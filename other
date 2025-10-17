@@ -1,0 +1,52 @@
+
+
+#### CHECK!!!! 
+Obtain the public key needed to communicate with BCM
+
+```
+grep BOOT /cm/local/apps/cmd/etc/htdocs/switch/<SWITCH>/cumulus-ztp.sh
+```
+
+on the bastion:
+***************
+#sudo wget --no-check-certificate -O etc/bootstrap.key http://10.150.4.61:8080/switch/<SWITCH>/bootstrap.key
+#sudo wget --no-check-certificate -O etc/bootstrap.pem http://10.150.4.61:8080/switch/<SWITCH>/bootstrap.pem
+
+scp /nfs/scratch/switch_config/bootstrap.key /nfs/scratch/switch_config/bootstrap.pem cumulus@switch_ip:/home/cumulus
+
+on the switch:
+**************
+cp /home/cumulus/bootstrap.key /home/cumulus/bootstrap.pem /opt/cm-lite-daemon/etc
+sudo ztp -e
+
+
+Register the Node
+On the switch, add the head node to /etc/hosts:
+
+echo "10.150.4.61 master.cm.cluster" | sudo tee -a /etc/hosts
+
+and register the node with BCM
+
+sudo ./register_node --host 10.150.4.61 --disable-cert-check
+
+
+Approve the Certificate Request
+On the head node:
+
+cmsh
+cert
+listrequests
+issuecertificate <request-id> --days 10000
+
+Step 8: Start cm-lite-daemon Service
+On the switch:
+
+sudo systemctl restart cm-lite-daemon
+sudo systemctl status cm-lite-daemon
+
+Step 9: Verify Installation
+On the head node:
+
+cmsh
+device
+list

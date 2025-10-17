@@ -1,0 +1,88 @@
+
+These steps are required to be completed on the NV Link Switches if the ZTP fails or other issues occur
+
+Prerequisites: NV Link Switches are properly provisioned in BCM
+BCM Steps
+Download the cm-lite-daemon package and extract the zip
+#Start at the root directory
+cd /root
+
+apt update
+apt install cm-lite-daemon
+unzip /cm/shared/apps/cm-lite-daemon-dist/cm-lite-daemon.zip
+
+#Check the cm-lite-daemon exists 
+ls -l /root
+drwxr-xr-x 7 root root 4096 Oct 31  2017 cm-lite-daemon
+Create a directory for pip packages:
+mkdir ~/pip_packages_dep
+cd ~/pip_packages_dep
+Download the required Python packages from the cm-lite-daemon requirements file
+pip download --python-version 3.11 -r ~/cm-lite-daemon/requirements.txt --dest ./ --no-deps
+Validate all Python packages exist against the requirements.txt
+root@bcm10-headnode:~/pip_packages_dep# cat ~/cm-lite-daemon/requirements.txt 
+pyOpenSSL>=21.0.0
+websocket-client
+pyyaml
+psutil
+py-cpuinfo
+uptime
+netifaces
+py-dmidecode
+requests
+
+root@bcm10-headnode:~/pip_packages_dep# ls -l
+total 1276
+-rw-r--r-- 1 root root  30106 Jul 15 14:03 netifaces-0.11.0.tar.gz
+-rw-r--r-- 1 root root 277986 Jul 15 14:03 psutil-7.0.0-cp36-abi3-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+-rw-r--r-- 1 root root  22335 Jul 15 14:03 py_cpuinfo-9.0.0-py3-none-any.whl
+-rw-r--r-- 1 root root  11995 Jul 15 14:03 py_dmidecode-0.1.3-py3-none-any.whl
+-rw-r--r-- 1 root root  56771 Jul 15 14:03 pyopenssl-25.1.0-py3-none-any.whl
+-rw-r--r-- 1 root root 762952 Jul 15 14:03 PyYAML-6.0.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+-rw-r--r-- 1 root root  64847 Jul 15 14:03 requests-2.32.4-py3-none-any.whl
+-rw-r--r-- 1 root root   6630 Jul 15 14:03 uptime-3.0.1.tar.gz
+-rw-r--r-- 1 root root  58826 Jul 15 14:03 websocket_client-1.8.0-py3-none-any.whl
+Copy the cm-lite-daemon.zip and Python packages to the switch
+scp /cm/shared/apps/cm-lite-daemon-dist/cm-lite-daemon.zip cumulus@{switch_ip}:/home/cumulus
+scp -r ~/pip_packages_dep cumulus@{switch_ip}:/home/cumulus
+Copy the bootstrap keys to the Cumulus device 
+scp /cm/local/apps/cmd/etc/htdocs/switch/{switch_name}/bootstrap.* cumulus@{switch_ip}:/home/cumulus 
+
+Determine active BCM headnode which will be used later 
+cmsh -c 'device; use master; get ip'
+
+
+NV Link Switch
+Ssh into the switch 
+Install unzip packages and extract the cm-lite-daemon.zip 
+sudo apt update
+sudo apt install unzip
+sudo unzip cm-lite-daemon.zip
+
+cumulus@cumulus:mgmt:~$ ls -l
+total 168
+-rw------- 1 cumulus cumulus   1704 Jul 25 21:44 bootstrap.key
+-rw------- 1 cumulus cumulus   1285 Jul 25 21:44 bootstrap.pem
+drwxr-xr-x 7 root    root      4096 Oct 31  2017 cm-lite-daemon
+-rw-r--r-- 1 cumulus cumulus 159540 Jul 25 21:29 cm-lite-daemon.zip
+
+cumulus@cumulus:mgmt:~$ 
+
+Install Python developer packages
+sudo apt update
+sudo apt install build-essential python3-dev
+Move the cm-lite-daemon, the bootstrap keys, and install Python dependencies:
+sudo apt install python3-openssl
+
+sudo cp -r /home/cumulus/cm-lite-daemon /opt
+cd /opt/cm-lite-daemon
+
+sudo cp bootstrap.* /opt/cm-lite-daemon/etc/
+
+cd /opt/cm-lite-daemon/etc/
+
+sudo pip install --break-system-packages --no-index --find-links ~/pip_packages_dep -r requirements.txt
+
+Register the node to BCM
+sudo ./register_node --host <active_bcm> --disable-cert-check --vrf mgmt
+

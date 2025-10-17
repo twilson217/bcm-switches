@@ -1,0 +1,5 @@
+Hostname	IP	MAC	Network
+leaf05	10.141.2.1	50:10:00:00:00	internalnet
+leaf06	10.141.2.2	50:10:00:00:01	internalnet
+leaf07	10.141.2.3	50:10:00:00:02	internalnet
+leaf08	10.141.2.4	50:10:00:00:03	internalnet
