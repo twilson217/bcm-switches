@@ -2,6 +2,8 @@
 
 This repository provides comprehensive automation scripts for managing Cumulus devices with Nvidia's BCM (Base Command Manager) using cm-lite-daemon.
 
+> **Note:** These scripts are designed for BCM 10.
+
 ## 🚀 Quick Start - Complete Setup
 
 For the simplest experience, use the **complete setup script** that handles everything automatically:
