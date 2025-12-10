@@ -33,10 +33,17 @@ from typing import Dict, List, Optional, Tuple
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_DIR = SCRIPT_DIR / ".configs"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-PROGRESS_FILE = CONFIG_DIR / "progress.json"
 CSV_FILE = CONFIG_DIR / "bcm_switches.csv"
 FILES_DIR = SCRIPT_DIR / ".files"
 CM_LITE_ZIP_PATH = Path("/cm/shared/apps/cm-lite-daemon-dist/cm-lite-daemon.zip")
+
+# Default progress structure
+DEFAULT_PROGRESS = {
+    'phase': 'discovery',
+    'completed_ips': [],
+    'failed_ips': [],
+    'devices': []
+}
 
 
 class IPAddressParser:
@@ -115,7 +122,9 @@ class IPAddressParser:
 
 
 class ConfigManager:
-    """Manage configuration file operations."""
+    """Manage configuration and progress tracking in a single file."""
+    
+    PHASES = ['discovery', 'bcm_add', 'transfer', 'install', 'register', 'complete']
     
     def __init__(self):
         self.config = {}
@@ -127,6 +136,9 @@ class ConfigManager:
             try:
                 with open(CONFIG_FILE, 'r') as f:
                     self.config = json.load(f)
+                # Ensure progress structure exists
+                if 'progress' not in self.config:
+                    self.config['progress'] = DEFAULT_PROGRESS.copy()
                 return True
             except (json.JSONDecodeError, IOError) as e:
                 print(f"Warning: Error loading config: {e}")
@@ -144,6 +156,59 @@ class ConfigManager:
     def set(self, key: str, value):
         """Set a configuration value."""
         self.config[key] = value
+    
+    # Progress tracking methods
+    @property
+    def progress(self) -> Dict:
+        """Get the progress sub-object."""
+        if 'progress' not in self.config:
+            self.config['progress'] = DEFAULT_PROGRESS.copy()
+        return self.config['progress']
+    
+    def has_progress(self) -> bool:
+        """Check if there is existing progress to resume."""
+        return ('progress' in self.config and 
+                (self.config['progress'].get('completed_ips') or 
+                 self.config['progress'].get('devices')))
+    
+    def clear_progress(self):
+        """Clear progress data (keeps config settings)."""
+        self.config['progress'] = DEFAULT_PROGRESS.copy()
+        self.save()
+    
+    def set_phase(self, phase: str):
+        """Set current deployment phase."""
+        self.progress['phase'] = phase
+        self.save()
+    
+    def mark_ip_completed(self, ip: str):
+        """Mark an IP as completed."""
+        if ip not in self.progress['completed_ips']:
+            self.progress['completed_ips'].append(ip)
+        self.save()
+    
+    def mark_ip_failed(self, ip: str):
+        """Mark an IP as failed."""
+        if ip not in self.progress['failed_ips']:
+            self.progress['failed_ips'].append(ip)
+        self.save()
+    
+    def add_device(self, device: Dict):
+        """Add a discovered device."""
+        # Check if device already exists (by IP)
+        for i, d in enumerate(self.progress['devices']):
+            if d['ip'] == device['ip']:
+                self.progress['devices'][i] = device
+                self.save()
+                return
+        self.progress['devices'].append(device)
+        self.save()
+    
+    def get_remaining_ips(self, all_ips: List[str]) -> List[str]:
+        """Get IPs that haven't been processed."""
+        completed = set(self.progress['completed_ips'])
+        failed = set(self.progress['failed_ips'])
+        return [ip for ip in all_ips if ip not in completed and ip not in failed]
     
     def prompt_for_config(self, use_existing: bool = False):
         """Prompt user for configuration values. Saves after each answer."""
@@ -305,82 +370,6 @@ def run_connectivity_test(config: ConfigManager) -> Optional[str]:
                 print("Please enter 1 or 2.")
 
 
-class ProgressTracker:
-    """Track deployment progress for resume capability."""
-    
-    PHASES = ['discovery', 'bcm_add', 'transfer', 'install', 'register', 'complete']
-    
-    def __init__(self):
-        self.progress = {
-            'phase': 'discovery',
-            'completed_ips': [],
-            'failed_ips': [],
-            'devices': []
-        }
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    
-    def load(self) -> bool:
-        """Load progress from file. Returns True if progress exists."""
-        if PROGRESS_FILE.exists():
-            try:
-                with open(PROGRESS_FILE, 'r') as f:
-                    self.progress = json.load(f)
-                return True
-            except (json.JSONDecodeError, IOError):
-                pass
-        return False
-    
-    def save(self):
-        """Save progress to file."""
-        with open(PROGRESS_FILE, 'w') as f:
-            json.dump(self.progress, f, indent=2)
-    
-    def clear(self):
-        """Clear progress file."""
-        if PROGRESS_FILE.exists():
-            PROGRESS_FILE.unlink()
-        self.progress = {
-            'phase': 'discovery',
-            'completed_ips': [],
-            'failed_ips': [],
-            'devices': []
-        }
-    
-    def set_phase(self, phase: str):
-        """Set current phase."""
-        self.progress['phase'] = phase
-        self.save()
-    
-    def mark_ip_completed(self, ip: str):
-        """Mark an IP as completed."""
-        if ip not in self.progress['completed_ips']:
-            self.progress['completed_ips'].append(ip)
-        self.save()
-    
-    def mark_ip_failed(self, ip: str):
-        """Mark an IP as failed."""
-        if ip not in self.progress['failed_ips']:
-            self.progress['failed_ips'].append(ip)
-        self.save()
-    
-    def add_device(self, device: Dict):
-        """Add a discovered device."""
-        # Check if device already exists (by IP)
-        for i, d in enumerate(self.progress['devices']):
-            if d['ip'] == device['ip']:
-                self.progress['devices'][i] = device
-                self.save()
-                return
-        self.progress['devices'].append(device)
-        self.save()
-    
-    def get_remaining_ips(self, all_ips: List[str]) -> List[str]:
-        """Get IPs that haven't been processed."""
-        completed = set(self.progress['completed_ips'])
-        failed = set(self.progress['failed_ips'])
-        return [ip for ip in all_ips if ip not in completed and ip not in failed]
-
-
 class NetworkDetector:
     """Detect BCM networks and match switch IPs."""
     
@@ -537,13 +526,19 @@ class SwitchDiscovery:
         self.password = password
     
     def _run_ssh_command(self, host: str, command: str) -> Optional[str]:
-        """Run a command on a remote host via SSH."""
-        ssh_cmd = ["sshpass", "-p", self.password, "ssh",
-                   "-o", "StrictHostKeyChecking=no",
-                   "-o", "UserKnownHostsFile=/dev/null",
-                   "-o", "ConnectTimeout=10",
-                   f"{self.username}@{host}", command]
+        """Run a command on a remote host via SSH.
         
+        Tries SSH key auth first, falls back to password auth via sshpass.
+        """
+        ssh_opts = [
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=15",
+            "-o", "BatchMode=yes"  # Fail fast if key auth doesn't work
+        ]
+        
+        # First try without password (SSH key auth)
+        ssh_cmd = ["ssh"] + ssh_opts + [f"{self.username}@{host}", command]
         try:
             result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
@@ -552,6 +547,26 @@ class SwitchDiscovery:
             pass
         except Exception:
             pass
+        
+        # Fall back to password auth via sshpass
+        if self.password:
+            ssh_opts_pwd = [
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=15",
+                "-o", "PubkeyAuthentication=no"  # Force password auth
+            ]
+            ssh_cmd = ["sshpass", "-p", self.password, "ssh"] + ssh_opts_pwd + [
+                f"{self.username}@{host}", command
+            ]
+            try:
+                result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    return result.stdout.strip()
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
         
         return None
     
@@ -593,15 +608,10 @@ class SwitchDiscovery:
         return None
     
     def check_connectivity(self, ip: str) -> bool:
-        """Check if switch is reachable via ping."""
-        try:
-            result = subprocess.run(
-                ["ping", "-c", "1", "-W", "3", ip],
-                capture_output=True, timeout=10
-            )
-            return result.returncode == 0
-        except:
-            return False
+        """Check if switch is reachable via SSH."""
+        # Use SSH instead of ping since ICMP may be blocked
+        result = self._run_ssh_command(ip, "echo ok")
+        return result == "ok"
     
     def get_vrf_for_ip(self, host: str, target_ip: str) -> Optional[str]:
         """Detect which VRF an IP address belongs to on a switch.
@@ -996,14 +1006,48 @@ class BCMDeployer:
                        "-r", str(temp_req), "--dest", str(pip_packages_dir), "--no-deps"]
                 subprocess.run(cmd, capture_output=True, check=True)
             
-            # Transfer files via SCP
-            scp_base = ["sshpass", "-p", self.password, "scp", "-r",
-                       "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
-            
+            # Transfer files via rsync
+            ssh_opts = "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
             target = f"{self.username}@{device['ip']}:/home/{self.username}/"
             
-            subprocess.run(scp_base + [str(local_zip), target], check=True, capture_output=True)
-            subprocess.run(scp_base + [str(pip_packages_dir), target], check=True, capture_output=True)
+            # Try rsync with SSH key first, fall back to sshpass
+            def run_rsync(source: str, dest: str, description: str) -> bool:
+                import time
+                start_time = time.time()
+                
+                # rsync options: -a (archive), -v (verbose), -z (compress), 
+                # --info=progress2 shows overall progress percentage
+                rsync_opts = ["-avz", "--info=progress2", "--human-readable"]
+                
+                # First try without password (SSH key auth)
+                rsync_cmd = ["rsync"] + rsync_opts + ["-e", f"{ssh_opts} -o BatchMode=yes",
+                            source, dest]
+                print(f"      {description}...")
+                result = subprocess.run(rsync_cmd, text=True)
+                
+                if result.returncode == 0:
+                    elapsed = time.time() - start_time
+                    print(f"      Completed in {elapsed:.1f}s")
+                    return True
+                
+                # Fall back to password auth
+                if self.password:
+                    rsync_cmd = ["sshpass", "-p", self.password, "rsync"] + rsync_opts + [
+                                "-e", ssh_opts, source, dest]
+                    result = subprocess.run(rsync_cmd, text=True)
+                    if result.returncode == 0:
+                        elapsed = time.time() - start_time
+                        print(f"      Completed in {elapsed:.1f}s")
+                        return True
+                return False
+            
+            if not run_rsync(str(local_zip), target, "Transferring cm-lite-daemon.zip"):
+                print(f"    ✗ Failed to transfer cm-lite-daemon.zip")
+                return False
+            
+            if not run_rsync(str(pip_packages_dir) + "/", target, "Transferring pip packages"):
+                print(f"    ✗ Failed to transfer pip_packages_dep")
+                return False
             
             return True
             
@@ -1015,6 +1059,8 @@ class BCMDeployer:
     
     def install_daemon(self, device: Dict, skip_if_exists: bool = True) -> bool:
         """Install cm-lite-daemon on a device."""
+        import time
+        
         if self.dry_run:
             print(f"    [DRY RUN] Would install daemon on {device['hostname']}")
             return True
@@ -1034,33 +1080,56 @@ class BCMDeployer:
                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                    f"{self.username}@{device['ip']}"]
         
-        commands = [
-            "sudo apt update",
-            "sudo apt install -y build-essential python3-dev python3-pip unzip",
-            f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip",
-            f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/",
-            f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
-            f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt",
-            f"rm -f /home/{self.username}/cm-lite-daemon.zip"
+        # Commands with descriptions for progress feedback
+        steps = [
+            ("Updating package lists...", "sudo apt update"),
+            ("Installing build dependencies...", "sudo apt install -y build-essential python3-dev python3-pip unzip"),
+            ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
+            ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
+            ("Installing Python packages (this may take a while)...", 
+             f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
+             f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
+            ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip")
         ]
         
-        for cmd in commands:
+        total_steps = len(steps)
+        overall_start = time.time()
+        
+        for i, (description, cmd) in enumerate(steps, 1):
+            print(f"      [{i}/{total_steps}] {description}", end="", flush=True)
+            step_start = time.time()
+            
             try:
                 # Handle sudo password
                 if "sudo " in cmd:
                     full_cmd = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
                     result = subprocess.run(full_cmd, input=f"{self.password}\n",
-                                          capture_output=True, text=True, timeout=300)
+                                          capture_output=True, text=True, timeout=600)
                 else:
                     result = subprocess.run(ssh_base + [cmd], capture_output=True, text=True, timeout=300)
+                
+                step_elapsed = time.time() - step_start
                 
                 if result.returncode != 0 and "already" not in result.stderr.lower():
                     # Some non-critical errors are OK
                     if "unzip" in cmd or "rm " in cmd:
+                        print(f" skipped ({step_elapsed:.1f}s)")
                         continue
-            except Exception as e:
-                print(f"    ✗ Command failed: {e}")
+                    print(f" FAILED ({step_elapsed:.1f}s)")
+                    print(f"        Error: {result.stderr.strip()[:100]}")
+                    return False
+                
+                print(f" done ({step_elapsed:.1f}s)")
+                
+            except subprocess.TimeoutExpired:
+                print(f" TIMEOUT")
                 return False
+            except Exception as e:
+                print(f" ERROR: {e}")
+                return False
+        
+        total_elapsed = time.time() - overall_start
+        print(f"      Total install time: {total_elapsed:.1f}s")
         
         return True
     
@@ -1160,6 +1229,11 @@ def check_prerequisites(airgapped: bool = False):
         print("Error: sshpass is required. Install with: apt install sshpass")
         sys.exit(1)
     
+    # Check for rsync
+    if not shutil.which("rsync"):
+        print("Error: rsync is required. Install with: apt install rsync")
+        sys.exit(1)
+    
     # Check for cmsh
     if not shutil.which("cmsh"):
         print("Error: cmsh not found. This script must run on a BCM system.")
@@ -1188,8 +1262,10 @@ def main():
         epilog="""
 Examples:
   %(prog)s                      # Normal interactive mode
-  %(prog)s --airgapped          # Use pre-downloaded files from ./files/
+  %(prog)s --airgapped          # Use pre-downloaded files from .files/
   %(prog)s --resume             # Resume from previous progress
+  %(prog)s --retry-failed       # Retry only the previously failed devices
+  %(prog)s --retry-failed --airgapped  # Retry failed devices using airgapped mode
   %(prog)s --dry-run            # Show what would be done
   %(prog)s --connectivity-test  # Run connectivity test and VRF detection only
         """
@@ -1199,6 +1275,8 @@ Examples:
                        help="Use airgapped mode (files from ./files/ directory)")
     parser.add_argument("--resume", action="store_true",
                        help="Resume from previous progress")
+    parser.add_argument("--retry-failed", action="store_true",
+                       help="Retry only the previously failed devices")
     parser.add_argument("--dry-run", action="store_true",
                        help="Show what would be done without executing")
     parser.add_argument("--connectivity-test", action="store_true",
@@ -1213,25 +1291,56 @@ Examples:
     # Check prerequisites
     check_prerequisites(args.airgapped)
     
-    # Initialize managers
+    # Initialize config manager
     config = ConfigManager()
-    progress = ProgressTracker()
+    
+    # Handle retry-failed mode
+    if args.retry_failed:
+        if not config.load():
+            print("Error: No configuration found. Cannot retry failed devices.")
+            sys.exit(1)
+        
+        failed_ips = config.progress.get('failed_ips', [])
+        if not failed_ips:
+            print("No failed devices to retry.")
+            sys.exit(0)
+        
+        print(f"\nRetrying {len(failed_ips)} previously failed device(s):")
+        for ip in failed_ips:
+            print(f"  - {ip}")
+        
+        # Clear failed IPs so they will be retried
+        config.progress['failed_ips'] = []
+        
+        # Remove failed IPs from completed_ips so they get rediscovered
+        config.progress['completed_ips'] = [ip for ip in config.progress.get('completed_ips', [])
+                                            if ip not in failed_ips]
+        
+        # Keep only successful devices, remove failed ones from devices list
+        config.progress['devices'] = [d for d in config.progress.get('devices', []) 
+                                      if d['ip'] not in failed_ips]
+        
+        # Reset phase to discovery for these IPs
+        config.progress['phase'] = 'discovery'
+        config.save()
+        
+        # Store failed IPs for filtering - these are the ONLY ones we'll process
+        config.set('_retry_ips', failed_ips)
+        config.set('switch_ips', failed_ips)
+        print("\nUsing existing configuration for retry.")
     
     # Handle resume mode
-    if args.resume and progress.load():
-        print(f"\nResuming from previous progress (phase: {progress.progress['phase']})")
-        print(f"  Completed IPs: {len(progress.progress['completed_ips'])}")
-        print(f"  Failed IPs: {len(progress.progress['failed_ips'])}")
-        print(f"  Discovered devices: {len(progress.progress['devices'])}")
-        
-        if not config.load():
-            print("Error: No configuration found. Cannot resume.")
-            sys.exit(1)
+    elif args.resume and config.load() and config.has_progress():
+        print(f"\nResuming from previous progress (phase: {config.progress['phase']})")
+        print(f"  Completed IPs: {len(config.progress['completed_ips'])}")
+        print(f"  Failed IPs: {len(config.progress['failed_ips'])}")
+        print(f"  Discovered devices: {len(config.progress['devices'])}")
     else:
-        progress.clear()
-        
         # Load or create configuration
         if config.load():
+            # Clear any stale progress if not resuming
+            if not args.resume:
+                config.clear_progress()
             print("\nExisting configuration found.")
             response = input("Would you like to use the existing configuration? (y/n): ").strip().lower()
             if response in ['y', 'yes', '']:
@@ -1318,14 +1427,14 @@ Examples:
     print(f"\nUsing VRF: {vrf}")
     
     # Detect network
-    print("\nDetecting BCM networks...")
-    network_detector = NetworkDetector()
-    network_detector.detect_networks()
-    
-    suggested_network = network_detector.detect_network_for_ips(switch_ips)
     network = config.get('network')
     
-    if not network or not args.resume:
+    if not network:
+        print("\nDetecting BCM networks...")
+        network_detector = NetworkDetector()
+        network_detector.detect_networks()
+        
+        suggested_network = network_detector.detect_network_for_ips(switch_ips)
         network = network_detector.prompt_for_network(suggested_network, switch_ips)
         config.set('network', network)
         config.save()
@@ -1338,7 +1447,7 @@ Examples:
     bcm_checker = BCMChecker()
     
     # Pre-check: Look for existing devices in BCM
-    if progress.progress['phase'] == 'discovery' and not args.resume:
+    if config.progress['phase'] == 'discovery' and not args.resume:
         print("\n" + "=" * 70)
         print("PRE-CHECK: Checking for existing devices in BCM")
         print("=" * 70)
@@ -1357,7 +1466,15 @@ Examples:
                 print(f"  - {bcm_dev['hostname']} ({ip}) - MAC: {bcm_dev.get('mac', 'N/A')}")
             
             response = input("\nWould you like to run a consistency check? (y/n) [y]: ").strip().lower()
-            if response not in ['n', 'no']:
+            if response in ['n', 'no']:
+                # Skip consistency check - use BCM data for all existing devices
+                print("\nUsing existing BCM data for these devices...")
+                for ip, bcm_dev in existing_in_bcm:
+                    bcm_dev['network'] = network
+                    config.add_device(bcm_dev)
+                    config.mark_ip_completed(ip)
+                    print(f"  ✓ Using BCM data for {bcm_dev['hostname']} ({ip})")
+            else:
                 print("\nRunning consistency check...")
                 all_consistent = True
                 
@@ -1376,8 +1493,8 @@ Examples:
                         print(f"    ✓ Consistency Confirmed!")
                         # Add to progress as already discovered
                         switch_data['network'] = network
-                        progress.add_device(switch_data)
-                        progress.mark_ip_completed(ip)
+                        config.add_device(switch_data)
+                        config.mark_ip_completed(ip)
                     else:
                         all_consistent = False
                         print(f"    ⚠ MISMATCH DETECTED:")
@@ -1394,16 +1511,16 @@ Examples:
                             if choice == "1":
                                 # Use BCM data
                                 bcm_dev['network'] = network
-                                progress.add_device(bcm_dev)
-                                progress.mark_ip_completed(ip)
+                                config.add_device(bcm_dev)
+                                config.mark_ip_completed(ip)
                                 print(f"    Using BCM data for {bcm_dev['hostname']}")
                                 break
                             elif choice == "2":
                                 # Use switch data - will need to update BCM
                                 switch_data['network'] = network
                                 switch_data['_needs_bcm_update'] = True
-                                progress.add_device(switch_data)
-                                progress.mark_ip_completed(ip)
+                                config.add_device(switch_data)
+                                config.mark_ip_completed(ip)
                                 print(f"    Using switch data, will update BCM")
                                 break
                             elif choice == "3":
@@ -1416,29 +1533,29 @@ Examples:
                     print("\n✓ All existing devices passed consistency check!")
     
     # Phase 1: Discovery
-    if progress.progress['phase'] == 'discovery':
+    if config.progress['phase'] == 'discovery':
         print("\n" + "=" * 70)
         print("PHASE 1: Discovering switches")
         print("=" * 70)
         
-        remaining_ips = progress.get_remaining_ips(switch_ips)
+        remaining_ips = config.get_remaining_ips(switch_ips)
         total = len(switch_ips)
         failed_count = 0
         
         if not remaining_ips:
             print("\nAll switches already discovered or checked.")
         else:
-            for i, ip in enumerate(remaining_ips, len(progress.progress['completed_ips']) + 1):
+            for i, ip in enumerate(remaining_ips, len(config.progress['completed_ips']) + 1):
                 print(f"\n[{i}/{total}] Discovering {ip}...")
                 
                 device = discovery.discover_switch(ip)
                 if device:
                     device['network'] = network
-                    progress.add_device(device)
-                    progress.mark_ip_completed(ip)
+                    config.add_device(device)
+                    config.mark_ip_completed(ip)
                     print(f"    ✓ Progress saved")
                 else:
-                    progress.mark_ip_failed(ip)
+                    config.mark_ip_failed(ip)
                     failed_count += 1
                     print(f"    ✗ Failed, marked for retry")
         
@@ -1451,18 +1568,23 @@ Examples:
                 sys.exit(1)
         
         # Generate CSV
-        devices = progress.progress['devices']
+        devices = config.progress['devices']
         if devices:
             write_csv(devices, network)
-            progress.set_phase('bcm_add')
+            config.set_phase('bcm_add')
         else:
             print("\nNo devices discovered. Exiting.")
             sys.exit(1)
     
-    devices = progress.progress['devices']
+    devices = config.progress['devices']
+    
+    # Filter devices to only those we're currently processing (for --retry-failed)
+    if args.retry_failed:
+        target_ips = set(switch_ips)
+        devices = [d for d in devices if d['ip'] in target_ips]
     
     # Phase 2: Add to BCM
-    if progress.progress['phase'] == 'bcm_add':
+    if config.progress['phase'] == 'bcm_add':
         print("\n" + "=" * 70)
         print("PHASE 2: Adding devices to BCM")
         print("=" * 70)
@@ -1490,10 +1612,10 @@ Examples:
             print("\nWaiting 15 seconds for BCM initialization...")
             time.sleep(15)
         
-        progress.set_phase('transfer')
+        config.set_phase('transfer')
     
     # Phase 3: Transfer daemon
-    if progress.progress['phase'] == 'transfer':
+    if config.progress['phase'] == 'transfer':
         print("\n" + "=" * 70)
         print("PHASE 3: Transferring cm-lite-daemon")
         print("=" * 70)
@@ -1517,10 +1639,10 @@ Examples:
                 print("\nExiting. Fix the issues and run with --resume to continue.")
                 sys.exit(1)
         
-        progress.set_phase('install')
+        config.set_phase('install')
     
     # Phase 4: Install daemon
-    if progress.progress['phase'] == 'install':
+    if config.progress['phase'] == 'install':
         print("\n" + "=" * 70)
         print("PHASE 4: Installing cm-lite-daemon")
         print("=" * 70)
@@ -1544,10 +1666,10 @@ Examples:
                 print("\nExiting. Fix the issues and run with --resume to continue.")
                 sys.exit(1)
         
-        progress.set_phase('register')
+        config.set_phase('register')
     
     # Phase 5: Register with BCM
-    if progress.progress['phase'] == 'register':
+    if config.progress['phase'] == 'register':
         print("\n" + "=" * 70)
         print("PHASE 5: Registering devices with BCM")
         print("=" * 70)
@@ -1567,7 +1689,7 @@ Examples:
         if failed_count > 0:
             print(f"\n⚠ {failed_count} device(s) failed registration.")
         
-        progress.set_phase('complete')
+        config.set_phase('complete')
     
     # Summary
     print("\n" + "=" * 70)
@@ -1575,12 +1697,12 @@ Examples:
     print("=" * 70)
     
     print(f"\nTotal devices processed: {len(devices)}")
-    print(f"Completed IPs: {len(progress.progress['completed_ips'])}")
-    print(f"Failed IPs: {len(progress.progress['failed_ips'])}")
+    print(f"Completed IPs: {len(config.progress['completed_ips'])}")
+    print(f"Failed IPs: {len(config.progress['failed_ips'])}")
     
-    if progress.progress['failed_ips']:
+    if config.progress['failed_ips']:
         print(f"\nFailed IPs:")
-        for ip in progress.progress['failed_ips']:
+        for ip in config.progress['failed_ips']:
             print(f"  - {ip}")
     
     print(f"\nCSV file: {CSV_FILE}")
@@ -1592,8 +1714,8 @@ Examples:
         print("3. Monitor logs for connectivity issues")
     
     # Clear progress on success
-    if progress.progress['phase'] == 'complete' and not progress.progress['failed_ips']:
-        progress.clear()
+    if config.progress['phase'] == 'complete' and not config.progress['failed_ips']:
+        config.clear_progress()
         print("\nDeployment completed successfully!")
     else:
         print(f"\nProgress saved. Run with --resume to continue.")

@@ -3,7 +3,7 @@
 
 # Airgapped deployment files
 .files/
-bcm-switches-deploy-airgapped.tar.gz
+bcm-switches-deploy-airgapped*.tar.gz
 
 # Python
 __pycache__/
