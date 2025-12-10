@@ -1081,15 +1081,17 @@ class BCMDeployer:
                    f"{self.username}@{device['ip']}"]
         
         # Commands with descriptions for progress feedback
+        # Note: Using apt-get instead of apt for stable CLI interface in scripts
         steps = [
-            ("Updating package lists...", "sudo apt update"),
-            ("Installing build dependencies...", "sudo apt install -y build-essential python3-dev python3-pip unzip"),
+            ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
+            ("Updating package lists...", "sudo apt-get update -q"),
+            ("Installing build dependencies...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev python3-pip unzip"),
             ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
             ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
             ("Installing Python packages (this may take a while)...", 
              f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
              f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
-            ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip")
+            ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
         ]
         
         total_steps = len(steps)
@@ -1194,13 +1196,45 @@ class BCMDeployer:
                              capture_output=True, text=True, timeout=60)
             
             # Register with BCM
+            print(f"    Registering with BCM...")
             register_cmd = (f"cd /opt/cm-lite-daemon && sudo ./register_node "
                           f"--host {bcm_master_ip} --disable-cert-check --vrf {self.vrf}")
             full_cmd = ssh_base + [register_cmd.replace("sudo ", "sudo -S ", 1)]
-            subprocess.run(full_cmd, input=f"{self.password}\n",
+            result = subprocess.run(full_cmd, input=f"{self.password}\n",
                          capture_output=True, text=True, timeout=120)
             
-            return True
+            if result.returncode != 0:
+                print(f"    ⚠ Registration command returned non-zero, checking service...")
+            
+            # Start the service
+            print(f"    Starting cm-lite-daemon service...")
+            start_cmd = "sudo systemctl start cm-lite-daemon"
+            full_cmd = ssh_base + [start_cmd.replace("sudo ", "sudo -S ", 1)]
+            subprocess.run(full_cmd, input=f"{self.password}\n",
+                         capture_output=True, text=True, timeout=60)
+            
+            # Wait a moment for service to start
+            time.sleep(3)
+            
+            # Verify service is running
+            print(f"    Verifying service status...")
+            verify_cmd = "systemctl is-active cm-lite-daemon"
+            full_cmd = ssh_base + [verify_cmd]
+            result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.stdout.strip() == "active":
+                print(f"    ✓ cm-lite-daemon service is running")
+                return True
+            else:
+                print(f"    ✗ Service not running: {result.stdout.strip()}")
+                # Try to get more info
+                status_cmd = "sudo systemctl status cm-lite-daemon --no-pager -l"
+                full_cmd = ssh_base + [status_cmd.replace("sudo ", "sudo -S ", 1)]
+                status_result = subprocess.run(full_cmd, input=f"{self.password}\n",
+                                              capture_output=True, text=True, timeout=30)
+                if status_result.stdout:
+                    print(f"    Service status:\n{status_result.stdout[:500]}")
+                return False
             
         except Exception as e:
             print(f"    ✗ Registration failed: {e}")
@@ -1226,12 +1260,12 @@ def check_prerequisites(airgapped: bool = False):
     """Check that all prerequisites are met."""
     # Check for sshpass
     if not shutil.which("sshpass"):
-        print("Error: sshpass is required. Install with: apt install sshpass")
+        print("Error: sshpass is required. Install with: apt-get install sshpass")
         sys.exit(1)
     
     # Check for rsync
     if not shutil.which("rsync"):
-        print("Error: rsync is required. Install with: apt install rsync")
+        print("Error: rsync is required. Install with: apt-get install rsync")
         sys.exit(1)
     
     # Check for cmsh
