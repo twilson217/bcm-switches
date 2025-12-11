@@ -1255,6 +1255,82 @@ def write_csv(devices: List[Dict], network: str):
             })
     print(f"\nGenerated {CSV_FILE} with {len(devices)} devices.")
 
+def read_devices_from_csv(csv_path: Path) -> List[Dict]:
+    """Read devices from a CSV file.
+    
+    Expected columns: Hostname, IP, MAC, Network
+    """
+    if not csv_path.exists():
+        print(f"Error: CSV file not found: {csv_path}")
+        sys.exit(1)
+    
+    devices = []
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Normalize field names
+            device = {}
+            for key, value in row.items():
+                device[key.lower()] = value
+            
+            # Require IP
+            if not device.get('ip'):
+                continue
+            
+            devices.append({
+                'hostname': device.get('hostname', ''),
+                'ip': device['ip'],
+                'mac': device.get('mac', '').upper() if device.get('mac') else '',
+                'network': device.get('network', '')
+            })
+    
+    return devices
+
+
+def check_csv_conflicts_with_bcm(devices: List[Dict], bcm_checker: 'BCMChecker') -> List[Dict]:
+    """Check for conflicts between CSV devices and existing BCM devices.
+    
+    Returns list of conflict dicts with details.
+    """
+    conflicts = []
+    bcm_devices = bcm_checker.get_bcm_devices()
+    
+    for device in devices:
+        ip = device['ip']
+        mac = device.get('mac', '')
+        hostname = device.get('hostname', '')
+        
+        # Check by IP
+        if ip in bcm_devices:
+            bcm_dev = bcm_devices[ip]
+            conflict = {'device': device, 'bcm_device': bcm_dev, 'type': 'ip'}
+            
+            # Check if data matches
+            if mac and bcm_dev.get('mac') and mac.upper() != bcm_dev['mac'].upper():
+                conflict['mac_mismatch'] = True
+            if hostname and bcm_dev.get('hostname') and hostname != bcm_dev['hostname']:
+                conflict['hostname_mismatch'] = True
+            
+            if conflict.get('mac_mismatch') or conflict.get('hostname_mismatch'):
+                conflicts.append(conflict)
+        
+        # Check by MAC (might be at different IP)
+        if mac:
+            for bcm_ip, bcm_dev in bcm_devices.items():
+                if bcm_dev.get('mac') and bcm_dev['mac'].upper() == mac.upper():
+                    if bcm_ip != ip:
+                        conflicts.append({
+                            'device': device,
+                            'bcm_device': bcm_dev,
+                            'type': 'mac',
+                            'ip_mismatch': True
+                        })
+                        break
+    
+    return conflicts
+
+
+
 
 def check_prerequisites(airgapped: bool = False):
     """Check that all prerequisites are met."""
@@ -1296,10 +1372,11 @@ def main():
         epilog="""
 Examples:
   %(prog)s                      # Normal interactive mode
+  %(prog)s --csv .configs/from-dhcp.csv  # Deploy from CSV file
+  %(prog)s --csv switches.csv --airgapped  # CSV mode with airgapped
   %(prog)s --airgapped          # Use pre-downloaded files from .files/
   %(prog)s --resume             # Resume from previous progress
   %(prog)s --retry-failed       # Retry only the previously failed devices
-  %(prog)s --retry-failed --airgapped  # Retry failed devices using airgapped mode
   %(prog)s --dry-run            # Show what would be done
   %(prog)s --connectivity-test  # Run connectivity test and VRF detection only
         """
@@ -1315,6 +1392,8 @@ Examples:
                        help="Show what would be done without executing")
     parser.add_argument("--connectivity-test", action="store_true",
                        help="Run connectivity test and VRF auto-detection only")
+    parser.add_argument("--csv", type=Path, metavar="FILE",
+                       help="Use CSV file as source of truth for switch information")
     
     args = parser.parse_args()
     
@@ -1328,6 +1407,301 @@ Examples:
     # Initialize config manager
     config = ConfigManager()
     
+
+    # Handle CSV mode
+    if args.csv:
+        print(f"\nCSV Mode: Using {args.csv} as source of truth")
+        
+        # Read devices from CSV
+        csv_devices = read_devices_from_csv(args.csv)
+        if not csv_devices:
+            print("Error: No valid devices found in CSV file.")
+            sys.exit(1)
+        
+        print(f"  Found {len(csv_devices)} device(s) in CSV")
+        for dev in csv_devices:
+            hostname = dev['hostname'] if dev['hostname'] else "(no hostname)"
+            print(f"    - {dev['ip']:16} {hostname}")
+        
+        # Check for conflicts with BCM
+        print("\nChecking for conflicts with existing BCM devices...")
+        bcm_checker = BCMChecker()
+        conflicts = check_csv_conflicts_with_bcm(csv_devices, bcm_checker)
+        
+        if conflicts:
+            print("\n" + "!" * 60)
+            print("CONFLICTS DETECTED WITH EXISTING BCM DEVICES")
+            print("!" * 60)
+            
+            for conflict in conflicts:
+                csv_dev = conflict['device']
+                bcm_dev = conflict['bcm_device']
+                print(f"\n  Device: {csv_dev.get('hostname') or csv_dev['ip']}")
+                print(f"    CSV:  IP={csv_dev['ip']}, MAC={csv_dev.get('mac', 'N/A')}")
+                print(f"    BCM:  IP={bcm_dev['ip']}, MAC={bcm_dev.get('mac', 'N/A')}, " +
+                      f"Hostname={bcm_dev.get('hostname', 'N/A')}")
+                
+                if conflict.get('mac_mismatch'):
+                    print(f"    !! MAC address mismatch!")
+                if conflict.get('hostname_mismatch'):
+                    print(f"    !! Hostname mismatch!")
+                if conflict.get('ip_mismatch'):
+                    print(f"    !! Same MAC exists with different IP in BCM!")
+            
+            print("\n" + "!" * 60)
+            print("Please resolve these conflicts before proceeding:")
+            print("  1. Update the CSV file to match BCM")
+            print("  2. Update BCM to match the CSV")
+            print("  3. Remove conflicting devices from CSV")
+            print("!" * 60)
+            sys.exit(1)
+        
+        print("  No conflicts found with BCM")
+        
+        # Prompt for credentials only
+        print("\n" + "-" * 60)
+        print("CREDENTIALS")
+        print("-" * 60)
+        
+        # Check for existing config
+        if config.load():
+            current_user = config.get('username', 'cumulus')
+            current_pass = config.get('password', '')
+            print(f"\nExisting credentials found (username: {current_user})")
+            response = input("Use existing credentials? (y/n) [y]: ").strip().lower()
+            if response not in ['n', 'no']:
+                username = current_user
+                password = current_pass
+                print("Using existing credentials.")
+            else:
+                username = input(f"Enter SSH username [{current_user}]: ").strip() or current_user
+                password = getpass.getpass("Enter SSH password: ")
+        else:
+            username = input("Enter SSH username [cumulus]: ").strip() or "cumulus"
+            password = getpass.getpass("Enter SSH password: ")
+        
+        # Determine network from CSV or detect
+        networks_in_csv = set(d['network'] for d in csv_devices if d.get('network'))
+        if len(networks_in_csv) == 1:
+            network = list(networks_in_csv)[0]
+            print(f"\nUsing network from CSV: {network}")
+        elif len(networks_in_csv) > 1:
+            print(f"\nMultiple networks found in CSV: {', '.join(networks_in_csv)}")
+            print("Devices will be added to their respective networks.")
+            network = None  # Will use per-device network
+        else:
+            # No network in CSV, detect it
+            print("\nNo network specified in CSV. Detecting...")
+            network_detector = NetworkDetector()
+            network_detector.detect_networks()
+            ips = [d['ip'] for d in csv_devices]
+            suggested = network_detector.detect_network_for_ips(ips)
+            network = network_detector.prompt_for_network(suggested, ips)
+            # Apply to all devices
+            for d in csv_devices:
+                d['network'] = network
+        
+        # Ask about connectivity test
+        print("\n" + "-" * 60)
+        response = input("Would you like to test connectivity to the devices? (y/n) [y]: ").strip().lower()
+        if response not in ['n', 'no']:
+            print("\nTesting connectivity...")
+            discovery = SwitchDiscovery(username, password)
+            reachable = []
+            unreachable = []
+            
+            for i, device in enumerate(csv_devices, 1):
+                ip = device['ip']
+                hostname = device['hostname'] if device['hostname'] else ip
+                print(f"  [{i}/{len(csv_devices)}] {hostname} ({ip})...", end=" ", flush=True)
+                
+                if discovery.check_connectivity(ip):
+                    print("reachable")
+                    reachable.append(device)
+                else:
+                    print("UNREACHABLE")
+                    unreachable.append(device)
+            
+            if unreachable:
+                print(f"\n{len(unreachable)} device(s) are unreachable:")
+                for dev in unreachable:
+                    print(f"    - {dev['ip']} ({dev.get('hostname', '')})")
+                response = input("\nContinue with reachable devices only? (y/n) [n]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("Exiting.")
+                    sys.exit(1)
+                csv_devices = reachable
+                if not csv_devices:
+                    print("No reachable devices. Exiting.")
+                    sys.exit(1)
+        
+        # Save config
+        config.set('username', username)
+        config.set('password', password)
+        config.set('switch_ips', [d['ip'] for d in csv_devices])
+        if network:
+            config.set('network', network)
+        
+        # VRF - use default if not set
+        vrf = config.get('vrf', 'default')
+        if not vrf:
+            vrf = 'default'
+        config.set('vrf', vrf)
+        
+        # Set devices directly (skip discovery phase)
+        config.progress['devices'] = csv_devices
+        config.progress['phase'] = 'bcm_add'
+        config.save()
+        
+        print("\nConfiguration saved. Proceeding to deployment...")
+        print(f"Using VRF: {vrf}")
+        if network:
+            print(f"Using network: {network}")
+        
+        # Set variables for rest of script
+        switch_ips = [d['ip'] for d in csv_devices]
+        devices = csv_devices
+        
+        # Jump to phase 2 (bcm_add)
+        deployer = BCMDeployer(username, password, vrf, args.airgapped, args.dry_run)
+        
+        # Phase 2: Add to BCM
+        print("\n" + "=" * 70)
+        print("PHASE 2: Adding devices to BCM")
+        print("=" * 70)
+        
+        success_count = 0
+        failed_count = 0
+        
+        for i, device in enumerate(devices, 1):
+            dev_network = device.get('network') or network
+            print(f"\n[{i}/{len(devices)}] Adding {device.get('hostname') or device['ip']} to BCM...")
+            if deployer.add_device_to_bcm(device, dev_network):
+                print(f"    Added to BCM")
+                success_count += 1
+            else:
+                print(f"    Failed to add to BCM")
+                failed_count += 1
+                config.mark_ip_failed(device['ip'])
+        
+        if failed_count > 0:
+            print(f"\n{failed_count} device(s) failed to add to BCM.")
+            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+            if response not in ['y', 'yes']:
+                print("\nExiting. Fix the issues and run with --resume to continue.")
+                sys.exit(1)
+        
+        if not args.dry_run and success_count > 0:
+            print("\nWaiting 15 seconds for BCM initialization...")
+            time.sleep(15)
+        
+        config.set_phase('transfer')
+        
+        # Continue to phase 3
+        print("\n" + "=" * 70)
+        print("PHASE 3: Transferring cm-lite-daemon")
+        print("=" * 70)
+        
+        success_count = 0
+        failed_count = 0
+        
+        for i, device in enumerate(devices, 1):
+            print(f"\n[{i}/{len(devices)}] Transferring to {device.get('hostname') or device['ip']}...")
+            if deployer.transfer_daemon(device):
+                print(f"    Transfer complete")
+                success_count += 1
+            else:
+                print(f"    Transfer failed")
+                failed_count += 1
+                config.mark_ip_failed(device['ip'])
+        
+        if failed_count > 0:
+            print(f"\n{failed_count} device(s) failed transfer.")
+            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+            if response not in ['y', 'yes']:
+                print("\nExiting. Fix the issues and run with --resume to continue.")
+                sys.exit(1)
+        
+        config.set_phase('install')
+        
+        # Phase 4: Install daemon
+        print("\n" + "=" * 70)
+        print("PHASE 4: Installing cm-lite-daemon")
+        print("=" * 70)
+        
+        success_count = 0
+        failed_count = 0
+        
+        for i, device in enumerate(devices, 1):
+            print(f"\n[{i}/{len(devices)}] Installing on {device.get('hostname') or device['ip']}...")
+            if deployer.install_daemon(device):
+                print(f"    Installation complete")
+                success_count += 1
+            else:
+                print(f"    Installation failed")
+                failed_count += 1
+                config.mark_ip_failed(device['ip'])
+        
+        if failed_count > 0:
+            print(f"\n{failed_count} device(s) failed installation.")
+            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+            if response not in ['y', 'yes']:
+                print("\nExiting. Fix the issues and run with --resume to continue.")
+                sys.exit(1)
+        
+        config.set_phase('register')
+        
+        # Phase 5: Register with BCM
+        print("\n" + "=" * 70)
+        print("PHASE 5: Registering devices with BCM")
+        print("=" * 70)
+        
+        success_count = 0
+        failed_count = 0
+        
+        for i, device in enumerate(devices, 1):
+            print(f"\n[{i}/{len(devices)}] Registering {device.get('hostname') or device['ip']}...")
+            if deployer.register_device(device):
+                print(f"    Registration complete")
+                success_count += 1
+                config.mark_ip_completed(device['ip'])
+            else:
+                print(f"    Registration failed")
+                failed_count += 1
+                config.mark_ip_failed(device['ip'])
+        
+        config.set_phase('complete')
+        
+        # Summary
+        print("\n" + "=" * 70)
+        print("DEPLOYMENT SUMMARY")
+        print("=" * 70)
+        
+        print(f"\nTotal devices processed: {len(devices)}")
+        print(f"Completed IPs: {len(config.progress['completed_ips'])}")
+        print(f"Failed IPs: {len(config.progress['failed_ips'])}")
+        
+        if config.progress['failed_ips']:
+            print(f"\nFailed IPs:")
+            for ip in config.progress['failed_ips']:
+                print(f"  - {ip}")
+        
+        # Write CSV for reference
+        write_csv(devices, network or 'mixed')
+        
+        if not args.dry_run:
+            print("\nNext steps:")
+            print("1. Verify devices appear in BCM device management")
+            print("2. Check cm-lite-daemon service status on devices")
+            print("3. Monitor logs for connectivity issues")
+        
+        if config.progress['phase'] == 'complete' and not config.progress['failed_ips']:
+            config.clear_progress()
+            print("\nDeployment completed successfully!")
+        
+        sys.exit(0)
+
+
     # Handle retry-failed mode
     if args.retry_failed:
         if not config.load():
