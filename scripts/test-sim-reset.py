@@ -12,9 +12,13 @@ Usage:
     python3 scripts/test-sim-reset.py
     python3 scripts/test-sim-reset.py --skip-bcm     # Skip BCM cleanup
     python3 scripts/test-sim-reset.py --skip-air     # Skip Air rebuild
+    
+Requirements:
+    pip install air-sdk
 """
 
 import argparse
+import base64
 import json
 import os
 import subprocess
@@ -22,10 +26,12 @@ import sys
 import time
 from pathlib import Path
 
+# Check for air-sdk
 try:
-    import requests
+    from air_sdk import AirApi
+    from air_sdk.exceptions import AirAuthorizationError, AirForbiddenError
 except ImportError:
-    print("Error: 'requests' module not found. Install with: pip install requests")
+    print("Error: 'air-sdk' not found. Install with: pip install air-sdk")
     sys.exit(1)
 
 # Constants
@@ -64,17 +70,17 @@ def create_env_file():
         shutil.copy(SAMPLE_ENV, ENV_FILE)
         print(f"Created {ENV_FILE} from sample")
     else:
-        # Create minimal .env
         content = """# NVIDIA Air API Configuration
 # Fill in your credentials below
 
 # NVIDIA Air API Token (get from air.nvidia.com -> Account Settings -> API Tokens)
+# Note: Internal and external sites use DIFFERENT tokens!
 AIR_API_TOKEN=your_api_token_here
 
-# NVIDIA Air API URL
-# External: https://air.nvidia.com/api/v1
-# Internal (NVIDIA VPN): https://air-inside.nvidia.com/api/v1
-AIR_API_URL=https://air.nvidia.com/api/v1
+# NVIDIA Air API URL (just the base URL, script adds /api/v1)
+# External: https://air.nvidia.com
+# Internal (NVIDIA VPN): https://air-inside.nvidia.com
+AIR_API_URL=https://air.nvidia.com
 
 # Your simulation ID (from the simulation URL)
 SIMULATION_ID=your_simulation_id_here
@@ -82,7 +88,7 @@ SIMULATION_ID=your_simulation_id_here
         ENV_FILE.write_text(content)
         print(f"Created {ENV_FILE}")
     
-    return False  # Indicates file was just created
+    return False
 
 
 def get_switches_from_topology():
@@ -96,7 +102,6 @@ def get_switches_from_topology():
             topology = json.load(f)
         
         nodes = topology.get('content', {}).get('nodes', {})
-        # Filter to only Cumulus switches (exclude oob-mgmt-switch, bcm-01, cpu-*, etc.)
         switches = [name for name in nodes.keys() 
                    if name.startswith('spine-') or name.startswith('leaf-')]
         return sorted(switches) if switches else MANAGED_SWITCHES
@@ -118,7 +123,7 @@ def get_bcm_devices():
             if line.strip() and not line.startswith('Type'):
                 parts = line.split()
                 if len(parts) >= 2:
-                    devices.append(parts[1])  # Device name is second column
+                    devices.append(parts[1])
         return devices
     except subprocess.CalledProcessError as e:
         print(f"Error getting BCM devices: {e}")
@@ -154,119 +159,108 @@ def remove_switches_from_bcm(switches_to_remove):
     return removed
 
 
-class NvidiaAirClient:
-    """Simple client for NVIDIA Air API."""
-    
-    def __init__(self, api_url: str, api_token: str, simulation_id: str):
-        self.api_url = api_url.rstrip('/')
-        self.api_token = api_token
-        self.simulation_id = simulation_id
-        self.headers = {
-            "Authorization": f"Bearer {api_token}",
-            "Content-Type": "application/json"
-        }
-    
-    def get_simulation(self):
-        """Get simulation details."""
-        url = f"{self.api_url}/simulations/{self.simulation_id}/"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
-    
-    def get_simulation_nodes(self):
-        """Get all nodes in the simulation."""
-        url = f"{self.api_url}/simulations/{self.simulation_id}/nodes/"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
-    
-    def rebuild_node(self, node_id: str):
-        """Rebuild a node to factory defaults."""
-        url = f"{self.api_url}/simulations/{self.simulation_id}/nodes/{node_id}/rebuild/"
-        response = requests.post(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json() if response.text else {"status": "rebuilding"}
-    
-    def get_node_status(self, node_id: str):
-        """Get current status of a node."""
-        url = f"{self.api_url}/simulations/{self.simulation_id}/nodes/{node_id}/"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
+def normalize_api_url(url):
+    """Normalize API URL to the format expected by air-sdk."""
+    url = url.rstrip('/')
+    # Remove any existing /api/v1 or /api/v2 suffix
+    if '/api/v' in url:
+        url = url.split('/api/v')[0]
+    elif url.endswith('/api'):
+        url = url[:-4]
+    # Add /api/ suffix
+    return url + '/api/'
 
 
-def rebuild_switches_in_air(client: NvidiaAirClient, switches: list):
+def decode_token_if_needed(token):
+    """Decode base64 token if it appears to be encoded."""
+    # Check if token looks like base64-encoded UUID
+    try:
+        decoded = base64.b64decode(token).decode('utf-8')
+        # If it decodes to a UUID-like string, return decoded
+        if len(decoded) == 36 and decoded.count('-') == 4:
+            return decoded
+    except:
+        pass
+    return token
+
+
+def rebuild_switches_in_air(api: AirApi, simulation_id: str, switches: list):
     """Rebuild switches in NVIDIA Air."""
     print("\nGetting simulation nodes...")
     
     try:
-        nodes = client.get_simulation_nodes()
-    except requests.exceptions.HTTPError as e:
-        print(f"Error getting nodes: {e}")
+        sim = api.simulations.get(simulation_id)
+        print(f"  Simulation: {sim.title}")
+        print(f"  State: {sim.state}")
+    except Exception as e:
+        print(f"  ✗ Failed to get simulation: {e}")
         return False
     
-    # Find node IDs for our switches
-    switch_nodes = {}
+    # Get nodes
+    try:
+        nodes = list(sim.nodes.list())
+        print(f"  Found {len(nodes)} nodes")
+    except Exception as e:
+        print(f"  ✗ Failed to get nodes: {e}")
+        return False
+    
+    # Find switch nodes
+    switch_nodes = []
     for node in nodes:
-        name = node.get('name', '')
-        if name in switches:
-            switch_nodes[name] = node
+        if node.name in switches:
+            switch_nodes.append(node)
     
     if not switch_nodes:
-        print("No matching switches found in simulation")
+        print("  No matching switches found in simulation")
         return False
     
-    print(f"Found {len(switch_nodes)} switches to rebuild")
+    print(f"\nRebuilding {len(switch_nodes)} switches...")
     
     # Rebuild each switch
     rebuilding = []
-    for name, node in switch_nodes.items():
-        node_id = node.get('id')
-        print(f"  Rebuilding {name}...")
+    for node in switch_nodes:
+        print(f"  Rebuilding {node.name}...")
         try:
-            client.rebuild_node(node_id)
-            rebuilding.append((name, node_id))
-            print(f"    ✓ Rebuild initiated for {name}")
-        except requests.exceptions.HTTPError as e:
-            print(f"    ✗ Failed to rebuild {name}: {e}")
+            node.rebuild()
+            rebuilding.append(node)
+            print(f"    ✓ Rebuild initiated")
+        except Exception as e:
+            print(f"    ✗ Failed: {e}")
     
     if not rebuilding:
         return False
     
     # Monitor rebuild status
-    print("\nMonitoring rebuild status...")
+    print("\nMonitoring rebuild status (this may take several minutes)...")
     max_wait = 300  # 5 minutes
     start_time = time.time()
     
     while time.time() - start_time < max_wait:
         all_ready = True
+        status_line = []
         
-        for name, node_id in rebuilding:
+        for node in rebuilding:
             try:
-                status = client.get_node_status(node_id)
-                state = status.get('state', 'unknown')
+                # Refresh node state
+                node = api.simulations.get(simulation_id).nodes.get(node.id)
+                state = node.state if hasattr(node, 'state') else 'unknown'
                 
-                # Common states: booting, running, stopped, rebuilding
-                if state in ('running', 'booted'):
-                    print(f"  ✓ {name}: {state}")
-                elif state in ('rebuilding', 'booting', 'starting'):
-                    print(f"  ⏳ {name}: {state}")
-                    all_ready = False
+                if state in ('running', 'booted', 'RUNNING', 'BOOTED'):
+                    status_line.append(f"✓{node.name}")
                 else:
-                    print(f"  ? {name}: {state}")
+                    status_line.append(f"⏳{node.name}:{state}")
                     all_ready = False
             except Exception as e:
-                print(f"  ✗ {name}: error checking status - {e}")
+                status_line.append(f"?{node.name}")
                 all_ready = False
+        
+        print(f"  [{int(time.time() - start_time)}s] {' | '.join(status_line)}")
         
         if all_ready:
             print("\n✓ All switches are ready!")
             return True
         
-        elapsed = int(time.time() - start_time)
-        remaining = max_wait - elapsed
-        print(f"\n  Waiting... ({elapsed}s elapsed, {remaining}s remaining)")
-        time.sleep(10)
+        time.sleep(15)
     
     print("\n⚠ Timeout waiting for switches to be ready")
     return False
@@ -283,8 +277,15 @@ This script prepares a clean environment for testing by:
 
 Prerequisites:
 - .configs/.env file with NVIDIA Air credentials
-- NVIDIA Air simulation with test topology running
+- air-sdk installed (pip install air-sdk)
+- NVIDIA Air simulation running
 - Running on a BCM head node (for BCM cleanup)
+
+Token Notes:
+- External (air.nvidia.com) and internal (air-inside.nvidia.com) 
+  use DIFFERENT API tokens!
+- Generate your token from Account Settings -> API Tokens
+- If you see 403 errors, regenerate your token for the correct site
 
 Examples:
   %(prog)s                  # Full reset (BCM cleanup + Air rebuild)
@@ -297,6 +298,8 @@ Examples:
                        help="Skip BCM device cleanup")
     parser.add_argument("--skip-air", action="store_true",
                        help="Skip NVIDIA Air rebuild")
+    parser.add_argument("--debug", action="store_true",
+                       help="Show debug information")
     
     args = parser.parse_args()
     
@@ -313,6 +316,8 @@ Examples:
         print("  - AIR_API_TOKEN: Your NVIDIA Air API token")
         print("  - AIR_API_URL: API URL (air.nvidia.com or air-inside.nvidia.com)")
         print("  - SIMULATION_ID: Your simulation UUID")
+        print("\nIMPORTANT: Use a token generated for the CORRECT site!")
+        print("           Internal and external sites use different tokens.")
         print("\nThen run this script again.")
         sys.exit(1)
     
@@ -355,28 +360,46 @@ Examples:
         print("Step 2: NVIDIA Air Switch Rebuild")
         print("-" * 60)
         
-        client = NvidiaAirClient(
-            api_url=env['AIR_API_URL'],
-            api_token=env['AIR_API_TOKEN'],
-            simulation_id=env['SIMULATION_ID']
-        )
+        # Normalize API URL
+        api_url = normalize_api_url(env['AIR_API_URL'])
+        token = decode_token_if_needed(env['AIR_API_TOKEN'])
         
-        # Test connection
+        if args.debug:
+            print(f"  API URL: {api_url}")
+            print(f"  Token (first 20): {token[:20]}...")
+            print(f"  Simulation: {env['SIMULATION_ID']}")
+        
         print("Connecting to NVIDIA Air...")
         try:
-            sim = client.get_simulation()
-            print(f"  ✓ Connected to simulation: {sim.get('title', 'Unknown')}")
-        except requests.exceptions.HTTPError as e:
-            print(f"  ✗ Failed to connect: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                print(f"    Response: {e.response.text[:200]}")
+            api = AirApi(api_url=api_url, api_version='v1', bearer_token=token)
+            # Test connection by getting simulation
+            sim = api.simulations.get(env['SIMULATION_ID'])
+            print(f"  ✓ Connected to simulation: {sim.title}")
+        except AirForbiddenError:
+            print("  ✗ Authentication failed (403 Forbidden)")
+            print("\n  Possible causes:")
+            print("    1. Token is invalid or expired")
+            print("    2. Token is for the WRONG site (internal vs external)")
+            print("       - air.nvidia.com and air-inside.nvidia.com use DIFFERENT tokens")
+            print("    3. Token doesn't have permission for this simulation")
+            print("\n  Solution:")
+            print(f"    1. Go to {env['AIR_API_URL']}")
+            print("    2. Account Settings -> API Tokens")
+            print("    3. Generate a NEW token")
+            print(f"    4. Update AIR_API_TOKEN in {ENV_FILE}")
+            sys.exit(1)
+        except AirAuthorizationError as e:
+            print(f"  ✗ Authorization error: {e}")
             sys.exit(1)
         except Exception as e:
             print(f"  ✗ Connection error: {e}")
+            if args.debug:
+                import traceback
+                traceback.print_exc()
             sys.exit(1)
         
         # Rebuild switches
-        if rebuild_switches_in_air(client, switches):
+        if rebuild_switches_in_air(api, env['SIMULATION_ID'], switches):
             print("\n✓ NVIDIA Air rebuild complete")
         else:
             print("\n⚠ NVIDIA Air rebuild may not have completed successfully")
@@ -387,10 +410,11 @@ Examples:
     print("\n" + "=" * 60)
     print("Reset Complete!")
     print("=" * 60)
-    print("\nThe test environment is ready. You can now run:")
-    print("  1. ./scripts/csv-from-dhcp.py")
-    print("  2. ./scripts/change-default-password.py --csv .configs/from-dhcp.csv")
-    print("  3. ./deploy_bcm_switches.py --csv .configs/from-dhcp.csv")
+    print("\nThe test environment is ready. Next steps:")
+    print("  1. Wait for switches to get DHCP addresses")
+    print("  2. Run: ./scripts/csv-from-dhcp.py")
+    print("  3. Run: ./scripts/change-default-password.py --csv .configs/from-dhcp.csv")
+    print("  4. Run: ./deploy_bcm_switches.py --csv .configs/from-dhcp.csv")
 
 
 if __name__ == "__main__":
