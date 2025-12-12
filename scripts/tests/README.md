@@ -56,6 +56,53 @@ pip install -r requirements.txt
 
 ## Scripts
 
+### `test-loop.py`
+
+**Fully automated test loop** that runs complete deployment cycles:
+- Reset simulation
+- Setup switches (DHCP, passwords, hostnames)
+- Deploy to BCM
+- Validate deployment
+
+```bash
+# Activate virtual environment first
+source .venv/bin/activate
+
+# Run all tests (Test 1 and Test 2)
+./test-loop.py
+
+# Run only Test 1 (DHCP lease deployment)
+./test-loop.py --test1
+
+# Run only Test 2 (switch setup first, then deploy)
+./test-loop.py --test2
+
+# Skip simulation reset (use existing state)
+./test-loop.py --test1 --no-reset
+
+# Dry run - show what would be done
+./test-loop.py --dry-run
+
+# Verbose output
+./test-loop.py --verbose
+```
+
+**Test 1: Full Deployment from DHCP Leases**
+1. Reset simulation
+2. Generate CSV from DHCP leases
+3. Change default passwords
+4. Map hostnames from topology
+5. Deploy using `--csv`
+6. Validate deployment
+
+**Test 2: Deployment with Switch Setup First**
+1. Reset simulation
+2. Generate CSV from DHCP leases
+3. Map hostnames from topology
+4. Change passwords AND set hostnames on switches
+5. Deploy using `--csv`
+6. Validate deployment
+
 ### `test-sim-reset.py`
 
 Resets the test environment by:
@@ -75,17 +122,11 @@ source .venv/bin/activate
 # Skip Air rebuild (only BCM cleanup)
 ./test-sim-reset.py --skip-air
 
+# List available simulations
+./test-sim-reset.py --list
+
 # Debug mode
 ./test-sim-reset.py --debug
-```
-
-### `test_direct_auth.py`
-
-Test NVIDIA Air API authentication.
-
-```bash
-source .venv/bin/activate
-./test_direct_auth.py
 ```
 
 ## Sample Files
