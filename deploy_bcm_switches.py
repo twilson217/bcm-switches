@@ -5,9 +5,13 @@ BCM Switch Deployment Script
 A comprehensive tool for deploying Cumulus switches to BCM (Base Command Manager).
 This script automates the entire process from switch discovery to full deployment.
 
+The script uses a "partially airgapped" approach:
+- Required files (cm-lite-daemon, pip packages) are downloaded once to .files/
+- Files are then distributed to switches via local network (no switch internet access)
+- If .files/ already exists (e.g., from prep-airgapped.py), those files are used
+
 Usage:
-    python3 deploy_bcm_switches.py              # Normal mode
-    python3 deploy_bcm_switches.py --airgapped  # Airgapped mode (uses local files)
+    python3 deploy_bcm_switches.py              # Auto-downloads files if needed
     python3 deploy_bcm_switches.py --resume     # Resume from previous progress
     python3 deploy_bcm_switches.py --dry-run    # Show what would be done
 """
@@ -835,11 +839,10 @@ class BCMDeployer:
     """Handle BCM deployment operations."""
     
     def __init__(self, username: str, password: str, vrf: str = "mgmt", 
-                 airgapped: bool = False, dry_run: bool = False):
+                 dry_run: bool = False):
         self.username = username
         self.password = password
         self.vrf = vrf
-        self.airgapped = airgapped
         self.dry_run = dry_run
         self.bcm_master_ip = None
         self.ssh_opts = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
@@ -966,53 +969,21 @@ class BCMDeployer:
             print(f"    ✓ Files already present on {device['hostname']}, skipping transfer")
             return True
         
-        work_dir = Path(tempfile.mkdtemp(prefix="cm_lite_daemon_"))
+        # Always use local files from .files/ directory (ensure_local_files() prepares them)
+        local_zip = FILES_DIR / "cm-lite-daemon.zip"
+        pip_packages_dir = FILES_DIR / "pip_packages_dep"
+        
+        if not local_zip.exists():
+            print(f"    ✗ cm-lite-daemon.zip not found in {FILES_DIR}")
+            print(f"      Run ensure_local_files() first or check your setup")
+            return False
+        
+        if not pip_packages_dir.exists() or not list(pip_packages_dir.glob("*")):
+            print(f"    ✗ pip_packages_dep not found or empty in {FILES_DIR}")
+            print(f"      Run ensure_local_files() first or check your setup")
+            return False
         
         try:
-            # Get cm-lite-daemon.zip
-            if self.airgapped:
-                zip_path = FILES_DIR / "cm-lite-daemon.zip"
-                if not zip_path.exists():
-                    print(f"    ✗ cm-lite-daemon.zip not found in {FILES_DIR}")
-                    return False
-                local_zip = work_dir / "cm-lite-daemon.zip"
-                shutil.copy2(zip_path, local_zip)
-            else:
-                if not CM_LITE_ZIP_PATH.exists():
-                    print(f"    ✗ cm-lite-daemon.zip not found at {CM_LITE_ZIP_PATH}")
-                    return False
-                local_zip = work_dir / "cm-lite-daemon.zip"
-                shutil.copy2(CM_LITE_ZIP_PATH, local_zip)
-            
-            # Get pip packages
-            pip_packages_dir = work_dir / "pip_packages_dep"
-            
-            if self.airgapped:
-                src_packages = FILES_DIR / "pip_packages_dep"
-                if src_packages.exists():
-                    shutil.copytree(src_packages, pip_packages_dir)
-                else:
-                    print(f"    ✗ pip_packages_dep not found in {FILES_DIR}")
-                    return False
-            else:
-                pip_packages_dir.mkdir(exist_ok=True)
-                # Extract requirements.txt and download packages
-                with zipfile.ZipFile(local_zip, 'r') as zip_ref:
-                    for filename in zip_ref.namelist():
-                        if filename.endswith('requirements.txt'):
-                            with zip_ref.open(filename) as req_file:
-                                requirements = req_file.read().decode('utf-8')
-                                break
-                    else:
-                        print("    ✗ requirements.txt not found in zip")
-                        return False
-                
-                temp_req = work_dir / "requirements.txt"
-                temp_req.write_text(requirements)
-                
-                cmd = ["pip", "download", "--python-version", "3.11",
-                       "-r", str(temp_req), "--dest", str(pip_packages_dir), "--no-deps"]
-                subprocess.run(cmd, capture_output=True, check=True)
             
             # Transfer files via rsync
             ssh_opts = "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
@@ -1064,8 +1035,6 @@ class BCMDeployer:
         except Exception as e:
             print(f"    ✗ Transfer failed: {e}")
             return False
-        finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
     
     def install_daemon(self, device: Dict, skip_if_exists: bool = True) -> bool:
         """Install cm-lite-daemon on a device."""
@@ -1342,7 +1311,7 @@ def check_csv_conflicts_with_bcm(devices: List[Dict], bcm_checker: 'BCMChecker')
 
 
 
-def check_prerequisites(airgapped: bool = False):
+def check_prerequisites():
     """Check that all prerequisites are met."""
     # Check for sshpass
     if not shutil.which("sshpass"):
@@ -1359,20 +1328,88 @@ def check_prerequisites(airgapped: bool = False):
         print("Error: cmsh not found. This script must run on a BCM system.")
         sys.exit(1)
     
-    # Check for airgapped files if needed
-    if airgapped:
-        if not (FILES_DIR / "cm-lite-daemon.zip").exists():
-            print(f"Error: cm-lite-daemon.zip not found in {FILES_DIR}")
-            print("Run scripts/prep-airgapped.py first to prepare airgapped files.")
-            sys.exit(1)
-        if not (FILES_DIR / "pip_packages_dep").exists():
-            print(f"Error: pip_packages_dep not found in {FILES_DIR}")
-            print("Run scripts/prep-airgapped.py first to prepare airgapped files.")
-            sys.exit(1)
-    else:
-        if not CM_LITE_ZIP_PATH.exists():
-            print(f"Error: cm-lite-daemon.zip not found at {CM_LITE_ZIP_PATH}")
-            sys.exit(1)
+    # Check for cm-lite-daemon.zip source
+    if not CM_LITE_ZIP_PATH.exists() and not (FILES_DIR / "cm-lite-daemon.zip").exists():
+        print(f"Error: cm-lite-daemon.zip not found at {CM_LITE_ZIP_PATH}")
+        print("       and not found in {FILES_DIR}")
+        sys.exit(1)
+
+
+def ensure_local_files():
+    """Ensure all required files are present in .files/ directory.
+    
+    Downloads files if not already present. This enables a 'partially airgapped'
+    approach where BCM downloads once and distributes to switches locally.
+    """
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    
+    cm_lite_zip = FILES_DIR / "cm-lite-daemon.zip"
+    pip_packages = FILES_DIR / "pip_packages_dep"
+    
+    # Check if files already exist
+    if cm_lite_zip.exists() and pip_packages.exists() and list(pip_packages.glob("*")):
+        print(f"✓ Using cached files from {FILES_DIR}")
+        return True
+    
+    print(f"\nPreparing deployment files in {FILES_DIR}...")
+    
+    # Copy cm-lite-daemon.zip if not present
+    if not cm_lite_zip.exists():
+        if CM_LITE_ZIP_PATH.exists():
+            print(f"  Copying cm-lite-daemon.zip from BCM...")
+            shutil.copy2(CM_LITE_ZIP_PATH, cm_lite_zip)
+            print(f"  ✓ Copied cm-lite-daemon.zip")
+        else:
+            print(f"  ✗ cm-lite-daemon.zip not found at {CM_LITE_ZIP_PATH}")
+            return False
+    
+    # Extract requirements and download pip packages if not present
+    if not pip_packages.exists() or not list(pip_packages.glob("*")):
+        pip_packages.mkdir(parents=True, exist_ok=True)
+        
+        # Extract requirements.txt from zip
+        print(f"  Extracting requirements.txt...")
+        requirements = None
+        with zipfile.ZipFile(cm_lite_zip, 'r') as zip_ref:
+            for filename in zip_ref.namelist():
+                if filename.endswith('requirements.txt'):
+                    with zip_ref.open(filename) as req_file:
+                        requirements = req_file.read().decode('utf-8')
+                        break
+        
+        if not requirements:
+            print(f"  ✗ requirements.txt not found in cm-lite-daemon.zip")
+            return False
+        
+        # Write temp requirements file
+        temp_req = FILES_DIR / "requirements.txt"
+        temp_req.write_text(requirements)
+        
+        try:
+            # Download packages for Python 3.11 (Cumulus Linux default)
+            print(f"  Downloading pip packages for Python 3.11...")
+            cmd = [
+                "pip", "download",
+                "--python-version", "3.11",
+                "-r", str(temp_req),
+                "--dest", str(pip_packages)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            
+            if result.returncode != 0:
+                print(f"  ⚠ Some packages may have failed to download")
+                print(f"    {result.stderr[:200] if result.stderr else ''}")
+            
+            # Count downloaded packages
+            package_count = len(list(pip_packages.glob("*")))
+            print(f"  ✓ Downloaded {package_count} package files")
+            
+        finally:
+            # Clean up temp requirements
+            if temp_req.exists():
+                temp_req.unlink()
+    
+    return True
 
 
 def main():
@@ -1383,17 +1420,18 @@ def main():
 Examples:
   %(prog)s                      # Normal interactive mode
   %(prog)s --csv .configs/from-dhcp.csv  # Deploy from CSV file
-  %(prog)s --csv switches.csv --airgapped  # CSV mode with airgapped
-  %(prog)s --airgapped          # Use pre-downloaded files from .files/
   %(prog)s --resume             # Resume from previous progress
   %(prog)s --retry-failed       # Retry only the previously failed devices
   %(prog)s --dry-run            # Show what would be done
   %(prog)s --connectivity-test  # Run connectivity test and VRF detection only
+
+Notes:
+  Files are automatically downloaded to .files/ if not already present.
+  For fully airgapped deployments, use scripts/prep-airgapped.py to create
+  an archive that includes all dependencies.
         """
     )
     
-    parser.add_argument("--airgapped", action="store_true",
-                       help="Use airgapped mode (files from ./files/ directory)")
     parser.add_argument("--resume", action="store_true",
                        help="Resume from previous progress")
     parser.add_argument("--retry-failed", action="store_true",
@@ -1411,24 +1449,8 @@ Examples:
     print("BCM Switch Deployment Tool")
     print("=" * 70)
     
-    # Auto-detect airgapped files if not already specified
-    if not args.airgapped:
-        airgapped_files_present = (
-            FILES_DIR.exists() and
-            (FILES_DIR / "cm-lite-daemon.zip").exists() and
-            (FILES_DIR / "pip_packages_dep").exists()
-        )
-        if airgapped_files_present:
-            print(f"\n✓ Airgapped installation files detected in {FILES_DIR}")
-            response = input("  Would you like to perform an airgapped installation? (Y/n) [Y]: ").strip().lower()
-            if response in ('', 'y', 'yes'):
-                args.airgapped = True
-                print("  → Using airgapped mode")
-            else:
-                print("  → Using online mode (will download files from BCM)")
-    
     # Check prerequisites
-    check_prerequisites(args.airgapped)
+    check_prerequisites()
     
     # Initialize config manager
     config = ConfigManager()
@@ -1589,7 +1611,7 @@ Examples:
         devices = csv_devices
         
         # Jump to phase 2 (bcm_add)
-        deployer = BCMDeployer(username, password, vrf, args.airgapped, args.dry_run)
+        deployer = BCMDeployer(username, password, vrf, args.dry_run)
         
         # Phase 2: Add to BCM
         print("\n" + "=" * 70)
@@ -1619,7 +1641,11 @@ Examples:
         
         config.set_phase('transfer')
         
-        # Continue to phase 3
+        # Continue to phase 3 - ensure local files are ready
+        if not ensure_local_files():
+            print("\nError: Failed to prepare deployment files. Exiting.")
+            sys.exit(1)
+        
         print("\n" + "=" * 70)
         print("PHASE 3: Transferring cm-lite-daemon")
         print("=" * 70)
@@ -1872,7 +1898,7 @@ Examples:
     
     # Initialize components
     discovery = SwitchDiscovery(username, password)
-    deployer = BCMDeployer(username, password, vrf, args.airgapped, args.dry_run)
+    deployer = BCMDeployer(username, password, vrf, args.dry_run)
     bcm_checker = BCMChecker()
     
     # Pre-check: Look for existing devices in BCM
@@ -2041,6 +2067,11 @@ Examples:
         
         # Phase 3: Transfer daemon
     if config.progress['phase'] == 'transfer':
+        # Ensure local files are ready before transfer
+        if not ensure_local_files():
+            print("\nError: Failed to prepare deployment files. Exiting.")
+            sys.exit(1)
+        
         print("\n" + "=" * 70)
         print("PHASE 3: Transferring cm-lite-daemon")
         print("=" * 70)
