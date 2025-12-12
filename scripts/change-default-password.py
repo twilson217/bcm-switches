@@ -77,26 +77,16 @@ def change_password_with_expect(ip: str, new_password: str, dry_run: bool = Fals
     escaped_default = DEFAULT_PASSWORD.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('[', '\\[').replace(']', '\\]')
     escaped_new = new_password.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('[', '\\[').replace(']', '\\]')
     
+    # NOTE: Order matters in expect! More specific patterns must come BEFORE less specific ones.
+    # "Retype new password:" must match before "New password:" which must match before "password:"
     expect_script = f'''
 # Set timeout to 30 seconds to allow for password processing delay
 set timeout 30
 
 spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {DEFAULT_USERNAME}@{ip}
 
-# Wait for password prompt or password change notice
+# Wait for prompts - ORDER MATTERS! Most specific patterns first.
 expect {{
-    -re "password:" {{
-        send "{escaped_default}\\r"
-        exp_continue
-    }}
-    "Current password:" {{
-        send "{escaped_default}\\r"
-        exp_continue
-    }}
-    "New password:" {{
-        send "{escaped_new}\\r"
-        exp_continue
-    }}
     "Retype new password:" {{
         send "{escaped_new}\\r"
         # Now wait for success message, connection close, or EOF
@@ -105,7 +95,7 @@ expect {{
                 puts "PASSWORD_CHANGED_SUCCESS"
                 exit 0
             }}
-            "Connection to * closed" {{
+            -re "Connection to .* closed" {{
                 puts "PASSWORD_CHANGED_SUCCESS"
                 exit 0
             }}
@@ -127,6 +117,19 @@ expect {{
                 exit 1
             }}
         }}
+    }}
+    "New password:" {{
+        send "{escaped_new}\\r"
+        exp_continue
+    }}
+    "Current password:" {{
+        send "{escaped_default}\\r"
+        exp_continue
+    }}
+    -re "assword:" {{
+        # Generic password prompt (login) - matches "password:" or "Password:"
+        send "{escaped_default}\\r"
+        exp_continue
     }}
     "Permission denied" {{
         puts "AUTH_FAILED"
