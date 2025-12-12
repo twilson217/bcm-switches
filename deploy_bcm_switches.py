@@ -1226,45 +1226,53 @@ class BCMDeployer:
             return False
 
 
-def disable_ztp_for_switches(devices: List[Dict], dry_run: bool = False) -> bool:
-    """Disable ZTP 'run on each boot' for all switches in BCM.
+def configure_monitoring_only_mode(devices: List[Dict], dry_run: bool = False) -> bool:
+    """Configure switches for monitoring-only mode in BCM.
     
-    This prevents the ZTP script from running on every switch boot,
-    which would be disruptive for monitoring-only deployments.
+    This sets:
+    1. cumulusmode = manual (BCM won't push config to switches)
+    2. runztponeachboot = no (ZTP won't run on every boot)
     
-    ZTP configuration remains in BCM for disaster recovery scenarios,
-    but won't automatically run unless manually triggered.
+    The result is non-disruptive monitoring:
+    - cm-lite-daemon provides metrics to BCM
+    - BCM doesn't change anything on the switches
+    - ZTP config remains in BCM for future disaster recovery use
     """
     if not devices:
         return True
     
-    print("\nDisabling ZTP 'run on each boot' for monitoring-only mode...")
+    print("\nConfiguring switches for monitoring-only mode...")
+    print("  - Setting cumulusmode to 'manual' (no auto-config push)")
+    print("  - Disabling 'run ZTP on each boot' (no boot-time provisioning)")
     
     if dry_run:
-        print("  [DRY RUN] Would disable ZTP for all switches")
+        print("\n  [DRY RUN] Would configure all switches for monitoring-only mode")
         return True
     
-    # Build cmsh command to disable ZTP for all devices
     hostnames = [d.get('hostname', d.get('ip')) for d in devices]
     
     success_count = 0
     for hostname in hostnames:
         try:
-            # Disable ZTP run on each boot
-            cmd = f"cmsh -c \"device; use {hostname}; ztpsettings; set runztponeachboot no; exit; commit\""
+            # Set cumulusmode to manual AND disable ZTP run on each boot
+            # Using a single cmsh command for efficiency
+            cmd = (f"cmsh -c \"device; use {hostname}; "
+                   f"set cumulusmode manual; "
+                   f"ztpsettings; set runztponeachboot no; "
+                   f"exit; commit\"")
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
             
             if result.returncode == 0:
-                print(f"  ✓ Disabled ZTP for {hostname}")
+                print(f"  ✓ {hostname}: monitoring-only mode configured")
                 success_count += 1
             else:
-                print(f"  ✗ Failed to disable ZTP for {hostname}: {result.stderr.strip()}")
+                print(f"  ✗ {hostname}: failed - {result.stderr.strip()}")
         except Exception as e:
-            print(f"  ✗ Error disabling ZTP for {hostname}: {e}")
+            print(f"  ✗ {hostname}: error - {e}")
     
-    print(f"\nZTP disabled for {success_count}/{len(hostnames)} devices")
-    print("  Note: ZTP config remains in BCM for disaster recovery")
-    print("  Switches will not run ZTP script on regular boots")
+    print(f"\nConfigured {success_count}/{len(hostnames)} devices for monitoring-only mode")
+    if success_count == len(hostnames):
+        print("  ✓ All switches set to monitoring-only (no config changes on boot)")
     
     return success_count == len(hostnames)
 
@@ -1774,8 +1782,8 @@ Notes:
         print("PHASE 6: Configuring for monitoring-only mode")
         print("=" * 70)
         
-        # Disable ZTP to prevent disruptive provisioning on boot
-        disable_ztp_for_switches(devices, dry_run=args.dry_run)
+        # Configure for monitoring-only (no config push, no ZTP on boot)
+        configure_monitoring_only_mode(devices, dry_run=args.dry_run)
         
         config.set_phase('complete')
         
@@ -2212,8 +2220,8 @@ Notes:
         print("PHASE 6: Configuring for monitoring-only mode")
         print("=" * 70)
         
-        # Disable ZTP to prevent disruptive provisioning on boot
-        disable_ztp_for_switches(devices, dry_run=args.dry_run)
+        # Configure for monitoring-only (no config push, no ZTP on boot)
+        configure_monitoring_only_mode(devices, dry_run=args.dry_run)
         
         config.set_phase('complete')
     
