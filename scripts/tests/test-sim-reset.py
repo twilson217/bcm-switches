@@ -12,6 +12,7 @@ Usage:
     python3 test-sim-reset.py
     python3 test-sim-reset.py --skip-bcm     # Skip BCM cleanup
     python3 test-sim-reset.py --skip-air     # Skip Air rebuild
+    python3 test-sim-reset.py --list         # List available simulations
     
 Requirements:
     pip install -r requirements.txt
@@ -131,7 +132,11 @@ def get_bcm_devices():
 
 
 def remove_switches_from_bcm(switches_to_remove):
-    """Remove specified switches from BCM."""
+    """Remove specified switches from BCM.
+    
+    Devices must be closed before they can be removed.
+    Command: cmsh -c "device; use <name>; close; remove; commit"
+    """
     bcm_devices = get_bcm_devices()
     
     removed = []
@@ -139,15 +144,21 @@ def remove_switches_from_bcm(switches_to_remove):
         if switch in bcm_devices:
             print(f"  Removing {switch} from BCM...")
             try:
+                # Must close the device before removing it
                 result = subprocess.run(
-                    ["cmsh", "-c", f"device; remove {switch}; commit"],
+                    ["cmsh", "-c", f"device; use {switch}; close; remove; commit"],
                     capture_output=True, text=True
                 )
                 if result.returncode == 0:
                     removed.append(switch)
                     print(f"    ✓ Removed {switch}")
                 else:
-                    print(f"    ✗ Failed to remove {switch}: {result.stderr}")
+                    # Check if it's already removed or another error
+                    if "Unable to remove" in result.stderr or "Unable to remove" in result.stdout:
+                        print(f"    ✗ Failed to remove {switch}: Device is still in use")
+                        print(f"       Try: cmsh -c 'device; use {switch}; usedby'")
+                    else:
+                        print(f"    ✗ Failed to remove {switch}: {result.stderr or result.stdout}")
             except Exception as e:
                 print(f"    ✗ Error removing {switch}: {e}")
         else:
@@ -161,7 +172,7 @@ class AirClient:
     
     def __init__(self, base_url: str, username: str, api_token: str):
         self.base_url = base_url.rstrip('/')
-        # Remove any /api/vX suffix
+        # Remove any /api/vX suffix to get clean base URL
         if '/api/' in self.base_url:
             self.base_url = self.base_url.split('/api/')[0]
         
@@ -199,6 +210,26 @@ class AirClient:
         response.raise_for_status()
         return response.json()
     
+    def list_simulations(self):
+        """List all available simulations."""
+        data = self.get_simulations()
+        simulations = data.get('results', [])
+        if not simulations:
+            print("  No simulations found.")
+            return []
+        
+        print(f"\n  Available simulations ({len(simulations)}):")
+        print("  " + "-" * 50)
+        for sim in simulations:
+            title = sim.get('title', 'Untitled')
+            sim_id = sim.get('id', 'N/A')
+            state = sim.get('state', 'unknown')
+            print(f"    {title}")
+            print(f"      ID: {sim_id}")
+            print(f"      State: {state}")
+            print()
+        return simulations
+    
     def find_simulation_by_name(self, name: str):
         """Find a simulation by name."""
         data = self.get_simulations()
@@ -215,23 +246,33 @@ class AirClient:
         return response.json()
     
     def get_simulation_nodes(self, sim_id: str):
-        """Get nodes in a simulation."""
-        url = f"{self.base_url}/api/v2/simulations/{sim_id}/nodes/"
-        response = self.session.get(url)
+        """Get nodes in a simulation.
+        
+        Uses /api/v2/simulations/nodes/?simulation=<id> endpoint.
+        NOT /api/v2/simulations/<id>/nodes/ (which doesn't exist).
+        """
+        # Correct endpoint: filter nodes by simulation ID
+        url = f"{self.base_url}/api/v2/simulations/nodes/"
+        params = {'simulation': sim_id}
+        response = self.session.get(url, params=params)
         response.raise_for_status()
         return response.json()
     
-    def rebuild_node(self, sim_id: str, node_id: str):
-        """Rebuild a node."""
-        url = f"{self.base_url}/api/v2/simulations/{sim_id}/nodes/{node_id}/rebuild/"
-        response = self.session.post(url)
+    def rebuild_node(self, node_id: str):
+        """Rebuild a node using the control endpoint.
+        
+        Uses /api/v2/simulations/nodes/<id>/control/ with {"action": "rebuild"}
+        """
+        url = f"{self.base_url}/api/v2/simulations/nodes/{node_id}/control/"
+        payload = {"action": "rebuild"}
+        response = self.session.post(url, json=payload)
         if response.status_code not in (200, 201, 202, 204):
             raise Exception(f"Rebuild failed: {response.status_code} - {response.text[:200]}")
         return True
     
-    def get_node(self, sim_id: str, node_id: str):
+    def get_node(self, node_id: str):
         """Get node details."""
-        url = f"{self.base_url}/api/v2/simulations/{sim_id}/nodes/{node_id}/"
+        url = f"{self.base_url}/api/v2/simulations/nodes/{node_id}/"
         response = self.session.get(url)
         response.raise_for_status()
         return response.json()
@@ -243,23 +284,29 @@ def rebuild_switches_in_air(client: AirClient, sim_id: str, switches: list):
     
     try:
         nodes_data = client.get_simulation_nodes(sim_id)
-        nodes = nodes_data.get('results', nodes_data) if isinstance(nodes_data, dict) else nodes_data
-        print(f"  Found {len(nodes)} nodes")
+        # Handle paginated or non-paginated response
+        if isinstance(nodes_data, dict):
+            nodes = nodes_data.get('results', [])
+        else:
+            nodes = nodes_data
+        print(f"  Found {len(nodes)} nodes in simulation")
     except Exception as e:
         print(f"  ✗ Failed to get nodes: {e}")
         return False
     
     # Find switch nodes
     switch_nodes = []
+    all_node_names = []
     for node in nodes:
         name = node.get('name', '')
+        all_node_names.append(name)
         if name in switches:
             switch_nodes.append(node)
     
     if not switch_nodes:
         print("  No matching switches found in simulation")
         print(f"  Looking for: {switches}")
-        print(f"  Found nodes: {[n.get('name') for n in nodes]}")
+        print(f"  Found nodes: {all_node_names}")
         return False
     
     print(f"\nRebuilding {len(switch_nodes)} switches...")
@@ -269,13 +316,13 @@ def rebuild_switches_in_air(client: AirClient, sim_id: str, switches: list):
     for node in switch_nodes:
         name = node.get('name')
         node_id = node.get('id')
-        print(f"  Rebuilding {name}...")
+        print(f"  Rebuilding {name}...", end=" ", flush=True)
         try:
-            client.rebuild_node(sim_id, node_id)
+            client.rebuild_node(node_id)
             rebuilding.append((name, node_id))
-            print(f"    ✓ Rebuild initiated")
+            print("✓ initiated")
         except Exception as e:
-            print(f"    ✗ Failed: {e}")
+            print(f"✗ Failed: {e}")
     
     if not rebuilding:
         return False
@@ -291,10 +338,10 @@ def rebuild_switches_in_air(client: AirClient, sim_id: str, switches: list):
         
         for name, node_id in rebuilding:
             try:
-                node = client.get_node(sim_id, node_id)
+                node = client.get_node(node_id)
                 state = node.get('state', 'unknown')
                 
-                if state.lower() in ('running', 'booted', 'active'):
+                if state.lower() in ('running', 'booted', 'active', 'ready'):
                     status_line.append(f"✓{name}")
                 else:
                     status_line.append(f"⏳{name}:{state}")
@@ -303,15 +350,16 @@ def rebuild_switches_in_air(client: AirClient, sim_id: str, switches: list):
                 status_line.append(f"?{name}")
                 all_ready = False
         
-        print(f"  [{int(time.time() - start_time)}s] {' | '.join(status_line)}")
+        elapsed = int(time.time() - start_time)
+        print(f"\r  [{elapsed}s] {' | '.join(status_line)}                    ", end="", flush=True)
         
         if all_ready:
-            print("\n✓ All switches are ready!")
+            print("\n\n✓ All switches are ready!")
             return True
         
         time.sleep(15)
     
-    print("\n⚠ Timeout waiting for switches to be ready")
+    print("\n\n⚠ Timeout waiting for switches to be ready")
     return False
 
 
@@ -333,6 +381,7 @@ Examples:
   %(prog)s                  # Full reset (BCM cleanup + Air rebuild)
   %(prog)s --skip-bcm       # Only rebuild in Air (skip BCM cleanup)
   %(prog)s --skip-air       # Only BCM cleanup (skip Air rebuild)
+  %(prog)s --list           # List available NVIDIA Air simulations
         """
     )
     
@@ -340,6 +389,8 @@ Examples:
                        help="Skip BCM device cleanup")
     parser.add_argument("--skip-air", action="store_true",
                        help="Skip NVIDIA Air rebuild")
+    parser.add_argument("--list", action="store_true",
+                       help="List available NVIDIA Air simulations and exit")
     parser.add_argument("--debug", action="store_true",
                        help="Show debug information")
     
@@ -362,20 +413,55 @@ Examples:
         print("\nThen run this script again.")
         sys.exit(1)
     
-    # Validate required fields
-    missing = []
+    # Validate required auth fields (but allow missing simulation for --list)
+    auth_missing = []
     if not env.get('AIR_API_TOKEN') or env['AIR_API_TOKEN'].endswith('_here'):
-        missing.append('AIR_API_TOKEN')
+        auth_missing.append('AIR_API_TOKEN')
     if not env.get('AIR_USERNAME') or env['AIR_USERNAME'].endswith('example.com'):
-        missing.append('AIR_USERNAME')
-    if not env.get('SIMULATION_NAME') and not env.get('SIMULATION_ID'):
-        missing.append('SIMULATION_NAME or SIMULATION_ID')
+        auth_missing.append('AIR_USERNAME')
     
-    if missing:
+    if auth_missing:
         print(f"\nMissing or placeholder values in {ENV_FILE}:")
-        for var in missing:
+        for var in auth_missing:
             print(f"  - {var}")
         print("\nPlease update these values and run again.")
+        sys.exit(1)
+    
+    # Handle --list option (can work without simulation name/ID)
+    if args.list:
+        api_url = env.get('AIR_API_URL', 'https://air.nvidia.com')
+        print(f"\nConnecting to {api_url}...")
+        client = AirClient(api_url, env['AIR_USERNAME'], env['AIR_API_TOKEN'])
+        
+        try:
+            client.login()
+            print("  ✓ Logged in successfully")
+            client.list_simulations()
+        except Exception as e:
+            print(f"  ✗ Failed: {e}")
+            sys.exit(1)
+        sys.exit(0)
+    
+    # For non-list operations, require simulation name/ID
+    if not env.get('SIMULATION_NAME') and not env.get('SIMULATION_ID'):
+        print(f"\nMissing SIMULATION_NAME or SIMULATION_ID in {ENV_FILE}")
+        print("\nTo see available simulations, run:")
+        print(f"  {sys.argv[0]} --list")
+        
+        # Try to list simulations if auth is available
+        api_url = env.get('AIR_API_URL', 'https://air.nvidia.com')
+        print(f"\nAttempting to list your simulations...")
+        client = AirClient(api_url, env['AIR_USERNAME'], env['AIR_API_TOKEN'])
+        
+        try:
+            client.login()
+            print("  ✓ Connected to NVIDIA Air")
+            client.list_simulations()
+            print("\nUpdate your .env file with one of the simulation names above,")
+            print("then run this script again.")
+        except Exception as e:
+            print(f"  Could not list simulations: {e}")
+        
         sys.exit(1)
     
     # Get switches from topology
@@ -436,10 +522,7 @@ Examples:
             else:
                 # List available simulations
                 print(f"  ✗ Simulation '{sim_name}' not found")
-                print("\n  Available simulations:")
-                data = client.get_simulations()
-                for s in data.get('results', []):
-                    print(f"    - {s.get('title')}")
+                client.list_simulations()
                 sys.exit(1)
         
         if not sim_id:

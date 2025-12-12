@@ -1,5 +1,6 @@
 # Configuration directory (contains sensitive data)
 .configs/
+.docs/
 
 # Test scripts secrets and virtualenv
 scripts/tests/.env
