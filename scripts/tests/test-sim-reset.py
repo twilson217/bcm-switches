@@ -36,11 +36,10 @@ except ImportError:
 
 # Constants
 SCRIPT_DIR = Path(__file__).parent.resolve()
-REPO_DIR = SCRIPT_DIR.parent
-CONFIG_DIR = REPO_DIR / ".configs"
-ENV_FILE = CONFIG_DIR / ".env"
-SAMPLE_ENV = REPO_DIR / "sample-configs" / "sample.env"
-TOPOLOGY_FILE = REPO_DIR / "sample-configs" / "test-topology.json"
+REPO_DIR = SCRIPT_DIR.parent.parent  # scripts/tests -> scripts -> repo root
+ENV_FILE = SCRIPT_DIR / ".env"
+SAMPLE_ENV = SCRIPT_DIR / "sample-configs" / "sample.env"
+TOPOLOGY_FILE = SCRIPT_DIR / "sample-configs" / "test-topology.json"
 
 # Switches we manage (Cumulus switches that get deployed to BCM)
 MANAGED_SWITCHES = ["spine-01", "spine-02", "leaf-01", "leaf-02", "leaf-03", "leaf-04"]
@@ -63,8 +62,6 @@ def load_env():
 
 def create_env_file():
     """Create .env file from sample if it doesn't exist."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    
     if SAMPLE_ENV.exists():
         import shutil
         shutil.copy(SAMPLE_ENV, ENV_FILE)

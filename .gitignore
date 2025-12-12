@@ -1,6 +1,10 @@
 # Configuration directory (contains sensitive data)
 .configs/
 
+# Test scripts secrets and virtualenv
+scripts/tests/.env
+scripts/tests/.venv/
+
 # Airgapped deployment files
 .files/
 bcm-switches-deploy-airgapped*.tar.gz

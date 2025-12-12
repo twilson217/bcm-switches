@@ -8,7 +8,7 @@ All tests are performed in [NVIDIA Air](https://air.nvidia.com) using this autom
 
 ### Topology
 
-The topology file used to create the simulation is saved at `sample-configs/test-topology.json`. This was the `default.json` file in the bcm-in-nvidia-air project at the time of testing (the default topology may change in the future). To reproduce these tests exactly, use the `test-topology.json` file.
+The topology file used to create the simulation is saved at `scripts/tests/sample-configs/test-topology.json`. This was the `default.json` file in the bcm-in-nvidia-air project at the time of testing (the default topology may change in the future). To reproduce these tests exactly, use the `test-topology.json` file.
 
 ### Manual Configuration
 
@@ -53,7 +53,7 @@ All tests have been performed on **BCM 10.30.0**.
 
 3. **Mapped CSV to topology for hostname resolution**
    ```bash
-   ./scripts/map-csv-topology.py --csv .configs/from-dhcp.csv --topology sample-configs/test-topology.json
+   ./scripts/map-csv-topology.py --csv .configs/from-dhcp.csv --topology scripts/tests/sample-configs/test-topology.json
    ```
 
 4. **Deployed switches to BCM (online mode - initial attempt)**

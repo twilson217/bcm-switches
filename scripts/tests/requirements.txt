@@ -1,0 +1,4 @@
+# Dependencies for NVIDIA Air test scripts
+air-sdk>=2.21.0
+python-dotenv>=1.0.0
+requests>=2.28.0
