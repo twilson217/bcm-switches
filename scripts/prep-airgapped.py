@@ -137,14 +137,17 @@ def download_pip_packages(requirements: str):
             except subprocess.TimeoutExpired:
                 print(f"  ⚠ Timeout downloading Python {py_version} packages")
         
-        # Also download with dependencies for completeness
-        print("  Downloading with dependencies...")
+        # Also download with dependencies for Python 3.11 (Cumulus Linux default)
+        print("  Downloading with dependencies for Python 3.11...")
         cmd = [
             "pip", "download",
+            "--python-version", "3.11",
             "-r", str(temp_req),
             "--dest", str(pip_dir)
         ]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            print(f"  ⚠ Some dependencies may have failed: {result.stderr[:200] if result.stderr else ''}")
         
         # List downloaded packages
         packages = list(pip_dir.glob("*"))
