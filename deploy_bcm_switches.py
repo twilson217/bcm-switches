@@ -1226,6 +1226,49 @@ class BCMDeployer:
             return False
 
 
+def disable_ztp_for_switches(devices: List[Dict], dry_run: bool = False) -> bool:
+    """Disable ZTP 'run on each boot' for all switches in BCM.
+    
+    This prevents the ZTP script from running on every switch boot,
+    which would be disruptive for monitoring-only deployments.
+    
+    ZTP configuration remains in BCM for disaster recovery scenarios,
+    but won't automatically run unless manually triggered.
+    """
+    if not devices:
+        return True
+    
+    print("\nDisabling ZTP 'run on each boot' for monitoring-only mode...")
+    
+    if dry_run:
+        print("  [DRY RUN] Would disable ZTP for all switches")
+        return True
+    
+    # Build cmsh command to disable ZTP for all devices
+    hostnames = [d.get('hostname', d.get('ip')) for d in devices]
+    
+    success_count = 0
+    for hostname in hostnames:
+        try:
+            # Disable ZTP run on each boot
+            cmd = f"cmsh -c \"device; use {hostname}; ztpsettings; set runztponeachboot no; exit; commit\""
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                print(f"  ✓ Disabled ZTP for {hostname}")
+                success_count += 1
+            else:
+                print(f"  ✗ Failed to disable ZTP for {hostname}: {result.stderr.strip()}")
+        except Exception as e:
+            print(f"  ✗ Error disabling ZTP for {hostname}: {e}")
+    
+    print(f"\nZTP disabled for {success_count}/{len(hostnames)} devices")
+    print("  Note: ZTP config remains in BCM for disaster recovery")
+    print("  Switches will not run ZTP script on regular boots")
+    
+    return success_count == len(hostnames)
+
+
 def write_csv(devices: List[Dict], network: str):
     """Write devices to CSV file."""
     with open(CSV_FILE, 'w', newline='') as f:
@@ -1724,6 +1767,16 @@ Notes:
                 failed_count += 1
                 config.mark_ip_failed(device['ip'])
         
+        config.set_phase('finalize')
+        
+        # Phase 6: Disable ZTP for monitoring-only mode
+        print("\n" + "=" * 70)
+        print("PHASE 6: Configuring for monitoring-only mode")
+        print("=" * 70)
+        
+        # Disable ZTP to prevent disruptive provisioning on boot
+        disable_ztp_for_switches(devices, dry_run=args.dry_run)
+        
         config.set_phase('complete')
         
         # Summary
@@ -2150,6 +2203,17 @@ Notes:
         
         if failed_count > 0:
             print(f"\n⚠ {failed_count} device(s) failed registration.")
+        
+        config.set_phase('finalize')
+    
+    # Phase 6: Disable ZTP for monitoring-only mode
+    if config.progress['phase'] == 'finalize':
+        print("\n" + "=" * 70)
+        print("PHASE 6: Configuring for monitoring-only mode")
+        print("=" * 70)
+        
+        # Disable ZTP to prevent disruptive provisioning on boot
+        disable_ztp_for_switches(devices, dry_run=args.dry_run)
         
         config.set_phase('complete')
     
