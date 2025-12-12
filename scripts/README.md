@@ -18,7 +18,7 @@ Generate a CSV file from DHCP leases for switch discovery.
 - `--output FILE` - Custom output path
 - `--filter VENDOR` - Filter by vendor class
 
-### `change-switch-defaults.py` (Recommended)
+### `change-switch-defaults.py`
 Change default password and/or hostname on Cumulus switches in a single SSH session.
 
 ```bash
@@ -40,36 +40,6 @@ Change default password and/or hostname on Cumulus switches in a single SSH sess
 - `--dry-run` - Show what would be done
 
 **Requires:** `expect` and `sshpass` installed on the system.
-
-### `change-default-password.py`
-Simpler alternative to `change-switch-defaults.py` for password-only changes.
-
-```bash
-./scripts/change-default-password.py --csv .configs/from-dhcp.csv
-```
-
-**Options:**
-- `--csv FILE` - Required. CSV file with switch info
-- `--dry-run` - Show what would be done
-- `--verify-only` - Check which switches need password change
-
-**Requires:** `expect` or `sshpass` installed on the system.
-
-### `change-default-hostname.py`
-Set hostnames on switches based on MAC-to-hostname mapping.
-
-```bash
-./scripts/change-default-hostname.py --topology scripts/tests/sample-configs/test-topology.json --ips 192.168.200.161-166 --password <pwd>
-```
-
-**Options:**
-- `--topology FILE` - Topology file for valid hostnames
-- `--mapping FILE` - JSON file with MAC-to-hostname mapping
-- `--ips RANGE` - IP addresses to process
-- `--password PWD` - SSH password
-- `--dry-run` - Show what would be done
-
-**Requires:** `sshpass` installed on the system.
 
 ### `map-csv-topology.py`
 Map hostnames from an NVIDIA Air topology JSON to switches in a CSV file.

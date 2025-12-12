@@ -95,11 +95,63 @@ All tests have been performed on **BCM 10.30.0**.
 
 ---
 
+## Test 2: Deployment with IP Discovery (No Input CSV)
+
+**Date:** 2025-12-12
+
+**Objective:** Test the workflow where the user provides IP addresses directly, and the script discovers hostnames from the switches.
+
+### Prerequisites
+
+This test was run immediately after Test 1. The simulation was reset using:
+```bash
+./scripts/tests/test-sim-reset.py
+```
+
+This removed the switches from BCM and rebuilt them in NVIDIA Air to factory defaults.
+
+### Steps Performed
+
+1. **Generated CSV from DHCP leases**
+   ```bash
+   ./scripts/csv-from-dhcp.py
+   ```
+   Output: `.configs/from-dhcp.csv` with IP and MAC addresses (hostnames show as "cumulus" - the default).
+
+2. **Mapped MAC addresses to hostnames from topology**
+   ```bash
+   ./scripts/map-csv-topology.py --csv .configs/from-dhcp.csv --topology scripts/tests/sample-configs/test-topology.json
+   ```
+   This updates the CSV with correct hostnames based on MAC address matching.
+
+3. **Changed default passwords AND set hostnames in one step**
+   ```bash
+   ./scripts/change-switch-defaults.py --csv .configs/from-dhcp.csv --password --hostname
+   ```
+   This script:
+   - SSHs to each switch once
+   - Handles the forced password change on first login
+   - Sets the hostname using NVUE commands
+   - Verifies the hostname was applied
+
+### Status
+
+✅ **PASSED** - All 6 switches had passwords changed and hostnames set correctly.
+
+### Notes
+
+- The combined `change-switch-defaults.py` script is more efficient than running separate password and hostname scripts, as it only SSHs to each switch once.
+- The `--password` and `--hostname` flags can be used independently or together.
+- When used together, the script uses the new password immediately after changing it to set the hostname.
+
+---
+
 ## Future Tests
 
 - [x] Test `--resume` functionality after interrupted deployment
 - [x] Test `--retry-failed` for partial failure recovery
 - [x] Test fully airgapped deployment with `prep-airgapped.py` tarball
+- [x] Test combined `change-switch-defaults.py` script
 - [ ] Test `--connectivity-test` VRF detection (standalone)
 - [ ] Test consistency check when switches already exist in BCM
 - [ ] Test BCM 11.x compatibility (when supported)
