@@ -226,15 +226,17 @@ class ConfigManager:
         if use_existing and current_ips:
             print(f"Current switch IPs: {', '.join(current_ips[:5])}{'...' if len(current_ips) > 5 else ''}")
             print(f"  ({len(current_ips)} total IPs)")
+            ip_prompt = "Enter switch IP addresses (formats: 192.168.0.1-100, 192.168.0.1-192.168.0.100,\n  or comma-separated, or combinations) [Enter to keep]: "
+        else:
+            ip_prompt = "Enter switch IP addresses (formats: 192.168.0.1-100, 192.168.0.1-192.168.0.100,\n  or comma-separated, or combinations): "
         
-        ip_input = input("Enter switch IP addresses (formats: 192.168.0.1-100, 192.168.0.1-192.168.0.100,\n"
-                        "  or comma-separated, or combinations) [Enter to keep]: ").strip()
+        ip_input = input(ip_prompt).strip()
         
         if ip_input:
             self.config['switch_ips'] = IPAddressParser.parse(ip_input)
             print(f"  Parsed {len(self.config['switch_ips'])} IP address(es)")
             self.save()  # Save after IP addresses
-        elif not use_existing or not current_ips:
+        elif not current_ips:
             print("Error: At least one IP address is required.")
             sys.exit(1)
         
@@ -247,15 +249,19 @@ class ConfigManager:
         self.save()  # Save after username
         
         # Password
-        if use_existing:
+        current_password = self.get('password')
+        if use_existing and current_password:
             print("\nCurrent password: *******")
-        password = getpass.getpass("Enter SSH password for switches [Enter to keep]: ")
+            password = getpass.getpass("Enter SSH password for switches [Enter to keep]: ")
+        else:
+            password = getpass.getpass("Enter SSH password for switches: ")
+        
         if password:
             self.config['password'] = password
             self.save()  # Save after password
-        elif not use_existing or not self.get('password'):
-            self.config['password'] = getpass.getpass("Enter SSH password for switches: ")
-            self.save()  # Save after password
+        elif not current_password:
+            print("Error: Password is required.")
+            sys.exit(1)
 
 
 def run_connectivity_test(config: ConfigManager) -> Optional[str]:
