@@ -1708,8 +1708,7 @@ Examples:
             for ip in config.progress['failed_ips']:
                 print(f"  - {ip}")
         
-        # Write CSV for reference
-        write_csv(devices, network or 'mixed')
+        # Note: Not writing bcm_switches.csv since we're using --csv input as source of truth
         
         if not args.dry_run:
             print("\nNext steps:")

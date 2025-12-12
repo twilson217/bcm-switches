@@ -75,24 +75,41 @@ All tests have been performed on **BCM 10.30.0**.
    ```
    When prompted "Would you like to perform an airgapped installation?", selected **Y** (default).
 
+   **Issues encountered and fixed:**
+   - pip package path mismatch (packages transferred to wrong directory) - fixed in commit c00f6dc
+   - Transfer check not verifying pip_packages_dep directory - fixed in commit 2992cef
+   - Missing `cffi` package for Python 3.11 (only had cp312 version) - fixed in commit d2b1db7
+
 ### Status
 
-🔄 **In Progress** - Phase 4 (pip install) still failing. Debugging in progress.
+✅ **PASSED** - All 6 switches successfully deployed to BCM.
 
 ### Results
 
 - **Phase 2 (Add to BCM):** ✅ All 6 devices added successfully
 - **Phase 3 (Transfer):** ✅ Files transferred successfully  
-- **Phase 4 (Install):** ❌ pip install failing - investigating
+- **Phase 4 (Install):** ✅ cm-lite-daemon installed successfully
+- **Phase 5 (Register):** ✅ All devices registered with BCM
+
+### Devices Deployed
+
+| Hostname | IP | MAC |
+|----------|-----|-----|
+| spine-02 | 192.168.200.161 | 48:B0:2D:09:AE:AC |
+| leaf-04 | 192.168.200.162 | 48:B0:2D:F6:37:28 |
+| leaf-02 | 192.168.200.163 | 48:B0:2D:A0:C1:83 |
+| spine-01 | 192.168.200.164 | 48:B0:2D:C1:1D:6C |
+| leaf-03 | 192.168.200.165 | 48:B0:2D:82:69:E6 |
+| leaf-01 | 192.168.200.166 | 48:B0:2D:3B:C8:E6 |
 
 ---
 
 ## Future Tests
 
-- [ ] Test `--airgapped` deployment mode
-- [ ] Test `--resume` functionality after interrupted deployment
-- [ ] Test `--retry-failed` for partial failure recovery
-- [ ] Test `--connectivity-test` VRF detection
+- [x] Test `--airgapped` deployment mode (tested via auto-detection)
+- [x] Test `--resume` functionality after interrupted deployment
+- [x] Test `--retry-failed` for partial failure recovery
+- [ ] Test `--connectivity-test` VRF detection (standalone)
 - [ ] Test consistency check when switches already exist in BCM
 - [ ] Test BCM 11.x compatibility (when supported)
 
