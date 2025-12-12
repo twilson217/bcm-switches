@@ -1403,6 +1403,22 @@ Examples:
     print("BCM Switch Deployment Tool")
     print("=" * 70)
     
+    # Auto-detect airgapped files if not already specified
+    if not args.airgapped:
+        airgapped_files_present = (
+            FILES_DIR.exists() and
+            (FILES_DIR / "cm-lite-daemon.zip").exists() and
+            (FILES_DIR / "pip_packages_dep").exists()
+        )
+        if airgapped_files_present:
+            print(f"\n✓ Airgapped installation files detected in {FILES_DIR}")
+            response = input("  Would you like to perform an airgapped installation? (Y/n) [Y]: ").strip().lower()
+            if response in ('', 'y', 'yes'):
+                args.airgapped = True
+                print("  → Using airgapped mode")
+            else:
+                print("  → Using online mode (will download files from BCM)")
+    
     # Check prerequisites
     check_prerequisites(args.airgapped)
     
