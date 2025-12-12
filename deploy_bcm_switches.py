@@ -1609,10 +1609,6 @@ Examples:
                 print("\nExiting. Fix the issues and run with --resume to continue.")
                 sys.exit(1)
         
-        if not args.dry_run and success_count > 0:
-            print("\nWaiting 15 seconds for BCM initialization...")
-            time.sleep(15)
-        
         config.set_phase('transfer')
         
         # Continue to phase 3
@@ -2034,13 +2030,9 @@ Examples:
                 print("\nExiting. Fix the issues and run with --resume to continue.")
                 sys.exit(1)
         
-        if not args.dry_run and success_count > 0:
-            print("\nWaiting 15 seconds for BCM initialization...")
-            time.sleep(15)
-        
         config.set_phase('transfer')
-    
-    # Phase 3: Transfer daemon
+        
+        # Phase 3: Transfer daemon
     if config.progress['phase'] == 'transfer':
         print("\n" + "=" * 70)
         print("PHASE 3: Transferring cm-lite-daemon")
