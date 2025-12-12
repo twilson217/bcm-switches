@@ -43,6 +43,8 @@ All tests have been performed on **BCM 10.30.0**.
    ```
    Output: `.configs/from-dhcp.csv`
 
+   > **Manual step:** Removed `oob-mgmt-switch` from the CSV file since it was no longer reachable after the bridging configuration change and was not planned for BCM deployment.
+
 2. **Changed default passwords on switches**
    ```bash
    ./scripts/change-default-password.py --csv .configs/from-dhcp.csv
