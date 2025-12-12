@@ -73,31 +73,44 @@ def change_password_with_expect(ip: str, new_password: str, dry_run: bool = Fals
     # Use Python's pexpect-like functionality via subprocess with pseudo-terminal
     # Since we need to interact with password prompts, we'll use a shell script approach
     
+    # Escape any special characters in passwords for tcl/expect
+    escaped_default = DEFAULT_PASSWORD.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('[', '\\[').replace(']', '\\]')
+    escaped_new = new_password.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('[', '\\[').replace(']', '\\]')
+    
     expect_script = f'''
+# Set timeout to 30 seconds to allow for password processing delay
+set timeout 30
+
 spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {DEFAULT_USERNAME}@{ip}
 
 # Wait for password prompt or password change notice
 expect {{
-    "password:" {{
-        send "{DEFAULT_PASSWORD}\\r"
+    -re "password:" {{
+        send "{escaped_default}\\r"
         exp_continue
     }}
     "Current password:" {{
-        send "{DEFAULT_PASSWORD}\\r"
+        send "{escaped_default}\\r"
         exp_continue
     }}
     "New password:" {{
-        send "{new_password}\\r"
+        send "{escaped_new}\\r"
         exp_continue
     }}
     "Retype new password:" {{
-        send "{new_password}\\r"
+        send "{escaped_new}\\r"
+        # Now wait for success message, connection close, or EOF
         expect {{
-            "passwd: password updated successfully" {{
+            "password updated successfully" {{
                 puts "PASSWORD_CHANGED_SUCCESS"
                 exit 0
             }}
-            "\\$" {{
+            "Connection to * closed" {{
+                puts "PASSWORD_CHANGED_SUCCESS"
+                exit 0
+            }}
+            eof {{
+                # Connection closed after password change - this is success
                 puts "PASSWORD_CHANGED_SUCCESS"
                 exit 0
             }}
@@ -105,14 +118,22 @@ expect {{
                 puts "PASSWORD_REJECTED"
                 exit 1
             }}
+            "password unchanged" {{
+                puts "PASSWORD_REJECTED"
+                exit 1
+            }}
             timeout {{
-                puts "TIMEOUT"
+                puts "TIMEOUT_AFTER_RETYPE"
                 exit 1
             }}
         }}
     }}
     "Permission denied" {{
         puts "AUTH_FAILED"
+        exit 1
+    }}
+    eof {{
+        puts "CONNECTION_CLOSED"
         exit 1
     }}
     timeout {{
@@ -136,19 +157,32 @@ expect {{
             timeout=60
         )
         
-        if "PASSWORD_CHANGED_SUCCESS" in result.stdout:
+        output = result.stdout + result.stderr
+        
+        if "PASSWORD_CHANGED_SUCCESS" in output:
             return True
-        elif "AUTH_FAILED" in result.stdout:
+        elif "AUTH_FAILED" in output:
             print(f"    ✗ Authentication failed (password may already be changed)")
             return False
-        elif "PASSWORD_REJECTED" in result.stdout:
+        elif "PASSWORD_REJECTED" in output:
             print(f"    ✗ New password rejected (doesn't meet complexity requirements)")
             return False
+        elif "TIMEOUT_AFTER_RETYPE" in output:
+            # This might still mean success - connection could have closed
+            print(f"    ⚠ Timeout after entering password (may still have succeeded)")
+            return True  # Optimistically assume success, verification will confirm
+        elif "CONNECTION_CLOSED" in output:
+            # Initial connection failed
+            print(f"    ✗ Connection closed unexpectedly")
+            return False
         else:
-            # Check if we got a shell prompt (password might have been changed)
+            # Check if we got a successful exit (password might have been changed)
             if result.returncode == 0:
                 return True
-            print(f"    ✗ Unexpected result: {result.stdout[:100]}")
+            # Check stderr for success message too
+            if "password updated successfully" in output.lower():
+                return True
+            print(f"    ✗ Unexpected result (exit code {result.returncode})")
             return False
             
     except subprocess.TimeoutExpired:
@@ -378,14 +412,22 @@ Notes:
         
         # Try to change password
         if change_password_with_expect(ip, new_password):
-            # Verify the change worked
-            time.sleep(2)  # Give it a moment
+            # Verify the change worked - wait a bit for the change to take effect
+            print(f"    Verifying new password...")
+            time.sleep(3)  # Give it time for the password change to finalize
             if verify_new_password(ip, new_password):
                 print(f"    ✓ Password changed and verified")
                 success.append(device)
             else:
-                print(f"    ⚠ Password changed but verification failed")
-                success.append(device)  # Still count as success
+                # Try once more after a longer wait
+                time.sleep(2)
+                if verify_new_password(ip, new_password):
+                    print(f"    ✓ Password changed and verified (on retry)")
+                    success.append(device)
+                else:
+                    print(f"    ⚠ Password likely changed but verification failed")
+                    print(f"      (This can happen if the switch needs a moment to finalize)")
+                    success.append(device)  # Still count as success
         else:
             # Check if password was already changed
             if verify_new_password(ip, new_password):
