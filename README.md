@@ -27,7 +27,8 @@ That's it! The script will guide you through the entire process:
 - **Auto-Discovery**: Automatically detects hostnames and MAC addresses from switches
 - **Network Detection**: Matches switch IPs to BCM networks
 - **Progress Tracking**: Resume interrupted deployments with `--resume`
-- **Airgapped Support**: Deploy on isolated networks with `--airgapped`
+- **Smart Caching**: Downloads dependencies once, reuses for all switches
+- **Fully Airgapped Support**: Package everything for isolated networks
 
 ## Usage
 
@@ -44,9 +45,19 @@ python3 deploy_bcm_switches.py --resume
 python3 deploy_bcm_switches.py --dry-run
 ```
 
-### Airgapped Deployment
+### How File Caching Works
 
-For BCM systems without internet access:
+The deployment script uses a "partially airgapped" approach by default:
+
+1. **First run**: Downloads `cm-lite-daemon.zip` and pip packages to `.files/`
+2. **All deployments**: Transfers cached files from BCM to switches via rsync
+3. **Switches never need internet access** - they receive everything from BCM
+
+This means you only need internet access on the BCM server for the initial download. Subsequent runs (including `--resume` and `--retry-failed`) reuse the cached files.
+
+### Fully Airgapped Deployment
+
+For BCM systems that have **no internet access at all**:
 
 1. **On a system with internet access**, prepare the deployment package:
    ```bash
@@ -59,8 +70,9 @@ For BCM systems without internet access:
    ```bash
    tar -xzf bcm-switches-deploy-airgapped-*.tar.gz
    cd bcm-switch-deploy
-   python3 deploy_bcm_switches.py --airgapped
+   python3 deploy_bcm_switches.py
    ```
+   The script will detect the pre-packaged files in `.files/` and use them automatically.
 
 ## Directory Structure
 

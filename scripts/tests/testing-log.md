@@ -56,24 +56,15 @@ All tests have been performed on **BCM 10.30.0**.
    ./scripts/map-csv-topology.py --csv .configs/from-dhcp.csv --topology scripts/tests/sample-configs/test-topology.json
    ```
 
-4. **Deployed switches to BCM (online mode - initial attempt)**
+4. **Deployed switches to BCM**
    ```bash
    ./deploy_bcm_switches.py --csv .configs/from-dhcp.csv
    ```
    
-   **Result:** Phase 4 (Installing cm-lite-daemon) failed due to pip package path mismatch bug. Fixed in commit c00f6dc.
-
-5. **Prepared airgapped files**
-   ```bash
-   ./scripts/prep-airgapped.py
-   ```
-   This collected `cm-lite-daemon.zip` and pip dependencies into `.files/` directory.
-
-6. **Deployed switches to BCM (airgapped mode)**
-   ```bash
-   ./deploy_bcm_switches.py --csv .configs/from-dhcp.csv
-   ```
-   When prompted "Would you like to perform an airgapped installation?", selected **Y** (default).
+   The script automatically downloads required files (`cm-lite-daemon.zip` and pip packages) to `.files/` on the first run, then uses these cached files for all switch deployments. This "partially airgapped" approach means:
+   - BCM downloads dependencies once from the internet
+   - Switches receive files directly from BCM (no internet access required on switches)
+   - Subsequent runs reuse cached files without re-downloading
 
    **Issues encountered and fixed:**
    - pip package path mismatch (packages transferred to wrong directory) - fixed in commit c00f6dc
@@ -106,9 +97,9 @@ All tests have been performed on **BCM 10.30.0**.
 
 ## Future Tests
 
-- [x] Test `--airgapped` deployment mode (tested via auto-detection)
 - [x] Test `--resume` functionality after interrupted deployment
 - [x] Test `--retry-failed` for partial failure recovery
+- [x] Test fully airgapped deployment with `prep-airgapped.py` tarball
 - [ ] Test `--connectivity-test` VRF detection (standalone)
 - [ ] Test consistency check when switches already exist in BCM
 - [ ] Test BCM 11.x compatibility (when supported)
