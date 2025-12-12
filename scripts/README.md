@@ -19,23 +19,35 @@ Generate a CSV file from DHCP leases for switch discovery.
 - `--filter VENDOR` - Filter by vendor class
 
 ### `change-switch-defaults.py`
-Change default password and/or hostname on Cumulus switches in a single SSH session.
+Change default password, hostname, and/or ZTP settings on Cumulus switches.
 
 ```bash
-# Change both password and hostname (most efficient)
-./scripts/change-switch-defaults.py --csv .configs/from-dhcp.csv --password --hostname
+# Do ALL actions (default behavior for fresh switches)
+./scripts/change-switch-defaults.py --csv .configs/from-dhcp.csv
 
 # Change password only
 ./scripts/change-switch-defaults.py --csv .configs/from-dhcp.csv --password
 
 # Change hostname only (when password already changed)
 ./scripts/change-switch-defaults.py --csv .configs/from-dhcp.csv --hostname --current-password <pwd>
+
+# Disable ZTP only
+./scripts/change-switch-defaults.py --csv .configs/from-dhcp.csv --disable-ztp --current-password <pwd>
+
+# Combine specific actions
+./scripts/change-switch-defaults.py --csv .configs/from-dhcp.csv --password --disable-ztp
 ```
+
+**Default behavior:** If no action flags are specified, ALL actions are performed:
+- Change password (from default cumulus/cumulus)
+- Set hostname (from CSV file)
+- Disable ZTP on the switch
 
 **Options:**
 - `--csv FILE` - Required. CSV file with switch info
 - `--password` - Change the default password
 - `--hostname` - Set hostname from CSV file
+- `--disable-ztp` - Disable ZTP on the switches (runs `sudo ztp --disable`)
 - `--current-password PWD` - Current password if not default
 - `--dry-run` - Show what would be done
 

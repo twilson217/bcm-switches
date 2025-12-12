@@ -623,6 +623,31 @@ class SwitchDiscovery:
         result = self._run_ssh_command(ip, "echo ok")
         return result == "ok"
     
+    def check_ztp_status(self, ip: str) -> Optional[str]:
+        """Check ZTP status on a switch.
+        
+        Returns:
+            'enabled', 'disabled', or None if unable to check
+        """
+        # Run: sudo ztp -s | grep -i service
+        # Need to use sudo, so we need to handle password
+        ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15"
+        cmd = f"sshpass -p '{self.password}' ssh {ssh_opts} {self.username}@{ip} " \
+              f"'echo {self.password} | sudo -S ztp -s 2>/dev/null | grep -i service'"
+        
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            output = result.stdout.lower()
+            
+            if 'disabled' in output:
+                return 'disabled'
+            elif 'enabled' in output:
+                return 'enabled'
+            else:
+                return None
+        except:
+            return None
+    
     def get_vrf_for_ip(self, host: str, target_ip: str) -> Optional[str]:
         """Detect which VRF an IP address belongs to on a switch.
         
@@ -2093,6 +2118,34 @@ Notes:
         devices = config.progress['devices']
         if devices:
             write_csv(devices, network)
+            
+            # Check ZTP status on discovered switches
+            print("\n" + "-" * 70)
+            print("Checking ZTP status on switches...")
+            ztp_enabled = []
+            for d in devices:
+                status = discovery.check_ztp_status(d['ip'])
+                print(f"  {d['hostname']}: ZTP {status or 'unknown'}")
+                if status == 'enabled':
+                    ztp_enabled.append(d['hostname'])
+            
+            if ztp_enabled:
+                print("\n" + "!" * 70)
+                print("WARNING: ZTP IS ENABLED ON THESE SWITCHES:")
+                for name in ztp_enabled:
+                    print(f"  - {name}")
+                print("\n⚠ This script has NOT been tested with ZTP enabled.")
+                print("  BCM integration may affect existing ZTP configuration.")
+                print("\n  To disable ZTP first, run:")
+                print("    ./scripts/change-switch-defaults.py --disable-ztp --csv <file>")
+                print("!" * 70)
+                resp = input("\nContinue anyway? (yes/no) [no]: ").strip().lower()
+                if resp != 'yes':
+                    print("\nExiting. Disable ZTP first, then run again.")
+                    sys.exit(1)
+            else:
+                print("✓ ZTP disabled on all switches")
+            
             config.set_phase('bcm_add')
         else:
             print("\nNo devices discovered. Exiting.")
