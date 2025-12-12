@@ -56,18 +56,34 @@ All tests have been performed on **BCM 10.30.0**.
    ./scripts/map-csv-topology.py --csv .configs/from-dhcp.csv --topology docs/test-topology.json
    ```
 
-4. **Deployed switches to BCM**
+4. **Deployed switches to BCM (online mode - initial attempt)**
    ```bash
    ./deploy_bcm_switches.py --csv .configs/from-dhcp.csv
    ```
+   
+   **Result:** Phase 4 (Installing cm-lite-daemon) failed due to pip package path mismatch bug. Fixed in commit c00f6dc.
+
+5. **Prepared airgapped files**
+   ```bash
+   ./scripts/prep-airgapped.py
+   ```
+   This collected `cm-lite-daemon.zip` and pip dependencies into `.files/` directory.
+
+6. **Deployed switches to BCM (airgapped mode)**
+   ```bash
+   ./deploy_bcm_switches.py --csv .configs/from-dhcp.csv
+   ```
+   When prompted "Would you like to perform an airgapped installation?", selected **Y** (default).
 
 ### Status
 
-🔄 **In Progress** - Currently at step 4 (deploy_bcm_switches.py)
+🔄 **In Progress** - Phase 4 (pip install) still failing. Debugging in progress.
 
 ### Results
 
-*(To be updated as testing continues)*
+- **Phase 2 (Add to BCM):** ✅ All 6 devices added successfully
+- **Phase 3 (Transfer):** ✅ Files transferred successfully  
+- **Phase 4 (Install):** ❌ pip install failing - investigating
 
 ---
 

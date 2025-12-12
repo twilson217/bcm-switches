@@ -877,6 +877,14 @@ class BCMDeployer:
         result = self._run_ssh_command(device['ip'], "test -d /opt/cm-lite-daemon && echo yes")
         return result == "yes"
     
+    def check_transfer_complete(self, device: Dict) -> bool:
+        """Check if all required files have been transferred to the device."""
+        # Check for both cm-lite-daemon.zip and pip_packages_dep directory
+        result = self._run_ssh_command(device['ip'], 
+            f"test -d /home/{self.username}/pip_packages_dep && "
+            f"test -f /home/{self.username}/cm-lite-daemon.zip && echo yes")
+        return result == "yes"
+    
     def check_daemon_registered(self, device: Dict) -> bool:
         """Check if device is already registered with BCM (has certificates)."""
         result = self._run_ssh_command(device['ip'], 
@@ -953,9 +961,9 @@ class BCMDeployer:
             print(f"    [DRY RUN] Would transfer daemon to {device['hostname']}")
             return True
         
-        # Check if already installed
-        if skip_if_exists and self.check_daemon_installed(device):
-            print(f"    ✓ cm-lite-daemon already installed on {device['hostname']}, skipping transfer")
+        # Check if all required files are already on the device
+        if skip_if_exists and self.check_transfer_complete(device):
+            print(f"    ✓ Files already present on {device['hostname']}, skipping transfer")
             return True
         
         work_dir = Path(tempfile.mkdtemp(prefix="cm_lite_daemon_"))
