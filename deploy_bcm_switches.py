@@ -1045,7 +1045,9 @@ class BCMDeployer:
                 print(f"    ✗ Failed to transfer cm-lite-daemon.zip")
                 return False
             
-            if not run_rsync(str(pip_packages_dir) + "/", target, "Transferring pip packages"):
+            # pip packages need to go to pip_packages_dep/ subdirectory
+            pip_target = f"{self.username}@{device['ip']}:/home/{self.username}/pip_packages_dep/"
+            if not run_rsync(str(pip_packages_dir) + "/", pip_target, "Transferring pip packages"):
                 print(f"    ✗ Failed to transfer pip_packages_dep")
                 return False
             
