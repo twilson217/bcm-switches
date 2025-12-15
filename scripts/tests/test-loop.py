@@ -32,7 +32,7 @@ Usage:
     ./test-loop.py --test2      # Run only Test 2
     ./test-loop.py --test3      # Run only Test 3
     ./test-loop.py --dry-run    # Show what would be done
-    ./test-loop.py --no-reset   # Skip simulation reset
+    ./test-loop.py --no-reset   # Skip switch-only rebuild + BCM cleanup
     ./test-loop.py --verbose    # Show detailed output
 """
 
@@ -692,17 +692,23 @@ class TestRunner:
         return result
     
     def reset_simulation(self) -> StepResult:
-        """Reset the NVIDIA Air simulation and clean BCM."""
-        print("\n  Step: Reset Simulation")
+        """
+        Rebuild the *test switches only* in NVIDIA Air and remove those test switches from BCM.
+
+        IMPORTANT: This does NOT reset the entire NVIDIA Air simulation and does NOT rebuild/reset
+        the BCM node. It only rebuilds the specific switch nodes defined by the test topology and
+        performs BCM device cleanup for those switches.
+        """
+        print("\n  Step: Rebuild test switches + BCM cleanup (NOT full simulation reset)")
         
         if self.dry_run:
-            print("    [DRY RUN] Would reset simulation")
+            print("    [DRY RUN] Would rebuild test switches + clean BCM (NOT full simulation reset)")
             return StepResult(name="reset", success=True, duration=0,
                             message="[DRY RUN] Skipped")
         
         start = time.time()
         
-        # Run test-sim-reset.py
+        # Run test-sim-reset.py (switch-only rebuild + BCM device cleanup)
         result = run_script(
             "scripts/tests/test-sim-reset.py", 
             "", 
@@ -982,7 +988,7 @@ class TestRunner:
         Test 1: Full Deployment from DHCP Leases
         
         Steps:
-        1. Reset simulation
+        1. Rebuild test switches + BCM cleanup (NOT full simulation reset)
         2. Generate CSV from DHCP
         3. Change default passwords
         4. Map hostnames from topology
@@ -1007,7 +1013,7 @@ class TestRunner:
         
         steps = []
         
-        # Step 1: Reset simulation
+        # Step 1: Rebuild test switches + BCM cleanup
         if not skip_reset:
             step = self.reset_simulation()
             steps.append(step)
@@ -1081,7 +1087,7 @@ class TestRunner:
         Test 2: Deployment with Switch Setup First
         
         Steps:
-        1. Reset simulation
+        1. Rebuild test switches + BCM cleanup (NOT full simulation reset)
         2. Generate CSV from DHCP
         3. Map hostnames from topology
         4. Change passwords AND set hostnames on switches
@@ -1106,7 +1112,7 @@ class TestRunner:
         
         steps = []
         
-        # Step 1: Reset simulation
+        # Step 1: Rebuild test switches + BCM cleanup
         if not skip_reset:
             step = self.reset_simulation()
             steps.append(step)
@@ -1180,7 +1186,7 @@ class TestRunner:
         Test 3: Install on Switches Already in BCM (--from-bcm mode)
         
         Steps:
-        1. Reset simulation
+        1. Rebuild test switches + BCM cleanup (NOT full simulation reset)
         2. Generate CSV from DHCP
         3. Change default passwords
         4. Map hostnames from topology
@@ -1206,7 +1212,7 @@ class TestRunner:
         
         steps = []
         
-        # Step 1: Reset simulation
+        # Step 1: Rebuild test switches + BCM cleanup
         if not skip_reset:
             step = self.reset_simulation()
             steps.append(step)
@@ -1343,7 +1349,8 @@ Examples:
   %(prog)s --test1            # Run only Test 1
   %(prog)s --test2            # Run only Test 2
   %(prog)s --test3            # Run only Test 3
-  %(prog)s --test1 --no-reset # Run Test 1 without resetting simulation
+  %(prog)s --test1 --no-reset # Run Test 1 without rebuilding test switches / BCM cleanup
+  %(prog)s --stop-on-fail     # Stop after the first test failure (preserve state for debugging)
   %(prog)s --dry-run          # Show what would be done
 
 Prerequisites:
@@ -1360,7 +1367,9 @@ Prerequisites:
     parser.add_argument("--test3", action="store_true",
                        help="Run only Test 3 (--from-bcm mode)")
     parser.add_argument("--no-reset", action="store_true",
-                       help="Skip simulation reset (use existing state)")
+                       help="Skip switch-only rebuild + BCM device cleanup (use existing test state)")
+    parser.add_argument("--stop-on-fail", action="store_true",
+                       help="Stop after the first test failure (do not proceed to subsequent tests)")
     parser.add_argument("--dry-run", action="store_true",
                        help="Show what would be done without running")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -1421,17 +1430,20 @@ Prerequisites:
         if run_test3:
             selected.append(("Test 3", runner.run_test_3))
 
-        # If running multiple tests, we *always* reset before each test to ensure isolation.
+        # If running multiple tests, we *always* rebuild the test switches + clean BCM before each test to ensure isolation.
         # --no-reset is only respected when running exactly one test.
         if args.no_reset and len(selected) > 1:
             print("\nNOTE: --no-reset was specified, but multiple tests were selected.")
-            print("      For isolation, this run will reset between tests (ignoring --no-reset).")
+            print("      For isolation, this run will rebuild test switches + clean BCM between tests (ignoring --no-reset).")
 
         for name, fn in selected:
             runner._current_test_name = name
             skip_reset = args.no_reset and len(selected) == 1
             result = fn(skip_reset=skip_reset)
             runner.results.append(result)
+            if args.stop_on_fail and not result.success:
+                print("\nNOTE: --stop-on-fail enabled; stopping after first failure to preserve state for debugging.")
+                break
 
         # Print summary
         all_passed = runner.print_summary()

@@ -1468,24 +1468,39 @@ def ensure_local_files():
         temp_req.write_text(requirements)
         
         try:
-            # Download packages for Python 3.11 (Cumulus Linux default)
-            print(f"  Downloading pip packages for Python 3.11...")
+            # Download packages for Python 3.11 (Cumulus Linux default).
+            #
+            # NOTE: pip requires additional flags when using --python-version/--platform/--abi/etc.
+            # See: pip's "restricting platform and interpreter constraints" error guidance.
+            print("  Downloading pip packages for Python 3.11...")
             cmd = [
                 "pip", "download",
-                "--python-version", "3.11",
                 "-r", str(temp_req),
-                "--dest", str(pip_packages)
+                "--dest", str(pip_packages),
+                "--python-version", "3.11",
+                "--implementation", "cp",
+                "--abi", "cp311",
+                "--platform", "manylinux2014_x86_64",
+                "--only-binary", ":all:",
+                "--no-binary", ":none:",
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            
-            if result.returncode != 0:
-                print(f"  ⚠ Some packages may have failed to download")
-                print(f"    {result.stderr[:200] if result.stderr else ''}")
-            
+
             # Count downloaded packages
             package_count = len(list(pip_packages.glob("*")))
+
+            if result.returncode != 0 or package_count == 0:
+                print("  ✗ Failed to download required pip packages for offline install")
+                if result.stderr:
+                    print("    pip stderr (first 500 chars):")
+                    print(f"    {result.stderr[:500]}")
+                if result.stdout:
+                    print("    pip stdout (first 500 chars):")
+                    print(f"    {result.stdout[:500]}")
+                return False
+
             print(f"  ✓ Downloaded {package_count} package files")
-            
+
         finally:
             # Clean up temp requirements
             if temp_req.exists():
@@ -1940,7 +1955,10 @@ Notes:
             print("2. Check BCM for device connectivity")
             print("3. Monitor logs for any issues")
         
-        sys.exit(0)
+        # Exit non-zero if any devices failed. We may still proceed through later phases
+        # (especially in non-interactive mode), but callers (e.g., test-loop) need an
+        # accurate success/failure signal.
+        sys.exit(0 if failed_count == 0 else 1)
 
     # Handle CSV mode
     if args.csv:
@@ -2274,7 +2292,8 @@ Notes:
             config.clear_progress()
             print("\nDeployment completed successfully!")
         
-        sys.exit(0)
+        # Exit non-zero if any devices failed.
+        sys.exit(0 if not config.progress.get('failed_ips') else 1)
 
 
     # Handle retry-failed mode

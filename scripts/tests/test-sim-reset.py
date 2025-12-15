@@ -575,11 +575,11 @@ Examples:
     print("\n" + "=" * 60)
     print("Reset Complete!")
     print("=" * 60)
-    print("\nThe test environment is ready. Next steps:")
+    print("\nThe test environment is ready. Next steps (informational):")
     print("  1. Wait for switches to get DHCP addresses (~1-2 min)")
     print("  2. Run: ./scripts/csv-from-dhcp.py")
-    print("  3. Run: ./scripts/change-default-password.py --csv .configs/from-dhcp.csv")
-    print("  4. Run: ./deploy_bcm_switches.py --csv .configs/from-dhcp.csv")
+    print("  3. Run: ./scripts/change-switch-defaults.py --csv .configs/from-dhcp.csv --password <old> --new-password <new>")
+    print("  4. Run: ./deploy_bcm_switches.py --csv .configs/from-dhcp.csv --non-interactive --username <user> --password <pwd>")
 
 
 if __name__ == "__main__":
