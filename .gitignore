@@ -2,6 +2,9 @@
 .configs/
 .docs/
 
+# Local logs
+.logs/
+
 # Test scripts secrets and virtualenv
 scripts/tests/.env
 scripts/tests/.venv/

@@ -38,12 +38,14 @@ Usage:
 
 import argparse
 import shlex
+import re
 import csv
 import json
 import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +59,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_DIR = SCRIPT_DIR.parent.parent
 SCRIPTS_DIR = REPO_DIR / "scripts"
 CONFIG_DIR = REPO_DIR / ".configs"
+LOGS_DIR = REPO_DIR / ".logs"
 TOPOLOGY_FILE = SCRIPT_DIR / "sample-configs" / "test-topology.json"
 
 # CSV file paths
@@ -85,6 +88,7 @@ class StepResult:
     duration: float
     message: str
     output: str = ""
+    command: str = ""
 
 
 @dataclass
@@ -154,7 +158,8 @@ def run_script(script_path: str, args: str = "", timeout: int = 600,
         success=success,
         duration=duration,
         message=message,
-        output=output
+        output=output,
+        command=cmd
     )
 
 
@@ -274,6 +279,119 @@ def add_devices_to_bcm_only(csv_path: Path, username: str, password: str) -> boo
         return False
 
 
+
+
+
+
+def _redact_argv(argv):
+    """Redact secrets from argv list."""
+    out = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--password' and i + 1 < len(argv):
+            out.extend(['--password', '******'])
+            i += 2
+            continue
+        if a.startswith('--password='):
+            out.append('--password=******')
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def _redact_cmd(cmd: str) -> str:
+    # Replace common password forms
+    cmd = re.sub(r"(--password)\s+([^\s]+)", r"\1 ******", cmd)
+    cmd = re.sub(r"--password=([^\s]+)", "--password=******", cmd)
+    return cmd
+# ============================================================================
+# Logging
+# ============================================================================
+
+def _safe_filename(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
+
+
+class RunLogger:
+    """Writes per-step logs + a run summary under .logs/."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+        self.run_dir = LOGS_DIR / "test-loop" / self.run_id
+        self.steps = []
+
+        if self.enabled:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_run_info(self, argv: List[str]):
+        if not self.enabled:
+            return
+        info = {
+            "run_id": self.run_id,
+            "start_time": datetime.now().isoformat(),
+            "cwd": str(REPO_DIR),
+            "argv": _redact_argv(argv),
+        }
+        (self.run_dir / "run-info.json").write_text(json.dumps(info, indent=2))
+
+    def write_step(self, test_name: str, step: StepResult):
+        if not self.enabled:
+            return
+
+        idx = len(self.steps) + 1
+        fname = f"{idx:02d}_{_safe_filename(test_name)}_{_safe_filename(step.name)}.log"
+        meta = {
+            "test": test_name,
+            "step": step.name,
+            "success": step.success,
+            "duration_seconds": step.duration,
+            "message": step.message,
+            "command": _redact_cmd(step.command),
+        }
+        body = []
+        body.append("=" * 80)
+        body.append("META")
+        body.append("=" * 80)
+        body.append(json.dumps(meta, indent=2))
+        body.append("\n" + "=" * 80)
+        body.append("OUTPUT")
+        body.append("=" * 80)
+        body.append(step.output or "")
+        (self.run_dir / fname).write_text("\n".join(body))
+
+        self.steps.append(meta)
+
+    def write_summary(self, results: List[TestResult]):
+        if not self.enabled:
+            return
+        summary = {
+            "run_id": self.run_id,
+            "end_time": datetime.now().isoformat(),
+            "tests": [],
+        }
+        for t in results:
+            summary["tests"].append({
+                "name": t.name,
+                "success": t.success,
+                "start_time": t.start_time,
+                "end_time": t.end_time,
+                "duration_seconds": t.duration,
+                "steps": [
+                    {
+                        "name": s.name,
+                        "success": s.success,
+                        "duration_seconds": s.duration,
+                        "message": s.message,
+                        "command": _redact_cmd(getattr(s, "command", "")),
+                    }
+                    for s in t.steps
+                ],
+            })
+        (self.run_dir / "run-summary.json").write_text(json.dumps(summary, indent=2))
 # ============================================================================
 # Test Implementations
 # ============================================================================
@@ -282,27 +400,32 @@ class TestRunner:
     """Runs automated tests."""
     
     def __init__(self, verbose: bool = False, dry_run: bool = False, 
-                 password: str = DEFAULT_TEST_PASSWORD):
+                 password: str = DEFAULT_TEST_PASSWORD, logger: "RunLogger" = None):
         self.verbose = verbose
         self.dry_run = dry_run
         self.password = password
         self.results: List[TestResult] = []
+        self.logger = logger
     
     def run_step(self, name: str, script: str, args: str = "", 
                  timeout: int = 600, input_text: str = None) -> StepResult:
         """Run a single test step."""
         print(f"\n  Step: {name}")
-        
+
         if self.dry_run:
             print(f"    [DRY RUN] Would run: {script} {args}")
-            return StepResult(name=name, success=True, duration=0, 
-                            message="[DRY RUN] Skipped")
+            cmd = f"python3 {REPO_DIR / script} {args}".strip()
+            return StepResult(name=name, success=True, duration=0,
+                            message="[DRY RUN] Skipped", command=cmd)
         
         result = run_script(script, args, timeout, input_text, self.verbose)
         
         status = "✓" if result.success else "✗"
         print(f"    {status} {result.message} ({result.duration:.1f}s)")
-        
+
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
+
         return result
     
     def reset_simulation(self) -> StepResult:
@@ -332,6 +455,8 @@ class TestRunner:
         wait_with_countdown(BOOT_STABILIZE_SECONDS, "Waiting for boot stabilization...")
         
         result.duration = time.time() - start
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
         return result
     
     def generate_csv_from_dhcp(self) -> StepResult:
@@ -844,8 +969,14 @@ Prerequisites:
             print("Please copy sample-configs/sample.env to .env and configure it.")
             sys.exit(1)
     
+    # Logging
+    logger = RunLogger(enabled=not args.dry_run)
+    if not args.dry_run:
+        logger.write_run_info(sys.argv)
+        print(f"\nLogs will be written to: {logger.run_dir}")
+
     # Run tests
-    runner = TestRunner(verbose=args.verbose, dry_run=args.dry_run, password=test_password)
+    runner = TestRunner(verbose=args.verbose, dry_run=args.dry_run, password=test_password, logger=logger)
     
     try:
         selected = []
@@ -863,12 +994,15 @@ Prerequisites:
             print("      For isolation, this run will reset between tests (ignoring --no-reset).")
 
         for name, fn in selected:
+            runner._current_test_name = name
             skip_reset = args.no_reset and len(selected) == 1
             result = fn(skip_reset=skip_reset)
             runner.results.append(result)
 
         # Print summary
         all_passed = runner.print_summary()
+        if not args.dry_run:
+            logger.write_summary(runner.results)
 
         # Exit code
         sys.exit(0 if all_passed else 1)
