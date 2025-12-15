@@ -1494,14 +1494,127 @@ def ensure_local_files():
     return True
 
 
+def get_bcm_switches() -> List[Dict]:
+    """Get all switches currently in BCM.
+    
+    Returns list of dicts with: hostname, ip, mac, network, status
+    """
+    try:
+        result = subprocess.run(
+            ["cmsh", "-c", "device;list -t switch"],
+            capture_output=True, text=True, check=True
+        )
+        return parse_bcm_switch_list(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"Error querying BCM switches: {e}")
+        return []
+    except FileNotFoundError:
+        print("Error: cmsh command not found.")
+        return []
+
+
+def parse_bcm_switch_list(output: str) -> List[Dict]:
+    """Parse 'cmsh device;list -t switch' output.
+    
+    Format:
+    Type       Hostname (key)   MAC                Category  IP              Network        Status
+    ---------- ---------------- ------------------ --------- --------------- -------------- --------
+    Switch     leaf-01          48:B0:2D:3B:C8:E6            192.168.200.166 internalnet    [   UP   ]
+    """
+    switches = []
+    lines = output.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Skip header lines
+        if line.startswith('Type') or '--' in line and line.count('-') > 10:
+            continue
+        
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        
+        # First part should be "Switch"
+        if parts[0] != 'Switch':
+            continue
+        
+        try:
+            hostname = parts[1]
+            mac = parts[2].upper() if ':' in parts[2] else ''
+            
+            # Find IP address (looks like x.x.x.x)
+            ip = ''
+            network = ''
+            status = ''
+            
+            for i, part in enumerate(parts[3:], 3):
+                if '.' in part and part.count('.') == 3:
+                    try:
+                        ipaddress.ip_address(part)
+                        ip = part
+                        # Network is usually the next field
+                        if i + 1 < len(parts):
+                            network = parts[i + 1]
+                        break
+                    except ValueError:
+                        continue
+            
+            # Extract status (text between [ and ])
+            status_match = re.search(r'\[\s*(\w+)\s*\]', line)
+            if status_match:
+                status = status_match.group(1)
+            
+            if ip:
+                switches.append({
+                    'hostname': hostname,
+                    'ip': ip,
+                    'mac': mac,
+                    'network': network,
+                    'status': status
+                })
+        except (ValueError, IndexError):
+            continue
+    
+    return switches
+
+
+def display_initial_menu() -> int:
+    """Display the initial menu and return user's choice (1, 2, or 3)."""
+    print("\n" + "=" * 70)
+    print("What switches do you want to add?")
+    print("=" * 70)
+    print("""
+  1) I want to provide the IP Addresses and let the script figure out
+     the other info.
+
+  2) I have prepared a CSV file, and I want to use that.
+
+  3) I have already added the switches to BCM, and I just want the
+     script to install cm-lite-daemon.
+""")
+    
+    while True:
+        try:
+            choice = input("Select an option (1/2/3): ").strip()
+            if choice in ['1', '2', '3']:
+                return int(choice)
+            print("Please enter 1, 2, or 3.")
+        except (ValueError, EOFError):
+            print("Please enter 1, 2, or 3.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Deploy Cumulus switches to BCM",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                      # Normal interactive mode
+  %(prog)s                      # Interactive mode (shows menu)
   %(prog)s --csv .configs/from-dhcp.csv  # Deploy from CSV file
+  %(prog)s --from-bcm           # Install cm-lite-daemon on switches already in BCM
   %(prog)s --resume             # Resume from previous progress
   %(prog)s --retry-failed       # Retry only the previously failed devices
   %(prog)s --dry-run            # Show what would be done
@@ -1524,6 +1637,8 @@ Notes:
                        help="Run connectivity test and VRF auto-detection only")
     parser.add_argument("--csv", type=Path, metavar="FILE",
                        help="Use CSV file as source of truth for switch information")
+    parser.add_argument("--from-bcm", action="store_true",
+                       help="Install cm-lite-daemon on switches already added to BCM")
     
     args = parser.parse_args()
     
@@ -1537,6 +1652,234 @@ Notes:
     # Initialize config manager
     config = ConfigManager()
     
+    # Show initial menu if no specific mode selected
+    # Skip menu for: --csv, --from-bcm, --resume, --retry-failed, --connectivity-test
+    if not (args.csv or args.from_bcm or args.resume or args.retry_failed or args.connectivity_test):
+        menu_choice = display_initial_menu()
+        
+        if menu_choice == 2:
+            # User chose CSV mode - ask for path
+            csv_path = input("\nEnter path to CSV file: ").strip()
+            if not csv_path:
+                print("Error: CSV path is required.")
+                sys.exit(1)
+            args.csv = Path(csv_path)
+            if not args.csv.exists():
+                print(f"Error: CSV file not found: {args.csv}")
+                sys.exit(1)
+        
+        elif menu_choice == 3:
+            # User chose from-BCM mode
+            args.from_bcm = True
+        
+        # menu_choice == 1 continues with default flow
+
+    # Handle --from-bcm mode (install on switches already in BCM)
+    if args.from_bcm:
+        print("\n" + "=" * 70)
+        print("FROM-BCM Mode: Installing on switches already in BCM")
+        print("=" * 70)
+        
+        # Get switches from BCM
+        print("\nRetrieving switches from BCM...")
+        bcm_switches = get_bcm_switches()
+        
+        if not bcm_switches:
+            print("No switches found in BCM. Add switches first or use a different mode.")
+            sys.exit(1)
+        
+        print(f"\nFound {len(bcm_switches)} switch(es) in BCM:")
+        print("-" * 70)
+        print(f"{'#':<4} {'Hostname':<16} {'IP':<16} {'Network':<15} {'Status':<10}")
+        print("-" * 70)
+        for i, sw in enumerate(bcm_switches, 1):
+            print(f"{i:<4} {sw['hostname']:<16} {sw['ip']:<16} {sw['network']:<15} {sw['status']:<10}")
+        print("-" * 70)
+        
+        # Ask if user wants to exclude any switches
+        response = input("\nWould you like to exclude any switches? (y/n) [n]: ").strip().lower()
+        if response in ['y', 'yes']:
+            print("\nEnter IP addresses or hostnames to exclude.")
+            print("  - Comma-separated: 192.168.200.161, 192.168.200.162")
+            print("  - IP range: 192.168.200.161-165")
+            print("  - Hostnames: spine-01, spine-02")
+            exclude_input = input("\nExclude: ").strip()
+            
+            if exclude_input:
+                # Parse exclusions
+                exclude_set = set()
+                parts = [p.strip() for p in exclude_input.replace(' ', '').split(',')]
+                
+                for part in parts:
+                    if not part:
+                        continue
+                    
+                    # Check if it's an IP range
+                    if '-' in part and '.' in part:
+                        exclude_ips = IPAddressParser.parse(part)
+                        exclude_set.update(exclude_ips)
+                    elif '.' in part:
+                        # Single IP
+                        exclude_set.add(part)
+                    else:
+                        # Hostname - find corresponding IP
+                        for sw in bcm_switches:
+                            if sw['hostname'].lower() == part.lower():
+                                exclude_set.add(sw['ip'])
+                                break
+                
+                # Filter switches
+                original_count = len(bcm_switches)
+                bcm_switches = [sw for sw in bcm_switches if sw['ip'] not in exclude_set]
+                excluded_count = original_count - len(bcm_switches)
+                print(f"\nExcluded {excluded_count} switch(es). Proceeding with {len(bcm_switches)}.")
+                
+                if not bcm_switches:
+                    print("No switches remaining after exclusions. Exiting.")
+                    sys.exit(0)
+        
+        # Prompt for credentials
+        print("\n" + "-" * 60)
+        print("CREDENTIALS")
+        print("-" * 60)
+        
+        # Check for existing config
+        if config.load():
+            current_user = config.get('username', 'cumulus')
+            current_pass = config.get('password', '')
+            print(f"\nExisting credentials found (username: {current_user})")
+            response = input("Use existing credentials? (y/n) [y]: ").strip().lower()
+            if response not in ['n', 'no']:
+                username = current_user
+                password = current_pass
+                print("Using existing credentials.")
+            else:
+                username = input(f"Enter SSH username [{current_user}]: ").strip() or current_user
+                password = getpass.getpass("Enter SSH password: ")
+        else:
+            username = input("Enter SSH username [cumulus]: ").strip() or "cumulus"
+            password = getpass.getpass("Enter SSH password: ")
+        
+        # Get VRF - use default or prompt
+        vrf = config.get('vrf', 'default')
+        if not vrf:
+            vrf = 'default'
+        print(f"\nUsing VRF: {vrf}")
+        
+        # Save config
+        config.set('username', username)
+        config.set('password', password)
+        config.set('vrf', vrf)
+        config.set('switch_ips', [sw['ip'] for sw in bcm_switches])
+        config.save()
+        
+        # Convert bcm_switches to devices format
+        devices = bcm_switches
+        
+        # Initialize deployer
+        deployer = BCMDeployer(username, password, vrf, args.dry_run)
+        
+        # Ensure local files are ready
+        if not ensure_local_files():
+            print("\nError: Failed to prepare deployment files. Exiting.")
+            sys.exit(1)
+        
+        # Phase 3: Transfer daemon (skip phases 1 and 2)
+        print("\n" + "=" * 70)
+        print("PHASE 3: Transferring cm-lite-daemon")
+        print("=" * 70)
+        
+        success_count = 0
+        failed_count = 0
+        failed_devices = []
+        
+        for i, device in enumerate(devices, 1):
+            print(f"\n[{i}/{len(devices)}] Transferring to {device['hostname']} ({device['ip']})...")
+            if deployer.transfer_daemon(device):
+                print(f"    ✓ Transfer complete")
+                success_count += 1
+            else:
+                print(f"    ✗ Transfer failed")
+                failed_count += 1
+                failed_devices.append(device['hostname'])
+        
+        if failed_count > 0:
+            print(f"\n⚠ {failed_count} device(s) failed transfer: {', '.join(failed_devices)}")
+            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+            if response not in ['y', 'yes']:
+                print("\nExiting.")
+                sys.exit(1)
+        
+        # Phase 4: Install daemon
+        print("\n" + "=" * 70)
+        print("PHASE 4: Installing cm-lite-daemon")
+        print("=" * 70)
+        
+        success_count = 0
+        failed_count = 0
+        failed_devices = []
+        
+        for i, device in enumerate(devices, 1):
+            print(f"\n[{i}/{len(devices)}] Installing on {device['hostname']} ({device['ip']})...")
+            if deployer.install_daemon(device):
+                print(f"    ✓ Installation complete")
+                success_count += 1
+            else:
+                print(f"    ✗ Installation failed")
+                failed_count += 1
+                failed_devices.append(device['hostname'])
+        
+        if failed_count > 0:
+            print(f"\n⚠ {failed_count} device(s) failed installation: {', '.join(failed_devices)}")
+            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+            if response not in ['y', 'yes']:
+                print("\nExiting.")
+                sys.exit(1)
+        
+        # Phase 5: Register with BCM
+        print("\n" + "=" * 70)
+        print("PHASE 5: Registering devices with BCM")
+        print("=" * 70)
+        
+        success_count = 0
+        failed_count = 0
+        failed_devices = []
+        
+        for i, device in enumerate(devices, 1):
+            print(f"\n[{i}/{len(devices)}] Registering {device['hostname']} ({device['ip']})...")
+            if deployer.register_device(device):
+                print(f"    ✓ Registration complete")
+                success_count += 1
+            else:
+                print(f"    ✗ Registration failed")
+                failed_count += 1
+                failed_devices.append(device['hostname'])
+        
+        # Phase 6: Configure monitoring-only mode
+        print("\n" + "=" * 70)
+        print("PHASE 6: Configuring for monitoring-only mode")
+        print("=" * 70)
+        
+        configure_monitoring_only_mode(devices, dry_run=args.dry_run)
+        
+        # Summary
+        print("\n" + "=" * 70)
+        print("DEPLOYMENT SUMMARY (from-BCM mode)")
+        print("=" * 70)
+        
+        print(f"\nTotal devices processed: {len(devices)}")
+        if failed_devices:
+            print(f"Failed devices: {', '.join(failed_devices)}")
+        else:
+            print("All devices completed successfully!")
+        
+        if not args.dry_run:
+            print("\nNext steps:")
+            print("1. Verify cm-lite-daemon service status on devices")
+            print("2. Check BCM for device connectivity")
+            print("3. Monitor logs for any issues")
+        
+        sys.exit(0)
 
     # Handle CSV mode
     if args.csv:
