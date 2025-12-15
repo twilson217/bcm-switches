@@ -26,12 +26,11 @@ import sys
 import time
 from pathlib import Path
 
-try:
-    import requests
-    from dotenv import load_dotenv
-except ImportError:
-    print("Error: Missing dependencies. Run: pip install -r requirements.txt")
-    sys.exit(1)
+"""
+Note on dependencies:
+- This script supports `--help` even if optional deps are not installed.
+- Runtime API calls require: `requests` and `python-dotenv` (see scripts/tests/requirements.txt).
+"""
 
 # Constants
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -49,6 +48,12 @@ def load_env_file():
     if not ENV_FILE.exists():
         return None
     
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except ImportError:
+        print("Error: Missing dependency 'python-dotenv'. Run: pip install -r requirements.txt")
+        sys.exit(1)
+    
     load_dotenv(ENV_FILE)
     return {
         'AIR_API_TOKEN': os.getenv('AIR_API_TOKEN'),
@@ -57,6 +62,13 @@ def load_env_file():
         'SIMULATION_NAME': os.getenv('SIMULATION_NAME'),
         'SIMULATION_ID': os.getenv('SIMULATION_ID'),
     }
+
+
+def _effective_simulation_from_args_env(args, env: dict) -> tuple:
+    """Return (sim_name, sim_id) with CLI args taking precedence over env."""
+    sim_id = args.sim_id or env.get('SIMULATION_ID')
+    sim_name = args.sim_name or env.get('SIMULATION_NAME')
+    return sim_name, sim_id
 
 
 def create_env_file():
@@ -171,6 +183,13 @@ class AirClient:
     """Simple client for NVIDIA Air API using login-based authentication."""
     
     def __init__(self, base_url: str, username: str, api_token: str):
+        try:
+            import requests  # type: ignore
+        except ImportError:
+            print("Error: Missing dependency 'requests'. Run: pip install -r requirements.txt")
+            sys.exit(1)
+        
+        self._requests = requests
         self.base_url = base_url.rstrip('/')
         # Remove any /api/vX suffix to get clean base URL
         if '/api/' in self.base_url:
@@ -179,7 +198,7 @@ class AirClient:
         self.username = username
         self.api_token = api_token
         self.jwt_token = None
-        self.session = requests.Session()
+        self.session = self._requests.Session()
     
     def login(self):
         """Login to get JWT token."""
@@ -382,6 +401,8 @@ Examples:
   %(prog)s --skip-bcm       # Only rebuild in Air (skip BCM cleanup)
   %(prog)s --skip-air       # Only BCM cleanup (skip Air rebuild)
   %(prog)s --list           # List available NVIDIA Air simulations
+  %(prog)s --sim-name NAME  # Use simulation name (overrides .env)
+  %(prog)s --sim-id ID      # Use simulation ID (overrides .env)
         """
     )
     
@@ -393,6 +414,11 @@ Examples:
                        help="List available NVIDIA Air simulations and exit")
     parser.add_argument("--debug", action="store_true",
                        help="Show debug information")
+    sim_group = parser.add_mutually_exclusive_group()
+    sim_group.add_argument("--sim-name", type=str, default=None,
+                           help="Simulation name/title to use (overrides SIMULATION_NAME in .env)")
+    sim_group.add_argument("--sim-id", type=str, default=None,
+                           help="Simulation ID to use (overrides SIMULATION_ID in .env)")
     
     args = parser.parse_args()
     
@@ -442,8 +468,9 @@ Examples:
             sys.exit(1)
         sys.exit(0)
     
-    # For non-list operations, require simulation name/ID
-    if not env.get('SIMULATION_NAME') and not env.get('SIMULATION_ID'):
+    # For non-list operations, require simulation name/ID (CLI args override .env)
+    eff_sim_name, eff_sim_id = _effective_simulation_from_args_env(args, env)
+    if not eff_sim_name and not eff_sim_id:
         print(f"\nMissing SIMULATION_NAME or SIMULATION_ID in {ENV_FILE}")
         print("\nTo see available simulations, run:")
         print(f"  {sys.argv[0]} --list")
@@ -509,9 +536,8 @@ Examples:
             print(f"  ✗ Login failed: {e}")
             sys.exit(1)
         
-        # Find simulation
-        sim_id = env.get('SIMULATION_ID')
-        sim_name = env.get('SIMULATION_NAME')
+        # Find simulation (CLI args override .env)
+        sim_name, sim_id = _effective_simulation_from_args_env(args, env)
         
         if sim_name and not sim_id:
             print(f"\nFinding simulation by name: {sim_name}")
