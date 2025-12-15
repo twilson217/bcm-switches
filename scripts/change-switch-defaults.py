@@ -27,6 +27,7 @@ Usage:
 import argparse
 import csv
 import getpass
+import os
 import subprocess
 import sys
 import time
@@ -303,6 +304,10 @@ Workflow:
                        help="CSV file with IP, MAC, Hostname columns")
     parser.add_argument("--password", action="store_true",
                        help="Change the default password")
+    parser.add_argument("--new-password", dest="new_password", type=str, default=None,
+                       help="New password value to set (non-interactive). "
+                            "If not provided, you will be prompted. "
+                            "You can also set BCM_SWITCH_NEW_PASSWORD env var.")
     parser.add_argument("--hostname", action="store_true",
                        help="Set hostname from CSV file")
     parser.add_argument("--disable-ztp", action="store_true",
@@ -362,19 +367,27 @@ Workflow:
         print("-" * 60)
         print("Requirements: 8+ chars, mix of upper/lower/numbers/symbols")
         
-        while True:
-            new_password = getpass.getpass("\nEnter new password: ")
+        # Non-interactive password support
+        new_password = args.new_password or os.environ.get("BCM_SWITCH_NEW_PASSWORD")
+        if new_password:
             if len(new_password) < 8:
-                print("Password must be at least 8 characters")
-                continue
-            
-            confirm = getpass.getpass("Confirm new password: ")
-            if new_password != confirm:
-                print("Passwords do not match")
-                continue
-            
-            print("✓ Password confirmed")
-            break
+                print("Error: --new-password / BCM_SWITCH_NEW_PASSWORD must be at least 8 characters")
+                sys.exit(2)
+            print("✓ Using provided new password (non-interactive)")
+        else:
+            while True:
+                new_password = getpass.getpass("\nEnter new password: ")
+                if len(new_password) < 8:
+                    print("Password must be at least 8 characters")
+                    continue
+                
+                confirm = getpass.getpass("Confirm new password: ")
+                if new_password != confirm:
+                    print("Passwords do not match")
+                    continue
+                
+                print("✓ Password confirmed")
+                break
         
         # After password change, use the new password for subsequent actions
         working_password = new_password

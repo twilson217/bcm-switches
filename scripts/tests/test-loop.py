@@ -42,6 +42,7 @@ import re
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -49,7 +50,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # ============================================================================
 # Configuration
@@ -61,6 +62,7 @@ SCRIPTS_DIR = REPO_DIR / "scripts"
 CONFIG_DIR = REPO_DIR / ".configs"
 LOGS_DIR = REPO_DIR / ".logs"
 TOPOLOGY_FILE = SCRIPT_DIR / "sample-configs" / "test-topology.json"
+DHCP_LEASES_FILE = Path("/var/lib/dhcpd/dhcpd.leases")
 
 # CSV file paths
 FROM_DHCP_CSV = CONFIG_DIR / "from-dhcp.csv"
@@ -234,6 +236,253 @@ def get_validation_summary(output: str) -> Tuple[int, int]:
     return passed, failed
 
 
+def _normalize_mac(mac: str) -> str:
+    return mac.strip().lower()
+
+
+def parse_topology_macs(topology_path: Path) -> Tuple[Optional[str], Dict[str, str]]:
+    """Return (oob_swp0_mac, {switch_name: eth0_mac}) from the topology JSON."""
+    data = json.loads(topology_path.read_text())
+    links = data.get("content", {}).get("links", [])
+
+    oob_swp0_mac: Optional[str] = None
+    switch_eth0_macs: Dict[str, str] = {}
+
+    for link in links:
+        if not isinstance(link, list):
+            continue
+        for endpoint in link:
+            if not isinstance(endpoint, dict):
+                continue
+            node = endpoint.get("node")
+            iface = endpoint.get("interface")
+            mac = endpoint.get("mac")
+            if not (node and iface and mac):
+                continue
+
+            if node == "oob-mgmt-switch" and iface == "swp0":
+                oob_swp0_mac = _normalize_mac(mac)
+
+            if node in TEST_SWITCHES and iface == "eth0":
+                switch_eth0_macs[node] = _normalize_mac(mac)
+
+    return oob_swp0_mac, switch_eth0_macs
+
+
+def parse_dhcpd_leases(leases_path: Path) -> Dict[str, str]:
+    """Parse dhcpd.leases and return dict of active leases: {mac: ip} (last active wins)."""
+    leases: Dict[str, str] = {}
+    if not leases_path.exists():
+        return leases
+
+    current_ip = None
+    current_mac = None
+    current_state = None
+
+    try:
+        for raw in leases_path.read_text(errors="ignore").splitlines():
+            line = raw.strip()
+            if line.startswith("lease ") and line.endswith("{"):
+                # lease 192.168.200.10 {
+                parts = line.split()
+                current_ip = parts[1] if len(parts) >= 2 else None
+                current_mac = None
+                current_state = None
+                continue
+
+            if current_ip is None:
+                continue
+
+            if line.startswith("hardware ethernet"):
+                parts = line.replace(";", "").split()
+                if len(parts) >= 3:
+                    current_mac = _normalize_mac(parts[2])
+                continue
+
+            if line.startswith("binding state"):
+                parts = line.replace(";", "").split()
+                if len(parts) >= 3:
+                    current_state = parts[2].lower()
+                continue
+
+            if line == "}":
+                if current_ip and current_mac and current_state == "active":
+                    leases[current_mac] = current_ip
+                current_ip = None
+                current_mac = None
+                current_state = None
+                continue
+    except Exception:
+        return leases
+
+    return leases
+
+
+def ping_host(ip: str, timeout_sec: int = 1) -> bool:
+    try:
+        res = subprocess.run(
+            ["ping", "-c", "1", "-W", str(timeout_sec), ip],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec + 2,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _ssh_base(user: str, ip: str) -> List[str]:
+    return [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        f"{user}@{ip}",
+    ]
+
+
+def sshpass_run(user: str, password: str, ip: str, cmd: str, timeout: int = 60) -> Tuple[int, str, str]:
+    """Run a remote command via sshpass and return (rc, stdout, stderr)."""
+    full = ["sshpass", "-p", password] + _ssh_base(user, ip) + [cmd]
+    try:
+        res = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        return res.returncode, res.stdout, res.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", f"timeout after {timeout}s"
+
+
+def expect_available() -> bool:
+    return shutil.which("expect") is not None
+
+
+def expect_handle_forced_password_change(ip: str, old_password: str, new_password: str,
+                                        user: str = "cumulus", timeout: int = 60) -> Tuple[bool, str]:
+    """
+    If the switch forces an immediate password change, perform it via expect.
+    Returns (success, output).
+    """
+    if not expect_available():
+        return False, "expect not found on this system (required for forced password change handling)"
+
+    expect_script = f"""
+set timeout {timeout}
+log_user 1
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {user}@{ip}
+
+expect {{
+  "Are you sure you want to continue connecting" {{
+    send "yes\\r"
+    exp_continue
+  }}
+  "Current password:" {{
+    send "{old_password}\\r"
+    exp_continue
+  }}
+  "New password:" {{
+    send "{new_password}\\r"
+    exp_continue
+  }}
+  "Retype new password:" {{
+    send "{new_password}\\r"
+    exp_continue
+  }}
+  -re {{\\$ $}} {{
+    send "exit\\r"
+  }}
+  -re {{# $}} {{
+    send "exit\\r"
+  }}
+  -re "password:" {{
+    send "{old_password}\\r"
+    exp_continue
+  }}
+  eof {{
+    # done
+  }}
+  timeout {{
+    puts "EXPECT_TIMEOUT"
+  }}
+}}
+"""
+
+    try:
+        proc = subprocess.run(["expect", "-c", expect_script], capture_output=True, text=True, timeout=timeout + 10)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        if "EXPECT_TIMEOUT" in out:
+            return False, out[-4000:]
+        return True, out[-4000:]
+    except subprocess.TimeoutExpired:
+        return False, "expect execution timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+def configure_oob_bridge(ip: str, password: str, user: str = "cumulus") -> Tuple[bool, str]:
+    """Configure oob-mgmt-switch swp0-50 as bridged ports (NVUE) and apply."""
+    outputs: List[str] = []
+
+    cmds = [
+        "nv set interface swp0-50 bridge domain br_default",
+        "nv config apply -y",
+    ]
+
+    for cmd in cmds:
+        rc, out, err = sshpass_run(user, password, ip, cmd, timeout=120)
+        outputs.append(f"$ {cmd}\nRC={rc}\n{out}{err}")
+        if rc == 0:
+            continue
+
+        # Retry with sudo (some images require it)
+        sudo_cmd = f"echo {password} | sudo -S {cmd}"
+        rc2, out2, err2 = sshpass_run(user, password, ip, sudo_cmd, timeout=120)
+        outputs.append(f"$ {sudo_cmd}\nRC={rc2}\n{out2}{err2}")
+        if rc2 != 0:
+            return False, "\n\n".join(outputs)[-8000:]
+
+    return True, "\n\n".join(outputs)[-8000:]
+
+
+def wait_for_switch_leases_and_connectivity(expected_macs: Dict[str, str],
+                                            timeout_sec: int = 240,
+                                            poll_sec: int = 5) -> Tuple[bool, str, Dict[str, str]]:
+    """
+    Wait until all expected switch MACs appear with active leases and are pingable.
+    Returns (success, output, {switch_name: ip}).
+    """
+    start = time.time()
+    resolved: Dict[str, str] = {}
+    log_lines: List[str] = []
+
+    while time.time() - start < timeout_sec:
+        leases = parse_dhcpd_leases(DHCP_LEASES_FILE)
+
+        missing = []
+        for sw, mac in expected_macs.items():
+            ip = leases.get(_normalize_mac(mac))
+            if ip:
+                resolved[sw] = ip
+            else:
+                missing.append(sw)
+
+        not_pingable = []
+        for sw, ip in sorted(resolved.items()):
+            if not ping_host(ip):
+                not_pingable.append(sw)
+
+        log_lines.append(
+            f"[{int(time.time()-start)}s] leases: {len(resolved)}/{len(expected_macs)} "
+            f"(missing: {', '.join(missing) if missing else 'none'}; "
+            f"not-pingable: {', '.join(not_pingable) if not_pingable else 'none'})"
+        )
+
+        if not missing and not not_pingable:
+            return True, "\n".join(log_lines)[-8000:], resolved
+
+        time.sleep(poll_sec)
+
+    return False, "\n".join(log_lines)[-8000:], resolved
+
+
 def add_devices_to_bcm_only(csv_path: Path, username: str, password: str) -> bool:
     """Add devices to BCM without installing cm-lite-daemon.
     
@@ -293,8 +542,16 @@ def _redact_argv(argv):
             out.extend(['--password', '******'])
             i += 2
             continue
+        if a == '--new-password' and i + 1 < len(argv):
+            out.extend(['--new-password', '******'])
+            i += 2
+            continue
         if a.startswith('--password='):
             out.append('--password=******')
+            i += 1
+            continue
+        if a.startswith('--new-password='):
+            out.append('--new-password=******')
             i += 1
             continue
         out.append(a)
@@ -306,6 +563,8 @@ def _redact_cmd(cmd: str) -> str:
     # Replace common password forms
     cmd = re.sub(r"(--password)\s+([^\s]+)", r"\1 ******", cmd)
     cmd = re.sub(r"--password=([^\s]+)", "--password=******", cmd)
+    cmd = re.sub(r"(--new-password)\s+([^\s]+)", r"\1 ******", cmd)
+    cmd = re.sub(r"--new-password=([^\s]+)", "--new-password=******", cmd)
     return cmd
 # ============================================================================
 # Logging
@@ -458,6 +717,153 @@ class TestRunner:
         if self.logger is not None:
             self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
         return result
+
+    def preflight_oob_bridge_and_wait_for_dhcp(self) -> StepResult:
+        """
+        Pre-flight network fix for NVIDIA Air topology:
+        - Detect if oob-mgmt-switch swp0 has taken a DHCP lease (routed mode issue)
+        - If reachable, login with default creds and handle forced password reset
+        - Apply NVUE bridge config on swp0-50 (br_default) and apply
+        - Wait for spine/leaf switches to receive DHCP leases and be pingable
+        """
+        step_name = "preflight-oob-bridge"
+        start = time.time()
+
+        if self.dry_run:
+            return StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: detect oob-mgmt-switch swp0 lease, fix NVUE bridge config, wait for switch DHCP leases",
+                command=f"topology={TOPOLOGY_FILE} leases={DHCP_LEASES_FILE}",
+            )
+
+        logs: List[str] = []
+        logs.append(f"Topology file: {TOPOLOGY_FILE}")
+        logs.append(f"DHCP leases:   {DHCP_LEASES_FILE}")
+
+        try:
+            oob_swp0_mac, switch_eth0_macs = parse_topology_macs(TOPOLOGY_FILE)
+        except Exception as e:
+            duration = time.time() - start
+            step = StepResult(
+                name=step_name,
+                success=False,
+                duration=duration,
+                message="Failed to parse topology file",
+                output=str(e),
+                command=f"parse_topology {TOPOLOGY_FILE}",
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        if not oob_swp0_mac:
+            logs.append("WARNING: Could not find oob-mgmt-switch swp0 MAC in topology.")
+        else:
+            logs.append(f"oob-mgmt-switch swp0 MAC: {oob_swp0_mac}")
+
+        # Look for a DHCP lease for oob swp0 MAC
+        leases = parse_dhcpd_leases(DHCP_LEASES_FILE)
+        oob_ip = leases.get(oob_swp0_mac) if oob_swp0_mac else None
+        if not oob_ip:
+            logs.append("No active DHCP lease found for oob-mgmt-switch swp0 MAC (ok if not present).")
+        else:
+            logs.append(f"Found DHCP lease for oob swp0: {oob_ip}")
+            if ping_host(oob_ip):
+                logs.append(f"Ping OK: {oob_ip}")
+
+                # Try a simple non-interactive command with default creds.
+                rc, out, err = sshpass_run("cumulus", "cumulus", oob_ip, "echo ok", timeout=20)
+                logs.append(f"ssh default creds rc={rc} out={out.strip()} err={err.strip()[:200]}")
+
+                working_pw = "cumulus"
+                if rc != 0:
+                    # Might be forced password change on first login.
+                    ok, exp_out = expect_handle_forced_password_change(
+                        ip=oob_ip,
+                        old_password="cumulus",
+                        new_password=self.password,
+                        user="cumulus",
+                        timeout=60,
+                    )
+                    logs.append("expect password-reset output (tail):")
+                    logs.append(exp_out)
+                    if not ok:
+                        duration = time.time() - start
+                        step = StepResult(
+                            name=step_name,
+                            success=False,
+                            duration=duration,
+                            message="Failed to handle forced password change on oob-mgmt-switch",
+                            output="\n".join(logs)[-8000:],
+                            command=f"expect ssh cumulus@{oob_ip}",
+                        )
+                        if self.logger is not None:
+                            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+                        return step
+                    working_pw = self.password
+                else:
+                    # Default creds worked; still prefer using the test password if already set.
+                    working_pw = "cumulus"
+
+                # Apply NVUE bridge configuration
+                ok, cfg_out = configure_oob_bridge(oob_ip, working_pw, user="cumulus")
+                logs.append("NVUE bridge config output (tail):")
+                logs.append(cfg_out)
+                if not ok:
+                    # Retry with test password (in case password was already changed but not forced)
+                    ok2, cfg_out2 = configure_oob_bridge(oob_ip, self.password, user="cumulus")
+                    logs.append("NVUE bridge config retry output (tail):")
+                    logs.append(cfg_out2)
+                    if not ok2:
+                        duration = time.time() - start
+                        step = StepResult(
+                            name=step_name,
+                            success=False,
+                            duration=duration,
+                            message="Failed to configure oob-mgmt-switch NVUE bridge settings",
+                            output="\n".join(logs)[-8000:],
+                            command=f"nv set/apply on {oob_ip}",
+                        )
+                        if self.logger is not None:
+                            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+                        return step
+            else:
+                logs.append(f"Ping FAILED: {oob_ip} (cannot apply bridge fix)")
+
+        # Wait for the other switches to get DHCP leases and be pingable
+        if len(switch_eth0_macs) != len(TEST_SWITCHES):
+            logs.append(
+                f"WARNING: Topology did not yield eth0 MACs for all switches "
+                f"({len(switch_eth0_macs)}/{len(TEST_SWITCHES)} found). Will wait for those found."
+            )
+
+        ok, wait_out, resolved = wait_for_switch_leases_and_connectivity(
+            expected_macs=switch_eth0_macs,
+            timeout_sec=300,
+            poll_sec=5,
+        )
+        logs.append("DHCP wait summary:")
+        logs.append(wait_out)
+        logs.append("Resolved switch IPs:")
+        for sw in TEST_SWITCHES:
+            if sw in resolved:
+                logs.append(f"  - {sw}: {resolved[sw]}")
+
+        duration = time.time() - start
+        step = StepResult(
+            name=step_name,
+            success=ok,
+            duration=duration,
+            message="Success" if ok else "Failed to observe DHCP leases/connectivity for all switches",
+            output="\n".join(logs)[-8000:],
+            command=f"oob_mac={oob_swp0_mac or 'unknown'} wait_dhcp",
+        )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
     
     def generate_csv_from_dhcp(self) -> StepResult:
         """Generate CSV from DHCP leases."""
@@ -489,28 +895,22 @@ class TestRunner:
     
     def change_passwords(self) -> StepResult:
         """Change default passwords on switches."""
-        # Need to provide password input
-        # The script prompts for: new password, confirm password
-        input_text = f"{self.password}\n{self.password}\n"
-        
+        pwd = shlex.quote(self.password)
         return self.run_step(
             "Change default passwords",
             "scripts/change-switch-defaults.py",
-            f"--csv {FROM_DHCP_CSV} --password",
-            timeout=300,
-            input_text=input_text
+            f"--csv {FROM_DHCP_CSV} --password --new-password {pwd}",
+            timeout=300
         )
     
     def change_passwords_and_hostnames(self) -> StepResult:
         """Change passwords AND set hostnames on switches."""
-        input_text = f"{self.password}\n{self.password}\n"
-        
+        pwd = shlex.quote(self.password)
         return self.run_step(
             "Change passwords and set hostnames",
             "scripts/change-switch-defaults.py",
-            f"--csv {FROM_DHCP_CSV} --password --hostname",
-            timeout=300,
-            input_text=input_text
+            f"--csv {FROM_DHCP_CSV} --password --hostname --new-password {pwd}",
+            timeout=300
         )
     
     def deploy_switches(self) -> StepResult:
@@ -614,6 +1014,16 @@ class TestRunner:
                 test.duration = time.time() - start
                 return test
         
+        # Step 1b: Preflight oob-mgmt-switch bridge fix + wait for DHCP leases
+        step = self.preflight_oob_bridge_and_wait_for_dhcp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
+        
         # Step 2: Generate CSV from DHCP
         step = self.generate_csv_from_dhcp()
         steps.append(step)
@@ -702,6 +1112,16 @@ class TestRunner:
                 test.end_time = datetime.now().isoformat()
                 test.duration = time.time() - start
                 return test
+        
+        # Step 1b: Preflight oob-mgmt-switch bridge fix + wait for DHCP leases
+        step = self.preflight_oob_bridge_and_wait_for_dhcp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
         
         # Step 2: Generate CSV from DHCP
         step = self.generate_csv_from_dhcp()
@@ -792,6 +1212,16 @@ class TestRunner:
                 test.end_time = datetime.now().isoformat()
                 test.duration = time.time() - start
                 return test
+        
+        # Step 1b: Preflight oob-mgmt-switch bridge fix + wait for DHCP leases
+        step = self.preflight_oob_bridge_and_wait_for_dhcp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
         
         # Step 2: Generate CSV from DHCP
         step = self.generate_csv_from_dhcp()
