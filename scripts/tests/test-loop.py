@@ -37,6 +37,7 @@ Usage:
 """
 
 import argparse
+import shlex
 import csv
 import json
 import os
@@ -255,9 +256,17 @@ def add_devices_to_bcm_only(csv_path: Path, username: str, password: str) -> boo
                 f"cmsh -c \"device; use {hostname}; ztpsettings; set enableapi yes; commit\"",
                 f"cmsh -c \"device; use {hostname}; initialize\"",
             ]
-            
             for cmd in cmds:
-                subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if res.returncode != 0:
+                    stderr = (res.stderr or '').strip()
+                    # cmsh sometimes returns non-zero for idempotent operations like 'already exists'
+                    if 'already' in stderr.lower() or 'exists' in stderr.lower():
+                        continue
+                    print(f"    cmsh failed for {hostname} ({ip}): {cmd}")
+                    if stderr:
+                        print(f"      stderr: {stderr[:300]}")
+                    return False
         
         return True
     except Exception as e:
@@ -381,19 +390,22 @@ class TestRunner:
     
     def deploy_switches(self) -> StepResult:
         """Deploy switches to BCM using --csv with --non-interactive."""
+        csv_path = shlex.quote(str(FROM_DHCP_CSV))
+        pwd = shlex.quote(self.password)
         return self.run_step(
             "Deploy to BCM",
             "deploy_bcm_switches.py",
-            f"--csv {FROM_DHCP_CSV} --non-interactive --username cumulus --password {self.password}",
+            f"--csv {csv_path} --non-interactive --username cumulus --password {pwd}",
             timeout=900  # 15 minutes for full deployment
         )
     
     def deploy_from_bcm(self) -> StepResult:
         """Deploy using --from-bcm mode (install on existing BCM devices)."""
+        pwd = shlex.quote(self.password)
         return self.run_step(
             "Deploy from BCM (install cm-lite-daemon)",
             "deploy_bcm_switches.py",
-            f"--from-bcm --non-interactive --username cumulus --password {self.password}",
+            f"--from-bcm --non-interactive --username cumulus --password {pwd}",
             timeout=900  # 15 minutes for full deployment
         )
     
@@ -836,30 +848,31 @@ Prerequisites:
     runner = TestRunner(verbose=args.verbose, dry_run=args.dry_run, password=test_password)
     
     try:
+        selected = []
         if run_test1:
-            result = runner.run_test_1(skip_reset=args.no_reset)
-            runner.results.append(result)
-        
+            selected.append(("Test 1", runner.run_test_1))
         if run_test2:
-            # Reset between tests if needed
-            skip_reset = args.no_reset or (run_test1 and args.no_reset)
-            result = runner.run_test_2(skip_reset=skip_reset if not run_test1 else False)
-            runner.results.append(result)
-        
+            selected.append(("Test 2", runner.run_test_2))
         if run_test3:
-            # Reset between tests if needed
-            skip_reset = args.no_reset
-            if run_test1 or run_test2:
-                skip_reset = False  # Always reset if running after other tests
-            result = runner.run_test_3(skip_reset=skip_reset if not (run_test1 or run_test2) else False)
+            selected.append(("Test 3", runner.run_test_3))
+
+        # If running multiple tests, we *always* reset before each test to ensure isolation.
+        # --no-reset is only respected when running exactly one test.
+        if args.no_reset and len(selected) > 1:
+            print("\nNOTE: --no-reset was specified, but multiple tests were selected.")
+            print("      For isolation, this run will reset between tests (ignoring --no-reset).")
+
+        for name, fn in selected:
+            skip_reset = args.no_reset and len(selected) == 1
+            result = fn(skip_reset=skip_reset)
             runner.results.append(result)
-        
+
         # Print summary
         all_passed = runner.print_summary()
-        
+
         # Exit code
         sys.exit(0 if all_passed else 1)
-        
+
     except KeyboardInterrupt:
         print("\n\nTest interrupted by user")
         runner.print_summary()
