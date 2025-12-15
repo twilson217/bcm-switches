@@ -18,10 +18,19 @@ Test 2: Deployment with Switch Setup First
   - Deploy using --csv option (switches already have correct hostnames)
   - Validate deployment
 
+Test 3: Install on Switches Already in BCM (--from-bcm mode)
+  - Generate CSV from DHCP leases
+  - Change passwords on switches
+  - Map hostnames from topology
+  - Add devices to BCM using --csv (phases 1-2 only)
+  - Run deploy with --from-bcm to install cm-lite-daemon
+  - Validate deployment
+
 Usage:
-    ./test-loop.py              # Run all tests
+    ./test-loop.py              # Run all tests (1, 2, and 3)
     ./test-loop.py --test1      # Run only Test 1
     ./test-loop.py --test2      # Run only Test 2
+    ./test-loop.py --test3      # Run only Test 3
     ./test-loop.py --dry-run    # Show what would be done
     ./test-loop.py --no-reset   # Skip simulation reset
     ./test-loop.py --verbose    # Show detailed output
@@ -219,6 +228,43 @@ def get_validation_summary(output: str) -> Tuple[int, int]:
     return passed, failed
 
 
+def add_devices_to_bcm_only(csv_path: Path, username: str, password: str) -> bool:
+    """Add devices to BCM without installing cm-lite-daemon.
+    
+    Uses cmsh commands directly to add devices from CSV.
+    """
+    try:
+        with open(csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            devices = list(reader)
+        
+        for device in devices:
+            hostname = device.get('Hostname') or device.get('hostname', '')
+            ip = device.get('IP') or device.get('ip', '')
+            mac = device.get('MAC') or device.get('mac', '')
+            network = device.get('Network') or device.get('network', 'internalnet')
+            
+            if not hostname or not ip:
+                continue
+            
+            # Add device to BCM using cmsh
+            cmds = [
+                f"cmsh -c 'device; add switch {hostname}; commit'",
+                f"cmsh -c \"device; use {hostname}; set ip {ip}; set mac {mac}; set network {network}; set hasclientdaemon yes; commit\"",
+                f"cmsh -c \"device; use {hostname}; accesssettings; set username {username}; set password {password}; set -e force true; commit\"",
+                f"cmsh -c \"device; use {hostname}; ztpsettings; set enableapi yes; commit\"",
+                f"cmsh -c \"device; use {hostname}; initialize\"",
+            ]
+            
+            for cmd in cmds:
+                subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        return True
+    except Exception as e:
+        print(f"    Error adding devices to BCM: {e}")
+        return False
+
+
 # ============================================================================
 # Test Implementations
 # ============================================================================
@@ -334,24 +380,45 @@ class TestRunner:
         )
     
     def deploy_switches(self) -> StepResult:
-        """Deploy switches to BCM."""
-        # The deploy script will prompt for:
-        # - username (use cumulus)
-        # - password
-        # - network confirmation (y)
-        # - VRF (just press enter for default)
-        # - proceed prompts (y)
-        
-        # Since we're using --csv, it skips IP prompts
-        # We need to handle: username, password, network, vrf, proceed prompts
-        input_text = f"cumulus\n{self.password}\ny\n\ny\ny\ny\ny\n"
-        
+        """Deploy switches to BCM using --csv with --non-interactive."""
         return self.run_step(
             "Deploy to BCM",
             "deploy_bcm_switches.py",
-            f"--csv {FROM_DHCP_CSV}",
-            timeout=900,  # 15 minutes for full deployment
-            input_text=input_text
+            f"--csv {FROM_DHCP_CSV} --non-interactive --username cumulus --password {self.password}",
+            timeout=900  # 15 minutes for full deployment
+        )
+    
+    def deploy_from_bcm(self) -> StepResult:
+        """Deploy using --from-bcm mode (install on existing BCM devices)."""
+        return self.run_step(
+            "Deploy from BCM (install cm-lite-daemon)",
+            "deploy_bcm_switches.py",
+            f"--from-bcm --non-interactive --username cumulus --password {self.password}",
+            timeout=900  # 15 minutes for full deployment
+        )
+    
+    def add_devices_to_bcm(self) -> StepResult:
+        """Add devices to BCM without installing cm-lite-daemon."""
+        print("\n  Step: Add devices to BCM (without daemon install)")
+        
+        if self.dry_run:
+            print(f"    [DRY RUN] Would add devices from {FROM_DHCP_CSV} to BCM")
+            return StepResult(name="add_to_bcm", success=True, duration=0,
+                            message="[DRY RUN] Skipped")
+        
+        start = time.time()
+        success = add_devices_to_bcm_only(FROM_DHCP_CSV, "cumulus", self.password)
+        duration = time.time() - start
+        
+        status = "✓" if success else "✗"
+        message = "Success" if success else "Failed"
+        print(f"    {status} {message} ({duration:.1f}s)")
+        
+        return StepResult(
+            name="add_to_bcm",
+            success=success,
+            duration=duration,
+            message=message
         )
     
     def validate_deployment(self) -> StepResult:
@@ -547,6 +614,106 @@ class TestRunner:
         
         return test
     
+    def run_test_3(self, skip_reset: bool = False) -> TestResult:
+        """
+        Test 3: Install on Switches Already in BCM (--from-bcm mode)
+        
+        Steps:
+        1. Reset simulation
+        2. Generate CSV from DHCP
+        3. Change default passwords
+        4. Map hostnames from topology
+        5. Add devices to BCM (without installing daemon)
+        6. Deploy using --from-bcm (installs cm-lite-daemon on existing BCM devices)
+        7. Validate deployment
+        """
+        print("\n" + "=" * 70)
+        print("TEST 3: Install on Switches Already in BCM (--from-bcm)")
+        print("=" * 70)
+        
+        test = TestResult(
+            name="Test 3: Install on Switches Already in BCM",
+            success=True,
+            start_time=datetime.now().isoformat()
+        )
+        
+        start = time.time()
+        
+        # Clear any existing config
+        if not self.dry_run:
+            clear_config()
+        
+        steps = []
+        
+        # Step 1: Reset simulation
+        if not skip_reset:
+            step = self.reset_simulation()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+        
+        # Step 2: Generate CSV from DHCP
+        step = self.generate_csv_from_dhcp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
+        
+        # Step 3: Change default passwords
+        step = self.change_passwords()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
+        
+        # Step 4: Map hostnames
+        step = self.map_hostnames()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
+        
+        # Step 5: Add devices to BCM (without installing daemon)
+        step = self.add_devices_to_bcm()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
+        
+        # Step 6: Deploy using --from-bcm
+        step = self.deploy_from_bcm()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+        
+        # Step 7: Validate
+        step = self.validate_deployment()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+        
+        test.steps = steps
+        test.end_time = datetime.now().isoformat()
+        test.duration = time.time() - start
+        
+        return test
+    
     def print_summary(self):
         """Print test summary."""
         print("\n" + "=" * 70)
@@ -597,10 +764,14 @@ Tests Available:
   Test 2: Deployment with Switch Setup First  
     - Hostnames set on switches before deploy, then deploy discovers them
 
+  Test 3: Install on Switches Already in BCM
+    - Devices added to BCM first, then --from-bcm installs cm-lite-daemon
+
 Examples:
   %(prog)s                    # Run all tests
   %(prog)s --test1            # Run only Test 1
   %(prog)s --test2            # Run only Test 2
+  %(prog)s --test3            # Run only Test 3
   %(prog)s --test1 --no-reset # Run Test 1 without resetting simulation
   %(prog)s --dry-run          # Show what would be done
 
@@ -615,6 +786,8 @@ Prerequisites:
                        help="Run only Test 1 (DHCP lease deployment)")
     parser.add_argument("--test2", action="store_true",
                        help="Run only Test 2 (switch setup first)")
+    parser.add_argument("--test3", action="store_true",
+                       help="Run only Test 3 (--from-bcm mode)")
     parser.add_argument("--no-reset", action="store_true",
                        help="Skip simulation reset (use existing state)")
     parser.add_argument("--dry-run", action="store_true",
@@ -627,8 +800,10 @@ Prerequisites:
     args = parser.parse_args()
     
     # Determine which tests to run
-    run_test1 = args.test1 or (not args.test1 and not args.test2)
-    run_test2 = args.test2 or (not args.test1 and not args.test2)
+    any_specific = args.test1 or args.test2 or args.test3
+    run_test1 = args.test1 or not any_specific
+    run_test2 = args.test2 or not any_specific
+    run_test3 = args.test3 or not any_specific
     
     # Password is passed to TestRunner
     test_password = args.password
@@ -638,12 +813,14 @@ Prerequisites:
     print("=" * 70)
     print(f"Start time: {datetime.now().isoformat()}")
     print(f"Tests to run: ", end="")
-    if run_test1 and run_test2:
-        print("Test 1, Test 2")
-    elif run_test1:
-        print("Test 1 only")
-    else:
-        print("Test 2 only")
+    tests_to_run = []
+    if run_test1:
+        tests_to_run.append("Test 1")
+    if run_test2:
+        tests_to_run.append("Test 2")
+    if run_test3:
+        tests_to_run.append("Test 3")
+    print(", ".join(tests_to_run))
     print(f"Skip reset: {args.no_reset}")
     print(f"Dry run: {args.dry_run}")
     
@@ -662,16 +839,19 @@ Prerequisites:
         if run_test1:
             result = runner.run_test_1(skip_reset=args.no_reset)
             runner.results.append(result)
-            
-            # If running both tests, reset between them
-            if run_test2 and not args.no_reset:
-                print("\n" + "-" * 70)
-                print("Preparing for Test 2...")
         
         if run_test2:
-            # For Test 2, always reset if we ran Test 1 (unless --no-reset)
+            # Reset between tests if needed
+            skip_reset = args.no_reset or (run_test1 and args.no_reset)
+            result = runner.run_test_2(skip_reset=skip_reset if not run_test1 else False)
+            runner.results.append(result)
+        
+        if run_test3:
+            # Reset between tests if needed
             skip_reset = args.no_reset
-            result = runner.run_test_2(skip_reset=skip_reset)
+            if run_test1 or run_test2:
+                skip_reset = False  # Always reset if running after other tests
+            result = runner.run_test_3(skip_reset=skip_reset if not (run_test1 or run_test2) else False)
             runner.results.append(result)
         
         # Print summary
@@ -693,4 +873,3 @@ Prerequisites:
 
 if __name__ == "__main__":
     main()
-

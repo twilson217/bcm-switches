@@ -1619,6 +1619,11 @@ Examples:
   %(prog)s --retry-failed       # Retry only the previously failed devices
   %(prog)s --dry-run            # Show what would be done
   %(prog)s --connectivity-test  # Run connectivity test and VRF detection only
+  
+Non-interactive mode (for automation):
+  %(prog)s --csv FILE --non-interactive --username cumulus --password PWD
+  %(prog)s --from-bcm --non-interactive --username cumulus --password PWD
+  %(prog)s --from-bcm --non-interactive --exclude-ips 192.168.1.1,192.168.1.2
 
 Notes:
   Files are automatically downloaded to .files/ if not already present.
@@ -1639,6 +1644,14 @@ Notes:
                        help="Use CSV file as source of truth for switch information")
     parser.add_argument("--from-bcm", action="store_true",
                        help="Install cm-lite-daemon on switches already added to BCM")
+    parser.add_argument("--non-interactive", action="store_true",
+                       help="Run without user prompts (uses defaults/config values)")
+    parser.add_argument("--username", type=str, default=None,
+                       help="SSH username for switches (for non-interactive mode)")
+    parser.add_argument("--password", type=str, default=None,
+                       help="SSH password for switches (for non-interactive mode)")
+    parser.add_argument("--exclude-ips", type=str, default=None,
+                       help="IPs to exclude, comma-separated (for --from-bcm)")
     
     args = parser.parse_args()
     
@@ -1696,39 +1709,27 @@ Notes:
             print(f"{i:<4} {sw['hostname']:<16} {sw['ip']:<16} {sw['network']:<15} {sw['status']:<10}")
         print("-" * 70)
         
-        # Ask if user wants to exclude any switches
-        response = input("\nWould you like to exclude any switches? (y/n) [n]: ").strip().lower()
-        if response in ['y', 'yes']:
-            print("\nEnter IP addresses or hostnames to exclude.")
-            print("  - Comma-separated: 192.168.200.161, 192.168.200.162")
-            print("  - IP range: 192.168.200.161-165")
-            print("  - Hostnames: spine-01, spine-02")
-            exclude_input = input("\nExclude: ").strip()
-            
-            if exclude_input:
-                # Parse exclusions
+        # Handle exclusions
+        if args.non_interactive:
+            # Non-interactive: use --exclude-ips if provided
+            if args.exclude_ips:
                 exclude_set = set()
-                parts = [p.strip() for p in exclude_input.replace(' ', '').split(',')]
+                parts = [p.strip() for p in args.exclude_ips.replace(' ', '').split(',')]
                 
                 for part in parts:
                     if not part:
                         continue
-                    
-                    # Check if it's an IP range
                     if '-' in part and '.' in part:
                         exclude_ips = IPAddressParser.parse(part)
                         exclude_set.update(exclude_ips)
                     elif '.' in part:
-                        # Single IP
                         exclude_set.add(part)
                     else:
-                        # Hostname - find corresponding IP
                         for sw in bcm_switches:
                             if sw['hostname'].lower() == part.lower():
                                 exclude_set.add(sw['ip'])
                                 break
                 
-                # Filter switches
                 original_count = len(bcm_switches)
                 bcm_switches = [sw for sw in bcm_switches if sw['ip'] not in exclude_set]
                 excluded_count = original_count - len(bcm_switches)
@@ -1737,28 +1738,82 @@ Notes:
                 if not bcm_switches:
                     print("No switches remaining after exclusions. Exiting.")
                     sys.exit(0)
+        else:
+            # Interactive: ask user
+            response = input("\nWould you like to exclude any switches? (y/n) [n]: ").strip().lower()
+            if response in ['y', 'yes']:
+                print("\nEnter IP addresses or hostnames to exclude.")
+                print("  - Comma-separated: 192.168.200.161, 192.168.200.162")
+                print("  - IP range: 192.168.200.161-165")
+                print("  - Hostnames: spine-01, spine-02")
+                exclude_input = input("\nExclude: ").strip()
+                
+                if exclude_input:
+                    # Parse exclusions
+                    exclude_set = set()
+                    parts = [p.strip() for p in exclude_input.replace(' ', '').split(',')]
+                    
+                    for part in parts:
+                        if not part:
+                            continue
+                        
+                        # Check if it's an IP range
+                        if '-' in part and '.' in part:
+                            exclude_ips = IPAddressParser.parse(part)
+                            exclude_set.update(exclude_ips)
+                        elif '.' in part:
+                            # Single IP
+                            exclude_set.add(part)
+                        else:
+                            # Hostname - find corresponding IP
+                            for sw in bcm_switches:
+                                if sw['hostname'].lower() == part.lower():
+                                    exclude_set.add(sw['ip'])
+                                    break
+                    
+                    # Filter switches
+                    original_count = len(bcm_switches)
+                    bcm_switches = [sw for sw in bcm_switches if sw['ip'] not in exclude_set]
+                    excluded_count = original_count - len(bcm_switches)
+                    print(f"\nExcluded {excluded_count} switch(es). Proceeding with {len(bcm_switches)}.")
+                    
+                    if not bcm_switches:
+                        print("No switches remaining after exclusions. Exiting.")
+                        sys.exit(0)
         
-        # Prompt for credentials
+        # Get credentials
         print("\n" + "-" * 60)
         print("CREDENTIALS")
         print("-" * 60)
         
-        # Check for existing config
-        if config.load():
-            current_user = config.get('username', 'cumulus')
-            current_pass = config.get('password', '')
-            print(f"\nExisting credentials found (username: {current_user})")
-            response = input("Use existing credentials? (y/n) [y]: ").strip().lower()
-            if response not in ['n', 'no']:
-                username = current_user
-                password = current_pass
-                print("Using existing credentials.")
-            else:
-                username = input(f"Enter SSH username [{current_user}]: ").strip() or current_user
-                password = getpass.getpass("Enter SSH password: ")
+        if args.non_interactive:
+            # Non-interactive: use command-line args or config
+            config.load()
+            username = args.username or config.get('username', 'cumulus')
+            password = args.password or config.get('password', '')
+            
+            if not password:
+                print("Error: Password required. Use --password or set in config.")
+                sys.exit(1)
+            
+            print(f"\nUsing credentials: username={username}")
         else:
-            username = input("Enter SSH username [cumulus]: ").strip() or "cumulus"
-            password = getpass.getpass("Enter SSH password: ")
+            # Interactive: prompt for credentials
+            if config.load():
+                current_user = config.get('username', 'cumulus')
+                current_pass = config.get('password', '')
+                print(f"\nExisting credentials found (username: {current_user})")
+                response = input("Use existing credentials? (y/n) [y]: ").strip().lower()
+                if response not in ['n', 'no']:
+                    username = current_user
+                    password = current_pass
+                    print("Using existing credentials.")
+                else:
+                    username = input(f"Enter SSH username [{current_user}]: ").strip() or current_user
+                    password = getpass.getpass("Enter SSH password: ")
+            else:
+                username = input("Enter SSH username [cumulus]: ").strip() or "cumulus"
+                password = getpass.getpass("Enter SSH password: ")
         
         # Get VRF - use default or prompt
         vrf = config.get('vrf', 'default')
@@ -1805,10 +1860,13 @@ Notes:
         
         if failed_count > 0:
             print(f"\n⚠ {failed_count} device(s) failed transfer: {', '.join(failed_devices)}")
-            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
-            if response not in ['y', 'yes']:
-                print("\nExiting.")
-                sys.exit(1)
+            if not args.non_interactive:
+                response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("\nExiting.")
+                    sys.exit(1)
+            else:
+                print("  (non-interactive: proceeding anyway)")
         
         # Phase 4: Install daemon
         print("\n" + "=" * 70)
@@ -1831,10 +1889,13 @@ Notes:
         
         if failed_count > 0:
             print(f"\n⚠ {failed_count} device(s) failed installation: {', '.join(failed_devices)}")
-            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
-            if response not in ['y', 'yes']:
-                print("\nExiting.")
-                sys.exit(1)
+            if not args.non_interactive:
+                response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("\nExiting.")
+                    sys.exit(1)
+            else:
+                print("  (non-interactive: proceeding anyway)")
         
         # Phase 5: Register with BCM
         print("\n" + "=" * 70)
@@ -1931,27 +1992,39 @@ Notes:
         
         print("  No conflicts found with BCM")
         
-        # Prompt for credentials only
+        # Get credentials
         print("\n" + "-" * 60)
         print("CREDENTIALS")
         print("-" * 60)
         
-        # Check for existing config
-        if config.load():
-            current_user = config.get('username', 'cumulus')
-            current_pass = config.get('password', '')
-            print(f"\nExisting credentials found (username: {current_user})")
-            response = input("Use existing credentials? (y/n) [y]: ").strip().lower()
-            if response not in ['n', 'no']:
-                username = current_user
-                password = current_pass
-                print("Using existing credentials.")
-            else:
-                username = input(f"Enter SSH username [{current_user}]: ").strip() or current_user
-                password = getpass.getpass("Enter SSH password: ")
+        if args.non_interactive:
+            # Non-interactive: use command-line args or config
+            config.load()
+            username = args.username or config.get('username', 'cumulus')
+            password = args.password or config.get('password', '')
+            
+            if not password:
+                print("Error: Password required. Use --password or set in config.")
+                sys.exit(1)
+            
+            print(f"\nUsing credentials: username={username}")
         else:
-            username = input("Enter SSH username [cumulus]: ").strip() or "cumulus"
-            password = getpass.getpass("Enter SSH password: ")
+            # Interactive: prompt for credentials
+            if config.load():
+                current_user = config.get('username', 'cumulus')
+                current_pass = config.get('password', '')
+                print(f"\nExisting credentials found (username: {current_user})")
+                response = input("Use existing credentials? (y/n) [y]: ").strip().lower()
+                if response not in ['n', 'no']:
+                    username = current_user
+                    password = current_pass
+                    print("Using existing credentials.")
+                else:
+                    username = input(f"Enter SSH username [{current_user}]: ").strip() or current_user
+                    password = getpass.getpass("Enter SSH password: ")
+            else:
+                username = input("Enter SSH username [cumulus]: ").strip() or "cumulus"
+                password = getpass.getpass("Enter SSH password: ")
         
         # Determine network from CSV or detect
         networks_in_csv = set(d['network'] for d in csv_devices if d.get('network'))
@@ -1969,44 +2042,55 @@ Notes:
             network_detector.detect_networks()
             ips = [d['ip'] for d in csv_devices]
             suggested = network_detector.detect_network_for_ips(ips)
-            network = network_detector.prompt_for_network(suggested, ips)
+            
+            if args.non_interactive:
+                # Non-interactive: use the suggested network or first available
+                network = suggested or (network_detector.networks[0]['name'] if network_detector.networks else 'internalnet')
+                print(f"  Auto-selected network: {network}")
+            else:
+                network = network_detector.prompt_for_network(suggested, ips)
+            
             # Apply to all devices
             for d in csv_devices:
                 d['network'] = network
         
-        # Ask about connectivity test
-        print("\n" + "-" * 60)
-        response = input("Would you like to test connectivity to the devices? (y/n) [y]: ").strip().lower()
-        if response not in ['n', 'no']:
-            print("\nTesting connectivity...")
-            discovery = SwitchDiscovery(username, password)
-            reachable = []
-            unreachable = []
-            
-            for i, device in enumerate(csv_devices, 1):
-                ip = device['ip']
-                hostname = device['hostname'] if device['hostname'] else ip
-                print(f"  [{i}/{len(csv_devices)}] {hostname} ({ip})...", end=" ", flush=True)
+        # Connectivity test
+        if args.non_interactive:
+            # Non-interactive: skip connectivity test
+            print("\n  (non-interactive: skipping connectivity test)")
+        else:
+            print("\n" + "-" * 60)
+            response = input("Would you like to test connectivity to the devices? (y/n) [y]: ").strip().lower()
+            if response not in ['n', 'no']:
+                print("\nTesting connectivity...")
+                discovery = SwitchDiscovery(username, password)
+                reachable = []
+                unreachable = []
                 
-                if discovery.check_connectivity(ip):
-                    print("reachable")
-                    reachable.append(device)
-                else:
-                    print("UNREACHABLE")
-                    unreachable.append(device)
-            
-            if unreachable:
-                print(f"\n{len(unreachable)} device(s) are unreachable:")
-                for dev in unreachable:
-                    print(f"    - {dev['ip']} ({dev.get('hostname', '')})")
-                response = input("\nContinue with reachable devices only? (y/n) [n]: ").strip().lower()
-                if response not in ['y', 'yes']:
-                    print("Exiting.")
-                    sys.exit(1)
-                csv_devices = reachable
-                if not csv_devices:
-                    print("No reachable devices. Exiting.")
-                    sys.exit(1)
+                for i, device in enumerate(csv_devices, 1):
+                    ip = device['ip']
+                    hostname = device['hostname'] if device['hostname'] else ip
+                    print(f"  [{i}/{len(csv_devices)}] {hostname} ({ip})...", end=" ", flush=True)
+                    
+                    if discovery.check_connectivity(ip):
+                        print("reachable")
+                        reachable.append(device)
+                    else:
+                        print("UNREACHABLE")
+                        unreachable.append(device)
+                
+                if unreachable:
+                    print(f"\n{len(unreachable)} device(s) are unreachable:")
+                    for dev in unreachable:
+                        print(f"    - {dev['ip']} ({dev.get('hostname', '')})")
+                    response = input("\nContinue with reachable devices only? (y/n) [n]: ").strip().lower()
+                    if response not in ['y', 'yes']:
+                        print("Exiting.")
+                        sys.exit(1)
+                    csv_devices = reachable
+                    if not csv_devices:
+                        print("No reachable devices. Exiting.")
+                        sys.exit(1)
         
         # Save config
         config.set('username', username)
@@ -2059,10 +2143,13 @@ Notes:
         
         if failed_count > 0:
             print(f"\n{failed_count} device(s) failed to add to BCM.")
-            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
-            if response not in ['y', 'yes']:
-                print("\nExiting. Fix the issues and run with --resume to continue.")
-                sys.exit(1)
+            if not args.non_interactive:
+                response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("\nExiting. Fix the issues and run with --resume to continue.")
+                    sys.exit(1)
+            else:
+                print("  (non-interactive: proceeding anyway)")
         
         config.set_phase('transfer')
         
@@ -2090,10 +2177,13 @@ Notes:
         
         if failed_count > 0:
             print(f"\n{failed_count} device(s) failed transfer.")
-            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
-            if response not in ['y', 'yes']:
-                print("\nExiting. Fix the issues and run with --resume to continue.")
-                sys.exit(1)
+            if not args.non_interactive:
+                response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("\nExiting. Fix the issues and run with --resume to continue.")
+                    sys.exit(1)
+            else:
+                print("  (non-interactive: proceeding anyway)")
         
         config.set_phase('install')
         
@@ -2117,10 +2207,13 @@ Notes:
         
         if failed_count > 0:
             print(f"\n{failed_count} device(s) failed installation.")
-            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
-            if response not in ['y', 'yes']:
-                print("\nExiting. Fix the issues and run with --resume to continue.")
-                sys.exit(1)
+            if not args.non_interactive:
+                response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("\nExiting. Fix the issues and run with --resume to continue.")
+                    sys.exit(1)
+            else:
+                print("  (non-interactive: proceeding anyway)")
         
         config.set_phase('register')
         
@@ -2452,10 +2545,13 @@ Notes:
         # Check for failures and prompt
         if failed_count > 0:
             print(f"\n⚠ {failed_count} switch(es) failed discovery.")
-            response = input("Do you want to proceed with the successful switches? (y/n) [n]: ").strip().lower()
-            if response not in ['y', 'yes']:
-                print("\nExiting. Run with --resume to retry failed switches.")
-                sys.exit(1)
+            if not args.non_interactive:
+                response = input("Do you want to proceed with the successful switches? (y/n) [n]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("\nExiting. Run with --resume to retry failed switches.")
+                    sys.exit(1)
+            else:
+                print("  (non-interactive: proceeding with successful switches)")
         
         # Generate CSV
         devices = config.progress['devices']
@@ -2482,10 +2578,13 @@ Notes:
                 print("\n  To disable ZTP first, run:")
                 print("    ./scripts/change-switch-defaults.py --disable-ztp --csv <file>")
                 print("!" * 70)
-                resp = input("\nContinue anyway? (yes/no) [no]: ").strip().lower()
-                if resp != 'yes':
-                    print("\nExiting. Disable ZTP first, then run again.")
-                    sys.exit(1)
+                if not args.non_interactive:
+                    resp = input("\nContinue anyway? (yes/no) [no]: ").strip().lower()
+                    if resp != 'yes':
+                        print("\nExiting. Disable ZTP first, then run again.")
+                        sys.exit(1)
+                else:
+                    print("\n  (non-interactive: proceeding despite ZTP warning)")
             else:
                 print("✓ ZTP disabled on all switches")
             
@@ -2521,10 +2620,13 @@ Notes:
         
         if failed_count > 0:
             print(f"\n⚠ {failed_count} device(s) failed to add to BCM.")
-            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
-            if response not in ['y', 'yes']:
-                print("\nExiting. Fix the issues and run with --resume to continue.")
-                sys.exit(1)
+            if not args.non_interactive:
+                response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("\nExiting. Fix the issues and run with --resume to continue.")
+                    sys.exit(1)
+            else:
+                print("  (non-interactive: proceeding anyway)")
         
         config.set_phase('transfer')
         
@@ -2553,10 +2655,13 @@ Notes:
         
         if failed_count > 0:
             print(f"\n⚠ {failed_count} device(s) failed transfer.")
-            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
-            if response not in ['y', 'yes']:
-                print("\nExiting. Fix the issues and run with --resume to continue.")
-                sys.exit(1)
+            if not args.non_interactive:
+                response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("\nExiting. Fix the issues and run with --resume to continue.")
+                    sys.exit(1)
+            else:
+                print("  (non-interactive: proceeding anyway)")
         
         config.set_phase('install')
     
@@ -2580,10 +2685,13 @@ Notes:
         
         if failed_count > 0:
             print(f"\n⚠ {failed_count} device(s) failed installation.")
-            response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
-            if response not in ['y', 'yes']:
-                print("\nExiting. Fix the issues and run with --resume to continue.")
-                sys.exit(1)
+            if not args.non_interactive:
+                response = input("Do you want to proceed to the next phase? (y/n) [n]: ").strip().lower()
+                if response not in ['y', 'yes']:
+                    print("\nExiting. Fix the issues and run with --resume to continue.")
+                    sys.exit(1)
+            else:
+                print("  (non-interactive: proceeding anyway)")
         
         config.set_phase('register')
     
