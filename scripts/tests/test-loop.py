@@ -63,6 +63,7 @@ CONFIG_DIR = REPO_DIR / ".configs"
 LOGS_DIR = REPO_DIR / ".logs"
 TOPOLOGY_FILE = SCRIPT_DIR / "sample-configs" / "test-topology.json"
 DHCP_LEASES_FILE = Path("/var/lib/dhcpd/dhcpd.leases")
+VENV_PYTHON = SCRIPT_DIR / ".venv" / "bin" / "python"
 
 # CSV file paths
 FROM_DHCP_CSV = CONFIG_DIR / "from-dhcp.csv"
@@ -134,7 +135,10 @@ def run_script(script_path: str, args: str = "", timeout: int = 600,
         script_path = script_path[2:]
     full_path = REPO_DIR / script_path
     
-    cmd = f"python3 {full_path}"
+    # Prefer scripts/tests/.venv if present so test-loop can run non-interactively
+    # without requiring the user to `source .venv/bin/activate`.
+    python_exe = str(VENV_PYTHON) if VENV_PYTHON.exists() else "python3"
+    cmd = f"{python_exe} {full_path}"
     if args:
         cmd += f" {args}"
     
