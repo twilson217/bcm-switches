@@ -1153,7 +1153,18 @@ class BCMDeployer:
                         print(f" skipped ({step_elapsed:.1f}s)")
                         continue
                     print(f" FAILED ({step_elapsed:.1f}s)")
-                    print(f"        Error: {result.stderr.strip()[:100]}")
+                    # Surface useful error output. SSH banners/warnings can pollute stderr/stdout,
+                    # so print the tail of both to help pinpoint the real failure (pip, sudo, etc.).
+                    stderr_tail = (result.stderr or "").strip()[-1200:]
+                    stdout_tail = (result.stdout or "").strip()[-1200:]
+                    if stderr_tail:
+                        print("        stderr (tail):")
+                        for line in stderr_tail.splitlines()[-20:]:
+                            print(f"          {line}")
+                    if stdout_tail:
+                        print("        stdout (tail):")
+                        for line in stdout_tail.splitlines()[-20:]:
+                            print(f"          {line}")
                     return False
                 
                 print(f" done ({step_elapsed:.1f}s)")
@@ -1453,10 +1464,15 @@ def ensure_local_files():
     cm_lite_zip = FILES_DIR / "cm-lite-daemon.zip"
     pip_packages = FILES_DIR / "pip_packages_dep"
     
-    # Check if files already exist
-    if cm_lite_zip.exists() and pip_packages.exists() and list(pip_packages.glob("*")):
-        print(f"✓ Using cached files from {FILES_DIR}")
-        return True
+    # Check if files already exist (and are plausibly complete).
+    # A non-empty directory is not sufficient: we need at least some wheels present
+    # for offline installation (sdist-only packages like `uptime` are not enough).
+    if cm_lite_zip.exists() and pip_packages.exists():
+        existing = list(pip_packages.glob("*"))
+        wheel_count = len([p for p in existing if p.suffix == ".whl"])
+        if existing and wheel_count > 0:
+            print(f"✓ Using cached files from {FILES_DIR}")
+            return True
     
     print(f"\nPreparing deployment files in {FILES_DIR}...")
     
@@ -1500,9 +1516,26 @@ def ensure_local_files():
             # we first download wheels-only for the target platform, then separately fetch
             # sdists for a small allowlist.
             print("  Downloading pip packages for Python 3.11 (wheels preferred)...")
+
+            # Split requirements: download wheels for everything except known sdist-only packages.
+            sdist_allowlist = {"uptime"}
+            filtered_lines = []
+            for line in requirements.splitlines():
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    filtered_lines.append(line)
+                    continue
+                pkg_name = s.split("==", 1)[0].split("[", 1)[0].strip()
+                if pkg_name in sdist_allowlist:
+                    continue
+                filtered_lines.append(line)
+
+            filtered_req = FILES_DIR / "requirements.filtered.txt"
+            filtered_req.write_text("\n".join(filtered_lines).strip() + "\n")
+
             base_cmd = [
                 "pip", "download",
-                "-r", str(temp_req),
+                "-r", str(filtered_req),
                 "--dest", str(pip_packages),
                 "--python-version", "3.11",
                 "--implementation", "cp",
@@ -1513,21 +1546,19 @@ def ensure_local_files():
             ]
             result = subprocess.run(base_cmd, capture_output=True, text=True, timeout=600)
 
-            # If pip complains about an sdist-only requirement (seen with `uptime`), fetch that sdist explicitly.
-            # This keeps the main wheel download strict, but avoids hard failure for known sdists.
-            sdist_allowlist = ["uptime"]
-            stderr_text = result.stderr or ""
-            for pkg in sdist_allowlist:
-                if f"requirement {pkg}" in stderr_text.lower() or f"no matching distribution found for {pkg}" in stderr_text.lower():
-                    print(f"  ⚠ '{pkg}' appears to be sdist-only for the target constraints; downloading sdist...")
-                    sdist_cmd = ["pip", "download", "--no-binary", ":all:", "--no-deps", "--dest", str(pip_packages), pkg]
-                    subprocess.run(sdist_cmd, capture_output=True, text=True, timeout=300)
+            # Always fetch sdists for allowlisted packages (they were excluded from wheel download).
+            for pkg in sorted(sdist_allowlist):
+                print(f"  Downloading sdist for '{pkg}'...")
+                sdist_cmd = ["pip", "download", "--no-binary", ":all:", "--no-deps", "--dest", str(pip_packages), pkg]
+                subprocess.run(sdist_cmd, capture_output=True, text=True, timeout=300)
 
             # Count downloaded packages
             package_count = len(list(pip_packages.glob("*")))
+            wheel_count = len(list(pip_packages.glob("*.whl")))
 
-            if package_count == 0:
-                print("  ✗ Failed to download required pip packages for offline install (0 files)")
+            if package_count == 0 or wheel_count == 0:
+                print("  ✗ Failed to download required pip packages for offline install")
+                print(f"    Downloaded files: {package_count} (wheels: {wheel_count})")
                 if result.stderr:
                     print("    pip stderr (first 500 chars):")
                     print(f"    {result.stderr[:500]}")
@@ -1538,26 +1569,20 @@ def ensure_local_files():
 
             # If the wheel download failed for reasons other than known sdists, still fail fast.
             if result.returncode != 0:
-                # Recompute if the failure was only about allowlisted sdists; if so, tolerate.
-                lowered = stderr_text.lower()
-                only_allowlisted = all(
-                    ("no matching distribution found for " + pkg) in lowered or ("could not find a version that satisfies the requirement " + pkg) in lowered
-                    for pkg in sdist_allowlist
-                    if ("no matching distribution found" in lowered or "could not find a version" in lowered)
-                )
-                if not only_allowlisted:
-                    print("  ✗ Failed to download required pip packages for offline install")
-                    if result.stderr:
-                        print("    pip stderr (first 500 chars):")
-                        print(f"    {result.stderr[:500]}")
-                    if result.stdout:
-                        print("    pip stdout (first 500 chars):")
-                        print(f"    {result.stdout[:500]}")
-                    return False
+                print("  ✗ Failed to download required pip packages for offline install")
+                if result.stderr:
+                    print("    pip stderr (first 500 chars):")
+                    print(f"    {result.stderr[:500]}")
+                if result.stdout:
+                    print("    pip stdout (first 500 chars):")
+                    print(f"    {result.stdout[:500]}")
+                return False
 
             print(f"  ✓ Downloaded {package_count} package files")
 
         finally:
+            if 'filtered_req' in locals() and filtered_req.exists():
+                filtered_req.unlink()
             # Clean up temp requirements
             if temp_req.exists():
                 temp_req.unlink()
