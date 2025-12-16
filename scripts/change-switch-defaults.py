@@ -28,6 +28,7 @@ import argparse
 import csv
 import getpass
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -65,34 +66,58 @@ def disable_ztp_on_switch(ip: str, password: str, dry_run: bool = False) -> bool
         print(f"    [DRY RUN] Would disable ZTP")
         return True
     
-    ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
-    
-    # Check current ZTP status first
-    check_cmd = f"sshpass -p '{password}' ssh {ssh_opts} {DEFAULT_USERNAME}@{ip} 'sudo ztp -s 2>/dev/null | grep -i service || echo unknown'"
+    ssh_args = [
+        "sshpass", "-p", password,
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        f"{DEFAULT_USERNAME}@{ip}",
+    ]
+
+    # Helper: run a remote command with sudo password via stdin (non-interactive)
+    def _run_sudo(cmd: str, timeout: int = 45) -> subprocess.CompletedProcess:
+        pw = shlex.quote(password)
+        remote = f"printf '%s\\n' {pw} | sudo -S -p '' {cmd}"
+        return subprocess.run(
+            ssh_args + [remote],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    # Check current ZTP status (best-effort)
     try:
-        result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True, timeout=30)
-        status = result.stdout.strip().lower()
-        
-        if 'disabled' in status:
-            print(f"    ✓ ZTP already disabled")
+        chk = _run_sudo("ztp -s 2>/dev/null | grep -i service || true", timeout=30)
+        status = (chk.stdout or "").strip().lower()
+        if "disabled" in status:
+            print("    ✓ ZTP already disabled")
             return True
-    except:
-        pass  # Continue to try disabling anyway
-    
-    # Disable ZTP
-    print(f"    Disabling ZTP...")
-    disable_cmd = f"sshpass -p '{password}' ssh {ssh_opts} {DEFAULT_USERNAME}@{ip} 'echo {password} | sudo -S ztp --disable 2>&1'"
-    
+    except Exception:
+        # Continue to try disabling anyway
+        pass
+
+    print("    Disabling ZTP...")
     try:
-        result = subprocess.run(disable_cmd, shell=True, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode == 0 or 'Removed' in result.stdout:
-            print(f"    ✓ ZTP disabled")
+        result = _run_sudo("ztp --disable 2>&1", timeout=60)
+
+        out = (result.stdout or "") + (result.stderr or "")
+        out_low = out.lower()
+
+        if result.returncode == 0 or "removed" in out_low or "disabled" in out_low:
+            print("    ✓ ZTP disabled")
             return True
+
+        # Fallback: if ztp helper behaves oddly, try disabling the service directly.
+        # This is safe even if it doesn't exist; we treat "not found" as non-fatal.
+        fallback = _run_sudo("systemctl disable --now ztp 2>&1 || true", timeout=60)
+        fb_out = ((fallback.stdout or "") + (fallback.stderr or "")).strip()
+        if fb_out:
+            print(f"    ⚠ ztp --disable did not clearly succeed; attempted systemctl fallback: {fb_out[:120]}")
         else:
-            print(f"    ⚠ ZTP disable returned: {result.stdout.strip()[:100]}")
-            return True  # May already be disabled
-            
+            print("    ⚠ ztp --disable did not clearly succeed; attempted systemctl fallback")
+        return True
+
     except subprocess.TimeoutExpired:
         print(f"    ✗ Timeout disabling ZTP")
         return False

@@ -903,23 +903,14 @@ class TestRunner:
             f"--csv {FROM_DHCP_CSV} --topology {TOPOLOGY_FILE}"
         )
     
-    def change_passwords(self) -> StepResult:
-        """Change default passwords on switches."""
+    def change_defaults_all(self) -> StepResult:
+        """Change all defaults on switches: password + hostname + disable ZTP (non-interactive)."""
         pwd = shlex.quote(self.password)
         return self.run_step(
-            "Change default passwords",
+            "Change defaults (password + hostname + disable ZTP)",
             "scripts/change-switch-defaults.py",
-            f"--csv {FROM_DHCP_CSV} --password --new-password {pwd}",
-            timeout=300
-        )
-    
-    def change_passwords_and_hostnames(self) -> StepResult:
-        """Change passwords AND set hostnames on switches."""
-        pwd = shlex.quote(self.password)
-        return self.run_step(
-            "Change passwords and set hostnames",
-            "scripts/change-switch-defaults.py",
-            f"--csv {FROM_DHCP_CSV} --password --hostname --new-password {pwd}",
+            # No action flags => change-switch-defaults.py does ALL actions by default.
+            f"--csv {FROM_DHCP_CSV} --new-password {pwd}",
             timeout=300
         )
     
@@ -990,8 +981,8 @@ class TestRunner:
         Steps:
         1. Rebuild test switches + BCM cleanup (NOT full simulation reset)
         2. Generate CSV from DHCP
-        3. Change default passwords
-        4. Map hostnames from topology
+        3. Map hostnames from topology
+        4. Change defaults (password + hostname + disable ZTP)
         5. Deploy using --csv
         6. Validate deployment
         """
@@ -1044,8 +1035,8 @@ class TestRunner:
             test.duration = time.time() - start
             return test
         
-        # Step 3: Change default passwords
-        step = self.change_passwords()
+        # Step 3: Map hostnames (so we can set them on switches during setup)
+        step = self.map_hostnames()
         steps.append(step)
         if not step.success:
             test.success = False
@@ -1053,9 +1044,9 @@ class TestRunner:
             test.end_time = datetime.now().isoformat()
             test.duration = time.time() - start
             return test
-        
-        # Step 4: Map hostnames
-        step = self.map_hostnames()
+
+        # Step 4: Change defaults (password + hostname + disable ZTP)
+        step = self.change_defaults_all()
         steps.append(step)
         if not step.success:
             test.success = False
@@ -1090,7 +1081,7 @@ class TestRunner:
         1. Rebuild test switches + BCM cleanup (NOT full simulation reset)
         2. Generate CSV from DHCP
         3. Map hostnames from topology
-        4. Change passwords AND set hostnames on switches
+        4. Change defaults (password + hostname + disable ZTP)
         5. Deploy using --csv
         6. Validate deployment
         """
@@ -1153,8 +1144,8 @@ class TestRunner:
             test.duration = time.time() - start
             return test
         
-        # Step 4: Change passwords AND set hostnames
-        step = self.change_passwords_and_hostnames()
+        # Step 4: Change defaults (password + hostname + disable ZTP)
+        step = self.change_defaults_all()
         steps.append(step)
         if not step.success:
             test.success = False
@@ -1188,8 +1179,8 @@ class TestRunner:
         Steps:
         1. Rebuild test switches + BCM cleanup (NOT full simulation reset)
         2. Generate CSV from DHCP
-        3. Change default passwords
-        4. Map hostnames from topology
+        3. Map hostnames from topology
+        4. Change defaults (password + hostname + disable ZTP)
         5. Add devices to BCM (without installing daemon)
         6. Deploy using --from-bcm (installs cm-lite-daemon on existing BCM devices)
         7. Validate deployment
@@ -1243,8 +1234,8 @@ class TestRunner:
             test.duration = time.time() - start
             return test
         
-        # Step 3: Change default passwords
-        step = self.change_passwords()
+        # Step 3: Map hostnames (so we can set them on switches during setup)
+        step = self.map_hostnames()
         steps.append(step)
         if not step.success:
             test.success = False
@@ -1252,9 +1243,9 @@ class TestRunner:
             test.end_time = datetime.now().isoformat()
             test.duration = time.time() - start
             return test
-        
-        # Step 4: Map hostnames
-        step = self.map_hostnames()
+
+        # Step 4: Change defaults (password + hostname + disable ZTP)
+        step = self.change_defaults_all()
         steps.append(step)
         if not step.success:
             test.success = False

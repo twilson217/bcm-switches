@@ -1470,10 +1470,12 @@ def ensure_local_files():
         try:
             # Download packages for Python 3.11 (Cumulus Linux default).
             #
-            # NOTE: pip requires additional flags when using --python-version/--platform/--abi/etc.
-            # See: pip's "restricting platform and interpreter constraints" error guidance.
-            print("  Downloading pip packages for Python 3.11...")
-            cmd = [
+            # We prefer wheels for offline installation, but a small number of requirements
+            # (e.g. `uptime`) may only be available as sdists. To keep the wheelhouse usable,
+            # we first download wheels-only for the target platform, then separately fetch
+            # sdists for a small allowlist.
+            print("  Downloading pip packages for Python 3.11 (wheels preferred)...")
+            base_cmd = [
                 "pip", "download",
                 "-r", str(temp_req),
                 "--dest", str(pip_packages),
@@ -1484,13 +1486,23 @@ def ensure_local_files():
                 "--only-binary", ":all:",
                 "--no-binary", ":none:",
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            result = subprocess.run(base_cmd, capture_output=True, text=True, timeout=600)
+
+            # If pip complains about an sdist-only requirement (seen with `uptime`), fetch that sdist explicitly.
+            # This keeps the main wheel download strict, but avoids hard failure for known sdists.
+            sdist_allowlist = ["uptime"]
+            stderr_text = result.stderr or ""
+            for pkg in sdist_allowlist:
+                if f"requirement {pkg}" in stderr_text.lower() or f"no matching distribution found for {pkg}" in stderr_text.lower():
+                    print(f"  ⚠ '{pkg}' appears to be sdist-only for the target constraints; downloading sdist...")
+                    sdist_cmd = ["pip", "download", "--no-binary", ":all:", "--no-deps", "--dest", str(pip_packages), pkg]
+                    subprocess.run(sdist_cmd, capture_output=True, text=True, timeout=300)
 
             # Count downloaded packages
             package_count = len(list(pip_packages.glob("*")))
 
-            if result.returncode != 0 or package_count == 0:
-                print("  ✗ Failed to download required pip packages for offline install")
+            if package_count == 0:
+                print("  ✗ Failed to download required pip packages for offline install (0 files)")
                 if result.stderr:
                     print("    pip stderr (first 500 chars):")
                     print(f"    {result.stderr[:500]}")
@@ -1498,6 +1510,25 @@ def ensure_local_files():
                     print("    pip stdout (first 500 chars):")
                     print(f"    {result.stdout[:500]}")
                 return False
+
+            # If the wheel download failed for reasons other than known sdists, still fail fast.
+            if result.returncode != 0:
+                # Recompute if the failure was only about allowlisted sdists; if so, tolerate.
+                lowered = stderr_text.lower()
+                only_allowlisted = all(
+                    ("no matching distribution found for " + pkg) in lowered or ("could not find a version that satisfies the requirement " + pkg) in lowered
+                    for pkg in sdist_allowlist
+                    if ("no matching distribution found" in lowered or "could not find a version" in lowered)
+                )
+                if not only_allowlisted:
+                    print("  ✗ Failed to download required pip packages for offline install")
+                    if result.stderr:
+                        print("    pip stderr (first 500 chars):")
+                        print(f"    {result.stderr[:500]}")
+                    if result.stdout:
+                        print("    pip stdout (first 500 chars):")
+                        print(f"    {result.stdout[:500]}")
+                    return False
 
             print(f"  ✓ Downloaded {package_count} package files")
 
