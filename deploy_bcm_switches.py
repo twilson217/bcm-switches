@@ -380,6 +380,31 @@ def run_connectivity_test(config: ConfigManager) -> Optional[str]:
                 print("Please enter 1 or 2.")
 
 
+def run_auth_check(username: str, password: str, devices: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Verify we can SSH to each device using the provided username/password.
+
+    This catches password drift early (e.g., defaults were changed but deploy is running
+    with an old password), before rsync/install steps.
+    """
+    discovery = SwitchDiscovery(username, password)
+    reachable: List[Dict] = []
+    unreachable: List[Dict] = []
+
+    for device in devices:
+        ip = device.get("ip")
+        if not ip:
+            unreachable.append(device)
+            continue
+        try:
+            ok = discovery.check_connectivity(ip)
+        except Exception:
+            ok = False
+        (reachable if ok else unreachable).append(device)
+
+    return reachable, unreachable
+
+
 class NetworkDetector:
     """Detect BCM networks and match switch IPs."""
     
@@ -2103,10 +2128,19 @@ Notes:
             for d in csv_devices:
                 d['network'] = network
         
-        # Connectivity test
+        # Connectivity/auth test
         if args.non_interactive:
-            # Non-interactive: skip connectivity test
-            print("\n  (non-interactive: skipping connectivity test)")
+            # In non-interactive mode we still MUST validate SSH auth to avoid late rsync/install failures.
+            print("\nTesting SSH authentication to devices...")
+            reachable, unreachable = run_auth_check(username, password, csv_devices)
+            if unreachable:
+                print(f"\n✗ {len(unreachable)} device(s) failed SSH authentication or are unreachable:")
+                for dev in unreachable:
+                    hn = dev.get("hostname") or dev.get("ip")
+                    print(f"  - {hn} ({dev.get('ip')})")
+                print("\nFix credentials/state and re-run. (Tip: ensure your setup step changed passwords consistently.)")
+                sys.exit(1)
+            print(f"✓ SSH authentication OK for {len(reachable)}/{len(csv_devices)} devices")
         else:
             print("\n" + "-" * 60)
             response = input("Would you like to test connectivity to the devices? (y/n) [y]: ").strip().lower()
