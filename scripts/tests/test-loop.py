@@ -964,7 +964,9 @@ class TestRunner:
         result = self.run_step(
             "Validate deployment",
             "scripts/validation-testing.py",
-            f"--password {self.password}",
+            # Always run validation with --verbose so failures include actionable detail
+            # in the step log even if test-loop itself is not running with --verbose.
+            f"--password {self.password} --verbose",
             timeout=120
         )
         

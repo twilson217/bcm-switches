@@ -157,6 +157,38 @@ def run_ssh_cmd(ip: str, command: str, username: str, password: str,
     return False, stderr
 
 
+def _normalize_log_line_for_dedupe(line: str) -> str:
+    """
+    Best-effort normalization to dedupe repeated log lines where only timestamps/PIDs differ.
+    """
+    s = (line or "").strip()
+    if not s:
+        return s
+    # Strip common syslog/journal prefixes
+    s = re.sub(r"^[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\S+\s+", "", s)  # "Dec 16 11:22:33 host "
+    s = re.sub(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s+", "", s)
+    s = re.sub(r"\[[0-9]+\]", "[PID]", s)  # replace [1234]
+    s = re.sub(r"\bpid=\d+\b", "pid=PID", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
+def dedupe_lines_with_counts(lines: List[str], limit: int = 10) -> List[Tuple[int, str]]:
+    """Return a list of (count, representative_line) entries, sorted by count desc."""
+    counts: Dict[str, int] = {}
+    rep: Dict[str, str] = {}
+    for line in lines:
+        key = _normalize_log_line_for_dedupe(line)
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        rep.setdefault(key, (line or "").strip())
+    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    out: List[Tuple[int, str]] = []
+    for key, cnt in items[:limit]:
+        out.append((cnt, rep.get(key, key)))
+    return out
+
+
 def read_csv_file(csv_path: Path) -> List[Dict]:
     """Read devices from CSV file."""
     devices = []
@@ -262,11 +294,17 @@ class BCMSystemValidator:
             )
         
         error_count = len(out.strip().split('\n'))
+        lines = [l for l in out.split('\n') if l.strip()]
+        deduped = dedupe_lines_with_counts(lines, limit=8)
+        detail_lines = []
+        for cnt, msg in deduped:
+            prefix = f"({cnt}x) " if cnt > 1 else ""
+            detail_lines.append(prefix + msg)
         return CheckResult(
             name="BCM syslog errors",
             passed=False,
             message=f"Found {error_count} recent error(s) in syslog",
-            details=out[:500] if self.verbose else f"Run with --verbose to see details",
+            details="\n".join(detail_lines) if detail_lines else (out[:500] if self.verbose else ""),
             severity="warning"
         )
     
@@ -748,33 +786,46 @@ class SwitchValidator:
                 passed=True,
                 message="No errors in recent cm-lite-daemon logs"
             )
+        deduped = dedupe_lines_with_counts(error_lines, limit=12 if self.verbose else 6)
+        detail_lines = []
+        for cnt, msg in deduped:
+            prefix = f"({cnt}x) " if cnt > 1 else ""
+            detail_lines.append(prefix + msg)
         return CheckResult(
             name="Daemon logs",
             passed=False,
             message=f"Found {len(error_lines)} error(s) in daemon logs",
-            details='\n'.join(error_lines[:5]) if self.verbose else "Run with --verbose",
+            details='\n'.join(detail_lines),
             severity="warning"
         )
     
     def run_all_checks(self) -> List[CheckResult]:
         """Run all switch-side checks."""
-        checks = [self.check_ssh_connectivity()]
-        
-        # Only continue if SSH works
-        if not checks[0].passed:
-            return checks
-        
-        checks.extend([
-            self.check_hostname(),
-            self.check_cm_lite_daemon_installed(),
-            self.check_cm_lite_daemon_running(),
-            self.check_cm_lite_daemon_enabled(),
-            self.check_ztp_disabled(),
-            self.check_pip_packages(),
-            self.check_cm_lite_config(),
-            self.check_bcm_connectivity(),
-            self.check_daemon_logs(),
-        ])
+        plan: List[Tuple[str, callable]] = [
+            ("SSH connectivity", self.check_ssh_connectivity),
+            ("Hostname check", self.check_hostname),
+            ("cm-lite-daemon installed", self.check_cm_lite_daemon_installed),
+            ("cm-lite-daemon running", self.check_cm_lite_daemon_running),
+            ("cm-lite-daemon enabled", self.check_cm_lite_daemon_enabled),
+            ("Switch ZTP disabled", self.check_ztp_disabled),
+            ("Pip packages", self.check_pip_packages),
+            ("cm-lite-daemon config", self.check_cm_lite_config),
+            ("BCM connectivity", self.check_bcm_connectivity),
+            ("Daemon logs", self.check_daemon_logs),
+        ]
+
+        checks: List[CheckResult] = []
+        total = len(plan)
+        for idx, (label, fn) in enumerate(plan, 1):
+            # Always show minimal progress so it doesn't look stalled.
+            print(f"    [{idx}/{total}] {label}...", flush=True)
+            res = fn()
+            checks.append(res)
+
+            # Only continue if SSH works
+            if label == "SSH connectivity" and not res.passed:
+                return checks
+
         return checks
 
 
@@ -848,7 +899,11 @@ def generate_report(report: ValidationReport, as_json: bool = False) -> str:
                 status_char = "✓" if check.passed else "✗"
                 lines.append(f"    {status_char} {check.name}: {check.message}")
                 if check.details and not check.passed:
-                    lines.append(f"        Detail: {check.details[:100]}")
+                    detail = (check.details or "").strip()
+                    if detail:
+                        # Print multi-line details with basic truncation per line.
+                        for dl in detail.splitlines()[:20]:
+                            lines.append(f"        {dl[:300]}")
         
         lines.append("")
     
@@ -866,7 +921,10 @@ def generate_report(report: ValidationReport, as_json: bool = False) -> str:
         for hostname, check in failed_checks[:10]:
             lines.append(f"  • {hostname}: {check.name}")
             if check.details:
-                lines.append(f"    → {check.details[:100]}")
+                detail = (check.details or "").strip()
+                if detail:
+                    first = detail.splitlines()[0]
+                    lines.append(f"    → {first[:200]}")
         lines.append("")
     
     lines.append("=" * 80)
@@ -984,6 +1042,8 @@ Examples:
             mac = switch_info.get('mac', '')
             
             print(f"\n[{i}/{len(switches)}] {hostname} ({ip})...")
+            if args.verbose:
+                print("  (verbose) Running checks; this can take a bit if SSH/sudo commands are slow...", flush=True)
             
             switch_result = SwitchValidation(
                 hostname=hostname,
