@@ -1582,38 +1582,90 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
             # sdists for a small allowlist.
             print(f"  Downloading pip packages for python version(s): {', '.join(python_versions)} (wheels preferred)...")
 
-            # Split requirements: download wheels for everything except known sdist-only packages.
+            # Split requirements: download wheels for everything except packages we will allow as sdists.
+            # Start with a small baseline allowlist; we will expand it automatically if pip reports
+            # "no matching distribution found" for a package under the wheel constraints.
             sdist_allowlist = {"uptime"}
-            filtered_lines = []
-            for line in requirements.splitlines():
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    filtered_lines.append(line)
-                    continue
-                pkg_name = s.split("==", 1)[0].split("[", 1)[0].strip()
-                if pkg_name in sdist_allowlist:
-                    continue
-                filtered_lines.append(line)
 
-            filtered_req = FILES_DIR / "requirements.filtered.txt"
-            filtered_req.write_text("\n".join(filtered_lines).strip() + "\n")
+            def _pkg_name_from_req_line(line: str) -> Optional[str]:
+                s = (line or "").strip()
+                if not s or s.startswith("#"):
+                    return None
+                # Basic normalization: strip extras and version pins.
+                return s.split("==", 1)[0].split("[", 1)[0].strip()
+
+            def _write_filtered_requirements() -> Path:
+                filtered_lines = []
+                for line in requirements.splitlines():
+                    pkg = _pkg_name_from_req_line(line)
+                    if pkg and pkg in sdist_allowlist:
+                        continue
+                    filtered_lines.append(line)
+                p = FILES_DIR / "requirements.filtered.txt"
+                p.write_text("\n".join(filtered_lines).strip() + "\n")
+                return p
+
+            def _extract_missing_pkgs(stderr_text: str) -> List[str]:
+                """
+                Parse pip stderr for missing distribution messages and return package names.
+                Examples:
+                  - "No matching distribution found for netifaces"
+                  - "Could not find a version that satisfies the requirement netifaces (from versions: none)"
+                """
+                missing: List[str] = []
+                if not stderr_text:
+                    return missing
+                low = stderr_text.lower()
+                # Pattern 1: explicit "No matching distribution found for X"
+                for m in re.finditer(r"no matching distribution found for ([a-z0-9_.-]+)", low):
+                    missing.append(m.group(1))
+                # Pattern 2: "satisfies the requirement X"
+                for m in re.finditer(r"satisfies the requirement ([a-z0-9_.-]+)", low):
+                    missing.append(m.group(1))
+                # De-dupe while preserving order
+                out: List[str] = []
+                for x in missing:
+                    if x not in out:
+                        out.append(x)
+                return out
 
             results = []
             for v in python_versions:
-                _, abi = _python_version_to_tags(v)
-                base_cmd = [
-                    "pip", "download",
-                    "-r", str(filtered_req),
-                    "--dest", str(pip_packages),
-                    "--python-version", v,
-                    "--implementation", "cp",
-                    "--abi", abi,
-                    "--platform", "manylinux2014_x86_64",
-                    "--only-binary", ":all:",
-                    "--no-binary", ":none:",
-                ]
-                r = subprocess.run(base_cmd, capture_output=True, text=True, timeout=600)
-                results.append((v, abi, r))
+                v_norm, abi = _python_version_to_tags(v)
+
+                # Retry loop: expand sdist_allowlist based on pip errors, then retry wheel download.
+                attempt = 0
+                last = None
+                while attempt < 3:
+                    attempt += 1
+                    filtered_req = _write_filtered_requirements()
+                    base_cmd = [
+                        "pip", "download",
+                        "-r", str(filtered_req),
+                        "--dest", str(pip_packages),
+                        "--python-version", v_norm,
+                        "--implementation", "cp",
+                        "--abi", abi,
+                        "--platform", "manylinux2014_x86_64",
+                        "--only-binary", ":all:",
+                        "--no-binary", ":none:",
+                    ]
+                    r = subprocess.run(base_cmd, capture_output=True, text=True, timeout=600)
+                    last = r
+                    if r.returncode == 0:
+                        break
+
+                    missing_pkgs = _extract_missing_pkgs(r.stderr or "")
+                    # Add newly discovered missing packages to sdist allowlist and retry.
+                    added = False
+                    for pkg in missing_pkgs:
+                        if pkg and pkg not in sdist_allowlist:
+                            sdist_allowlist.add(pkg)
+                            added = True
+                    if not added:
+                        break
+
+                results.append((v_norm, abi, last))
 
             # Always fetch sdists for allowlisted packages (they were excluded from wheel download).
             for pkg in sorted(sdist_allowlist):
@@ -1629,7 +1681,7 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
                 print("  ✗ Failed to download required pip packages for offline install")
                 print(f"    Downloaded files: {package_count} (wheels: {wheel_count})")
                 for v, abi, r in results:
-                    if r.returncode != 0:
+                    if r is not None and r.returncode != 0:
                         print(f"    pip download failed for python {v} ({abi})")
                         if r.stderr:
                             print(f"      stderr (first 500 chars): {r.stderr[:500]}")
@@ -1638,10 +1690,10 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
                 return False
 
             # If the wheel download failed for reasons other than known sdists, still fail fast.
-            if any(r.returncode != 0 for _, _, r in results):
+            if any((r is not None and r.returncode != 0) for _, _, r in results):
                 print("  ✗ Failed to download required pip packages for offline install")
                 for v, abi, r in results:
-                    if r.returncode != 0:
+                    if r is not None and r.returncode != 0:
                         print(f"    pip download failed for python {v} ({abi})")
                         if r.stderr:
                             print(f"      stderr (first 500 chars): {r.stderr[:500]}")
