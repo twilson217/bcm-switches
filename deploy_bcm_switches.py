@@ -1508,6 +1508,7 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
 
     # Check if files already exist (and are plausibly complete for the detected python versions).
     # A non-empty directory is not sufficient: we need wheels for each target ABI.
+    needs_pip_rebuild = False
     if cm_lite_zip.exists() and pip_packages.exists():
         existing = list(pip_packages.glob("*"))
         if existing:
@@ -1524,6 +1525,7 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
                 print(f"✓ Using cached files from {FILES_DIR}")
                 return True
             print(f"⚠ Cached wheelhouse missing wheels for python version(s): {', '.join(missing)}; re-downloading")
+            needs_pip_rebuild = True
     
     print(f"\nPreparing deployment files in {FILES_DIR}...")
     
@@ -1537,8 +1539,20 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
             print(f"  ✗ cm-lite-daemon.zip not found at {CM_LITE_ZIP_PATH}")
             return False
     
-    # Extract requirements and download pip packages if not present
-    if not pip_packages.exists() or not list(pip_packages.glob("*")):
+    # Extract requirements and download pip packages if not present OR cache is incomplete.
+    if needs_pip_rebuild:
+        # Clear out stale/incomplete wheelhouse contents so we don't accidentally re-use it.
+        try:
+            for p in pip_packages.glob("*"):
+                if p.is_file() or p.is_symlink():
+                    p.unlink()
+                elif p.is_dir():
+                    shutil.rmtree(p)
+        except Exception:
+            # Best-effort; we'll still attempt to download into the directory.
+            pass
+
+    if needs_pip_rebuild or (not pip_packages.exists()) or (not list(pip_packages.glob("*"))):
         pip_packages.mkdir(parents=True, exist_ok=True)
         
         # Extract requirements.txt from zip
