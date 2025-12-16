@@ -1259,28 +1259,51 @@ class BCMDeployer:
             subprocess.run(full_cmd, input=f"{self.password}\n",
                          capture_output=True, text=True, timeout=60)
             
-            # Wait a moment for service to start
-            time.sleep(3)
-            
-            # Verify service is running
+            # Poll service for a bit: systemd may need time for first start after install/register.
             print(f"    Verifying service status...")
-            verify_cmd = "systemctl is-active cm-lite-daemon"
-            full_cmd = ssh_base + [verify_cmd]
-            result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=30)
-            
-            if result.stdout.strip() == "active":
-                print(f"    ✓ cm-lite-daemon service is running")
-                return True
-            else:
-                print(f"    ✗ Service not running: {result.stdout.strip()}")
-                # Try to get more info
-                status_cmd = "sudo systemctl status cm-lite-daemon --no-pager -l"
-                full_cmd = ssh_base + [status_cmd.replace("sudo ", "sudo -S ", 1)]
-                status_result = subprocess.run(full_cmd, input=f"{self.password}\n",
-                                              capture_output=True, text=True, timeout=30)
-                if status_result.stdout:
-                    print(f"    Service status:\n{status_result.stdout[:500]}")
-                return False
+            max_wait = 45
+            interval = 3
+            waited = 0
+            last_state = None
+            while waited <= max_wait:
+                verify_cmd = "systemctl is-active cm-lite-daemon"
+                full_cmd = ssh_base + [verify_cmd]
+                result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=30)
+                state = (result.stdout or "").strip()
+                last_state = state
+                if state == "active":
+                    print(f"    ✓ cm-lite-daemon service is running")
+                    return True
+                time.sleep(interval)
+                waited += interval
+
+            print(f"    ✗ Service not running after {max_wait}s: {last_state}")
+
+            # Pull diagnostics to make failures actionable.
+            def _sudo(cmd: str, timeout: int = 45) -> subprocess.CompletedProcess:
+                full = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
+                return subprocess.run(full, input=f"{self.password}\n",
+                                      capture_output=True, text=True, timeout=timeout)
+
+            status_cmd = "sudo systemctl status cm-lite-daemon --no-pager -l"
+            status_result = _sudo(status_cmd, timeout=45)
+            if status_result.stdout:
+                print("    Service status (tail):")
+                print(status_result.stdout[-1500:])
+
+            journal_cmd = "sudo journalctl -u cm-lite-daemon --no-pager -n 200"
+            journal_result = _sudo(journal_cmd, timeout=45)
+            if journal_result.stdout:
+                print("    journalctl -u cm-lite-daemon (tail):")
+                print(journal_result.stdout[-2000:])
+
+            log_cmd = "sudo sh -lc 'ls -1 /opt/cm-lite-daemon/log 2>/dev/null | tail -n 20 || true'"
+            log_list = _sudo(log_cmd, timeout=45)
+            if log_list.stdout and log_list.stdout.strip():
+                print("    /opt/cm-lite-daemon/log (listing):")
+                print(log_list.stdout.strip())
+
+            return False
             
         except Exception as e:
             print(f"    ✗ Registration failed: {e}")
