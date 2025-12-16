@@ -405,6 +405,32 @@ def run_auth_check(username: str, password: str, devices: List[Dict]) -> Tuple[L
     return reachable, unreachable
 
 
+def detect_switch_vrf(username: str, password: str, devices: List[Dict]) -> Optional[str]:
+    """
+    Detect the VRF used by the management IP on the switches.
+
+    Returns a VRF string like 'mgmt' or 'default'. If detection yields multiple VRFs,
+    returns None (caller should fail or require explicit override).
+    """
+    discovery = SwitchDiscovery(username, password)
+    vrfs = []
+    for dev in devices:
+        ip = dev.get("ip")
+        if not ip:
+            continue
+        ok, vrf = discovery.test_connectivity_and_vrf(ip)
+        if ok and vrf:
+            vrfs.append(vrf)
+
+    vrfs = [v for v in vrfs if v and v != "unknown"]
+    if not vrfs:
+        return None
+    uniq = sorted(set(vrfs))
+    if len(uniq) == 1:
+        return uniq[0]
+    return None
+
+
 class NetworkDetector:
     """Detect BCM networks and match switch IPs."""
     
@@ -2057,11 +2083,21 @@ Notes:
                 username = input("Enter SSH username [cumulus]: ").strip() or "cumulus"
                 password = getpass.getpass("Enter SSH password: ")
         
-        # Get VRF - use default or prompt
-        vrf = config.get('vrf', 'default')
-        if not vrf:
-            vrf = 'default'
-        print(f"\nUsing VRF: {vrf}")
+        # Determine VRF
+        vrf = config.get('vrf')
+        if args.non_interactive:
+            # Auto-detect VRF from the switches in non-interactive mode.
+            detected = detect_switch_vrf(username, password, bcm_switches)
+            if detected:
+                vrf = detected
+            else:
+                # Safe default for modern Cumulus: mgmt. If your lab uses default, detection should find it.
+                vrf = vrf or "mgmt"
+            print(f"\nUsing VRF: {vrf}")
+        else:
+            # Interactive: use configured value or prompt/assume default.
+            vrf = vrf or "default"
+            print(f"\nUsing VRF: {vrf}")
         
         # Save config
         config.set('username', username)
@@ -2354,10 +2390,16 @@ Notes:
         if network:
             config.set('network', network)
         
-        # VRF - use default if not set
-        vrf = config.get('vrf', 'default')
-        if not vrf:
-            vrf = 'default'
+        # VRF
+        vrf = config.get('vrf')
+        if args.non_interactive:
+            detected = detect_switch_vrf(username, password, csv_devices)
+            if detected:
+                vrf = detected
+            else:
+                vrf = vrf or "mgmt"
+        else:
+            vrf = vrf or "default"
         config.set('vrf', vrf)
         
         # Set devices directly (skip discovery phase)
