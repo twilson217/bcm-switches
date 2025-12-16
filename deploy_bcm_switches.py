@@ -431,6 +431,26 @@ def detect_switch_vrf(username: str, password: str, devices: List[Dict]) -> Opti
     return None
 
 
+def choose_vrf_with_logging(*, non_interactive: bool, configured_vrf: Optional[str], detected_vrf: Optional[str]) -> str:
+    """
+    Decide which VRF to use and emit a clear log message about the source.
+
+    Policy:
+    - Prefer detected VRF when available.
+    - Else use configured VRF if provided.
+    - Else default to 'mgmt' (explicitly logged).
+    """
+    if detected_vrf:
+        print(f"\nAuto-detected VRF from switches: {detected_vrf}")
+        return detected_vrf
+    if configured_vrf:
+        print(f"\nUsing VRF from saved configuration: {configured_vrf}")
+        return configured_vrf
+    # Default
+    print("\nCould not auto-detect VRF and no VRF configured; defaulting to 'mgmt'")
+    return "mgmt"
+
+
 class NetworkDetector:
     """Detect BCM networks and match switch IPs."""
     
@@ -2084,20 +2104,13 @@ Notes:
                 password = getpass.getpass("Enter SSH password: ")
         
         # Determine VRF
-        vrf = config.get('vrf')
-        if args.non_interactive:
-            # Auto-detect VRF from the switches in non-interactive mode.
-            detected = detect_switch_vrf(username, password, bcm_switches)
-            if detected:
-                vrf = detected
-            else:
-                # Safe default for modern Cumulus: mgmt. If your lab uses default, detection should find it.
-                vrf = vrf or "mgmt"
-            print(f"\nUsing VRF: {vrf}")
-        else:
-            # Interactive: use configured value or prompt/assume default.
-            vrf = vrf or "default"
-            print(f"\nUsing VRF: {vrf}")
+        configured_vrf = config.get('vrf')
+        detected_vrf = detect_switch_vrf(username, password, bcm_switches) if args.non_interactive else None
+        vrf = choose_vrf_with_logging(
+            non_interactive=args.non_interactive,
+            configured_vrf=configured_vrf,
+            detected_vrf=detected_vrf,
+        )
         
         # Save config
         config.set('username', username)
@@ -2391,15 +2404,13 @@ Notes:
             config.set('network', network)
         
         # VRF
-        vrf = config.get('vrf')
-        if args.non_interactive:
-            detected = detect_switch_vrf(username, password, csv_devices)
-            if detected:
-                vrf = detected
-            else:
-                vrf = vrf or "mgmt"
-        else:
-            vrf = vrf or "default"
+        configured_vrf = config.get('vrf')
+        detected_vrf = detect_switch_vrf(username, password, csv_devices) if args.non_interactive else None
+        vrf = choose_vrf_with_logging(
+            non_interactive=args.non_interactive,
+            configured_vrf=configured_vrf,
+            detected_vrf=detected_vrf,
+        )
         config.set('vrf', vrf)
         
         # Set devices directly (skip discovery phase)
