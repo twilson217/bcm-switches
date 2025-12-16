@@ -31,15 +31,19 @@ import sys
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
+import getpass
+import shlex
 from typing import Dict, List, Optional, Tuple
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
-CONFIG_DIR = Path(".configs")
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_DIR = SCRIPT_DIR.parent
+CONFIG_DIR = REPO_DIR / ".configs"
 DEFAULT_USERNAME = "cumulus"
-DEFAULT_PASSWORD = "cumulus"
+DEFAULT_PASSWORD = ""
 
 # BCM states that indicate success
 BCM_SUCCESS_STATES = ['UP', 'IDLE', 'DOWN']  # DOWN is ok for monitoring-only
@@ -134,7 +138,7 @@ def run_ssh_cmd(ip: str, command: str, username: str, password: str,
     ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
     
     # Try with password
-    cmd = f"sshpass -p '{password}' ssh {ssh_opts} {username}@{ip} '{command}'"
+    cmd = f"sshpass -p {shlex.quote(password)} ssh {ssh_opts} {username}@{ip} {shlex.quote(command)}"
     rc, stdout, stderr = run_cmd(cmd, timeout)
     
     if rc == 0:
@@ -142,8 +146,10 @@ def run_ssh_cmd(ip: str, command: str, username: str, password: str,
     
     # Try with sudo for commands that need it
     if 'permission denied' in stderr.lower() or 'sudo' in command.lower():
-        cmd = f"sshpass -p '{password}' ssh {ssh_opts} {username}@{ip} " \
-              f"\"echo '{password}' | sudo -S {command}\""
+        cmd = (
+            f"sshpass -p {shlex.quote(password)} ssh {ssh_opts} {username}@{ip} "
+            f"{shlex.quote(f'echo {shlex.quote(password)} | sudo -S {command}')}"
+        )
         rc, stdout, stderr = run_cmd(cmd, timeout)
         if rc == 0:
             return True, stdout
@@ -638,8 +644,7 @@ class SwitchValidator:
         """Check cm-lite-daemon configuration."""
         success, out = run_ssh_cmd(
             self.ip, 
-            "cat /opt/cm-lite-daemon/etc/config.json 2>/dev/null || "
-            "echo 'Nvidia1234!' | sudo -S cat /opt/cm-lite-daemon/etc/config.json 2>/dev/null",
+            "sudo -S cat /opt/cm-lite-daemon/etc/config.json 2>/dev/null",
             self.username, self.password
         )
         
@@ -675,8 +680,7 @@ class SwitchValidator:
         # Get BCM IP from config
         success, out = run_ssh_cmd(
             self.ip,
-            "cat /opt/cm-lite-daemon/etc/config.json 2>/dev/null || "
-            "echo 'Nvidia1234!' | sudo -S cat /opt/cm-lite-daemon/etc/config.json 2>/dev/null",
+            "sudo -S cat /opt/cm-lite-daemon/etc/config.json 2>/dev/null",
             self.username, self.password
         )
         
@@ -720,7 +724,7 @@ class SwitchValidator:
         """Check cm-lite-daemon logs for errors."""
         success, out = run_ssh_cmd(
             self.ip,
-            "echo 'Nvidia1234!' | sudo -S journalctl -u cm-lite-daemon -n 50 --no-pager 2>/dev/null",
+            "sudo -S journalctl -u cm-lite-daemon -n 50 --no-pager 2>/dev/null",
             self.username, self.password, timeout=60
         )
         
@@ -915,11 +919,18 @@ Examples:
     import time
     start_time = time.time()
     
-    # Get password
+    # Get password (prefer CLI, then repo config, else prompt/error)
     password = args.password
     if not password:
         config = load_config()
-        password = config.get('password', DEFAULT_PASSWORD)
+        password = (config.get('password') or "").strip()
+    if not password:
+        if sys.stdin.isatty():
+            password = getpass.getpass("Enter SSH password: ")
+        else:
+            print("Error: SSH password not provided and no password found in .configs/config.json.")
+            print("       Provide --password or run interactively to be prompted.")
+            sys.exit(1)
     
     # Determine switches to validate
     switches = []
