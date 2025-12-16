@@ -1453,7 +1453,46 @@ def check_prerequisites():
         sys.exit(1)
 
 
-def ensure_local_files():
+def _python_version_to_tags(py_version: str) -> Tuple[str, str]:
+    """
+    Convert '3.11' -> ('3.11', 'cp311'), '3.9' -> ('3.9', 'cp39'), '3.10' -> ('3.10', 'cp310').
+    """
+    parts = (py_version or "").strip().split(".")
+    if len(parts) < 2:
+        raise ValueError(f"Invalid python version '{py_version}' (expected MAJOR.MINOR)")
+    major = int(parts[0])
+    minor = int(parts[1])
+    if major != 3:
+        raise ValueError(f"Unsupported python major version '{major}' (expected 3.x)")
+    abi = f"cp{major}{minor}" if minor < 10 else f"cp{major}{minor}"
+    # For 3.9 this yields cp39, for 3.10 cp310, for 3.11 cp311.
+    return f"{major}.{minor}", abi
+
+
+def detect_switch_python_versions(username: str, password: str, devices: List[Dict]) -> List[str]:
+    """
+    Detect python3 MAJOR.MINOR versions on target switches.
+
+    Returns a sorted list of unique versions (e.g. ['3.10', '3.11']).
+    If detection fails for all devices, returns ['3.11'] as a conservative default.
+    """
+    discovery = SwitchDiscovery(username, password)
+    found: set = set()
+    for dev in devices:
+        ip = dev.get("ip")
+        if not ip:
+            continue
+        out = discovery._run_ssh_command(ip, "python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")' 2>/dev/null")
+        if out:
+            v = out.strip()
+            if v and v[0].isdigit() and "." in v:
+                found.add(v)
+    if not found:
+        return ["3.11"]
+    return sorted(found)
+
+
+def ensure_local_files(python_versions: Optional[List[str]] = None):
     """Ensure all required files are present in .files/ directory.
     
     Downloads files if not already present. This enables a 'partially airgapped'
@@ -1464,15 +1503,27 @@ def ensure_local_files():
     cm_lite_zip = FILES_DIR / "cm-lite-daemon.zip"
     pip_packages = FILES_DIR / "pip_packages_dep"
     
-    # Check if files already exist (and are plausibly complete).
-    # A non-empty directory is not sufficient: we need at least some wheels present
-    # for offline installation (sdist-only packages like `uptime` are not enough).
+    # Default target if caller didn't detect versions.
+    python_versions = python_versions or ["3.11"]
+
+    # Check if files already exist (and are plausibly complete for the detected python versions).
+    # A non-empty directory is not sufficient: we need wheels for each target ABI.
     if cm_lite_zip.exists() and pip_packages.exists():
         existing = list(pip_packages.glob("*"))
-        wheel_count = len([p for p in existing if p.suffix == ".whl"])
-        if existing and wheel_count > 0:
-            print(f"✓ Using cached files from {FILES_DIR}")
-            return True
+        if existing:
+            missing = []
+            for v in python_versions:
+                try:
+                    _, abi = _python_version_to_tags(v)
+                except Exception:
+                    missing.append(v)
+                    continue
+                if not list(pip_packages.glob(f"*{abi}*.whl")):
+                    missing.append(v)
+            if not missing:
+                print(f"✓ Using cached files from {FILES_DIR}")
+                return True
+            print(f"⚠ Cached wheelhouse missing wheels for python version(s): {', '.join(missing)}; re-downloading")
     
     print(f"\nPreparing deployment files in {FILES_DIR}...")
     
@@ -1515,7 +1566,7 @@ def ensure_local_files():
             # (e.g. `uptime`) may only be available as sdists. To keep the wheelhouse usable,
             # we first download wheels-only for the target platform, then separately fetch
             # sdists for a small allowlist.
-            print("  Downloading pip packages for Python 3.11 (wheels preferred)...")
+            print(f"  Downloading pip packages for python version(s): {', '.join(python_versions)} (wheels preferred)...")
 
             # Split requirements: download wheels for everything except known sdist-only packages.
             sdist_allowlist = {"uptime"}
@@ -1533,18 +1584,22 @@ def ensure_local_files():
             filtered_req = FILES_DIR / "requirements.filtered.txt"
             filtered_req.write_text("\n".join(filtered_lines).strip() + "\n")
 
-            base_cmd = [
-                "pip", "download",
-                "-r", str(filtered_req),
-                "--dest", str(pip_packages),
-                "--python-version", "3.11",
-                "--implementation", "cp",
-                "--abi", "cp311",
-                "--platform", "manylinux2014_x86_64",
-                "--only-binary", ":all:",
-                "--no-binary", ":none:",
-            ]
-            result = subprocess.run(base_cmd, capture_output=True, text=True, timeout=600)
+            results = []
+            for v in python_versions:
+                _, abi = _python_version_to_tags(v)
+                base_cmd = [
+                    "pip", "download",
+                    "-r", str(filtered_req),
+                    "--dest", str(pip_packages),
+                    "--python-version", v,
+                    "--implementation", "cp",
+                    "--abi", abi,
+                    "--platform", "manylinux2014_x86_64",
+                    "--only-binary", ":all:",
+                    "--no-binary", ":none:",
+                ]
+                r = subprocess.run(base_cmd, capture_output=True, text=True, timeout=600)
+                results.append((v, abi, r))
 
             # Always fetch sdists for allowlisted packages (they were excluded from wheel download).
             for pkg in sorted(sdist_allowlist):
@@ -1559,23 +1614,25 @@ def ensure_local_files():
             if package_count == 0 or wheel_count == 0:
                 print("  ✗ Failed to download required pip packages for offline install")
                 print(f"    Downloaded files: {package_count} (wheels: {wheel_count})")
-                if result.stderr:
-                    print("    pip stderr (first 500 chars):")
-                    print(f"    {result.stderr[:500]}")
-                if result.stdout:
-                    print("    pip stdout (first 500 chars):")
-                    print(f"    {result.stdout[:500]}")
+                for v, abi, r in results:
+                    if r.returncode != 0:
+                        print(f"    pip download failed for python {v} ({abi})")
+                        if r.stderr:
+                            print(f"      stderr (first 500 chars): {r.stderr[:500]}")
+                        if r.stdout:
+                            print(f"      stdout (first 500 chars): {r.stdout[:500]}")
                 return False
 
             # If the wheel download failed for reasons other than known sdists, still fail fast.
-            if result.returncode != 0:
+            if any(r.returncode != 0 for _, _, r in results):
                 print("  ✗ Failed to download required pip packages for offline install")
-                if result.stderr:
-                    print("    pip stderr (first 500 chars):")
-                    print(f"    {result.stderr[:500]}")
-                if result.stdout:
-                    print("    pip stdout (first 500 chars):")
-                    print(f"    {result.stdout[:500]}")
+                for v, abi, r in results:
+                    if r.returncode != 0:
+                        print(f"    pip download failed for python {v} ({abi})")
+                        if r.stderr:
+                            print(f"      stderr (first 500 chars): {r.stderr[:500]}")
+                        if r.stdout:
+                            print(f"      stdout (first 500 chars): {r.stdout[:500]}")
                 return False
 
             print(f"  ✓ Downloaded {package_count} package files")
@@ -1930,8 +1987,9 @@ Notes:
         # Initialize deployer
         deployer = BCMDeployer(username, password, vrf, args.dry_run)
         
-        # Ensure local files are ready
-        if not ensure_local_files():
+        # Detect switch python versions and ensure local files are ready for those versions.
+        py_versions = detect_switch_python_versions(username, password, devices)
+        if not ensure_local_files(py_versions):
             print("\nError: Failed to prepare deployment files. Exiting.")
             sys.exit(1)
         
@@ -2261,8 +2319,9 @@ Notes:
         
         config.set_phase('transfer')
         
-        # Continue to phase 3 - ensure local files are ready
-        if not ensure_local_files():
+        # Continue to phase 3 - ensure local files are ready for detected switch python version(s)
+        py_versions = detect_switch_python_versions(username, password, devices)
+        if not ensure_local_files(py_versions):
             print("\nError: Failed to prepare deployment files. Exiting.")
             sys.exit(1)
         
