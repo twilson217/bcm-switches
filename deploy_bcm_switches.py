@@ -451,6 +451,27 @@ def choose_vrf_with_logging(*, non_interactive: bool, configured_vrf: Optional[s
     return "mgmt"
 
 
+def choose_vrf_interactive(*, configured_vrf: Optional[str], detected_vrf: Optional[str]) -> str:
+    """
+    Interactive VRF selection:
+    - If detected_vrf exists, ask user to confirm or override.
+    - Else, if configured_vrf exists, ask user to confirm or override.
+    - Else, prompt with default [mgmt].
+
+    NOTE: In interactive mode we do NOT silently default; the user must press Enter to accept.
+    """
+    if detected_vrf:
+        resp = input(f"\nDetected VRF '{detected_vrf}'. Press Enter to use it, or type a different VRF [${detected_vrf}]: ").strip()
+        return resp if resp else detected_vrf
+
+    if configured_vrf:
+        resp = input(f"\nUsing saved VRF '{configured_vrf}'. Press Enter to use it, or type a different VRF [{configured_vrf}]: ").strip()
+        return resp if resp else configured_vrf
+
+    resp = input("\nCould not auto-detect VRF. Enter VRF to use [mgmt]: ").strip()
+    return resp if resp else "mgmt"
+
+
 class NetworkDetector:
     """Detect BCM networks and match switch IPs."""
     
@@ -2122,12 +2143,18 @@ Notes:
         
         # Determine VRF
         configured_vrf = config.get('vrf')
-        detected_vrf = detect_switch_vrf(username, password, bcm_switches) if args.non_interactive else None
-        vrf = choose_vrf_with_logging(
-            non_interactive=args.non_interactive,
-            configured_vrf=configured_vrf,
-            detected_vrf=detected_vrf,
-        )
+        if args.non_interactive:
+            detected_vrf = detect_switch_vrf(username, password, bcm_switches)
+            vrf = choose_vrf_with_logging(
+                non_interactive=True,
+                configured_vrf=configured_vrf,
+                detected_vrf=detected_vrf,
+            )
+        else:
+            # In interactive mode, offer detection but always prompt for confirmation/override.
+            resp = input("\nWould you like to auto-detect VRF from the switches? (y/n) [y]: ").strip().lower()
+            detected_vrf = detect_switch_vrf(username, password, bcm_switches) if resp not in ["n", "no"] else None
+            vrf = choose_vrf_interactive(configured_vrf=configured_vrf, detected_vrf=detected_vrf)
         
         # Save config
         config.set('username', username)
@@ -2422,12 +2449,19 @@ Notes:
         
         # VRF
         configured_vrf = config.get('vrf')
-        detected_vrf = detect_switch_vrf(username, password, csv_devices) if args.non_interactive else None
-        vrf = choose_vrf_with_logging(
-            non_interactive=args.non_interactive,
-            configured_vrf=configured_vrf,
-            detected_vrf=detected_vrf,
-        )
+        detected_vrf = None
+        if args.non_interactive:
+            detected_vrf = detect_switch_vrf(username, password, csv_devices)
+            vrf = choose_vrf_with_logging(
+                non_interactive=True,
+                configured_vrf=configured_vrf,
+                detected_vrf=detected_vrf,
+            )
+        else:
+            # If user chose to test connectivity, attempt VRF detection too.
+            if response not in ['n', 'no']:
+                detected_vrf = detect_switch_vrf(username, password, csv_devices)
+            vrf = choose_vrf_interactive(configured_vrf=configured_vrf, detected_vrf=detected_vrf)
         config.set('vrf', vrf)
         
         # Set devices directly (skip discovery phase)
@@ -2728,9 +2762,13 @@ Notes:
             print("\nRun without --connectivity-test to proceed with deployment.")
             sys.exit(0)
     
-    # Use default if still not set
+    # If still not set, prompt in interactive mode; default only in non-interactive mode.
     if not vrf:
-        vrf = "mgmt"
+        if args.non_interactive:
+            vrf = "mgmt"
+        else:
+            vrf_input = input("Enter VRF to use [mgmt]: ").strip()
+            vrf = vrf_input if vrf_input else "mgmt"
         config.set('vrf', vrf)
         config.save()
     
