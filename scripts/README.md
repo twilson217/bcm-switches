@@ -76,6 +76,41 @@ Downloads `cm-lite-daemon.zip` and pip packages into `.files/` directory, then c
 **Options:**
 - `--output FILE` - Custom output tarball path
 - `--skip-packages` - Skip downloading pip packages
+- `--python3-version X.Y` - **Required for best results**. Target switch Python version (e.g. `3.11`). Used to download compatible wheels for offline installation.
+- `--cm-lite-zip FILE` - Path to `cm-lite-daemon.zip` (if you are not running on BCM or the BCM default path is not available)
+
+**Python version note:** You should set `--python3-version` to match the switches you will deploy to. On a switch, you can check with:
+
+```bash
+python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
+```
+
+**Where to run it:** `prep-airgapped.py` does **not** require BCM-specific tools (like `cmsh`). It can run on a laptop/WSL **as long as** you have internet access for `pip download` and you provide `cm-lite-daemon.zip` via `--cm-lite-zip` (or already have it in `.files/`).
+
+### `air-sim-setup.py`
+Prepare an NVIDIA Air lab simulation for deployment/validation.
+
+This script is a convenience wrapper that does common “setup” steps:
+- Preflight `oob-mgmt-switch`: if its `swp0` took a DHCP lease (routed mode issue), configure bridging via NVUE for `swp0-50`
+- Run `csv-from-dhcp.py` to generate/update `.configs/from-dhcp.csv`
+- Run `map-csv-topology.py` to set hostnames in the CSV based on the topology JSON
+- Run `change-switch-defaults.py` to set the switch password, hostnames, and disable ZTP
+
+```bash
+# Basic usage (uses test topology + default leases path)
+./scripts/air-sim-setup.py --password 'Nvidia1234!'
+
+# Override topology / output CSV
+./scripts/air-sim-setup.py \
+  --topology scripts/tests/sample-configs/test-topology.json \
+  --csv .configs/from-dhcp.csv \
+  --password 'Nvidia1234!'
+
+# Skip oob-mgmt-switch preflight if you know it’s already correct
+./scripts/air-sim-setup.py --skip-oob --password 'Nvidia1234!'
+```
+
+**Requires:** `sshpass` (and `expect` if your environment forces password change on first login).
 
 ### `validation-testing.py`
 Comprehensive validation of BCM switch deployment. Checks both BCM-side and switch-side configuration.
