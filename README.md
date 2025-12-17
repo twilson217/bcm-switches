@@ -110,14 +110,7 @@ On subsequent runs, you'll be asked whether to use existing configuration or upd
 ### On the BCM Server
 
 - Python 3.6+
-- `sshpass` for password-based SSH authentication:
-  ```bash
-  apt install sshpass
-  ```
-- `rsync` for file transfers:
-  ```bash
-  apt install rsync
-  ```
+- `sshpass` and `rsync` are expected to be present on BCM head nodes by default
 - `cmsh` access (standard on BCM systems)
 - Access to `/cm/shared/apps/cm-lite-daemon-dist/cm-lite-daemon.zip`
 
@@ -140,13 +133,6 @@ The script accepts IP addresses in various formats:
 | Mixed | `192.168.0.1-10,192.168.2.1-10` | 20 IPs |
 
 ## Troubleshooting
-
-### "sshpass not found"
-
-Install sshpass:
-```bash
-apt install sshpass
-```
 
 ### "cmsh not found"
 
@@ -177,8 +163,4 @@ All output files are stored in the `.configs/` directory (auto-created, git-igno
 
 - `.configs/config.json`: Your saved configuration and deployment progress
 - `.configs/bcm_switches.csv`: Generated CSV with discovered switch information
-
-## Legacy Scripts
-
-Previous versions of these scripts are preserved in the `old/` directory for reference.
 
