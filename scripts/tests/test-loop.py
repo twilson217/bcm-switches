@@ -109,7 +109,7 @@ class TestResult:
 # Utility Functions
 # ============================================================================
 
-def run_cmd(cmd: str, cwd: Path = None, timeout: int = 600, 
+def run_cmd(cmd: str, cwd: Path = None, timeout: int = 600,
             capture: bool = True, input_text: str = None) -> Tuple[int, str, str]:
     """Run a shell command and return (returncode, stdout, stderr)."""
     try:
@@ -119,8 +119,17 @@ def run_cmd(cmd: str, cwd: Path = None, timeout: int = 600,
             timeout=timeout, input=input_text
         )
         return result.returncode, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return -1, "", f"Command timed out after {timeout}s"
+    except subprocess.TimeoutExpired as e:
+        # Preserve partial output when possible (helps debug long-running steps).
+        out = e.stdout or ""
+        err = e.stderr or ""
+        if isinstance(out, bytes):
+            out = out.decode(errors="ignore")
+        if isinstance(err, bytes):
+            err = err.decode(errors="ignore")
+        msg = f"Command timed out after {timeout}s"
+        combined_err = (err + "\n" + msg).strip() if err else msg
+        return -1, out, combined_err
     except Exception as e:
         return -1, "", str(e)
 
@@ -961,13 +970,14 @@ class TestRunner:
     
     def validate_deployment(self) -> StepResult:
         """Run validation testing."""
+        pwd = shlex.quote(self.password)
         result = self.run_step(
             "Validate deployment",
             "scripts/validation-testing.py",
             # Always run validation with --verbose so failures include actionable detail
             # in the step log even if test-loop itself is not running with --verbose.
-            f"--password {self.password} --verbose",
-            timeout=120
+            f"--password {pwd} --verbose",
+            timeout=600
         )
         
         if not self.dry_run:
