@@ -2,6 +2,10 @@
 
 Automated deployment of Cumulus switches to NVIDIA Base Command Manager (BCM) with cm-lite-daemon.
 
+## Support note
+
+This repository has been **tested on BCM 10.x only**. BCM 11.x support will come in a future iteration.
+
 ## Quick Start
 
 ```bash

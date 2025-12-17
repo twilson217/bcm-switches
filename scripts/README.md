@@ -71,13 +71,16 @@ Prepare files for airgapped deployment.
 ./scripts/prep-airgapped.py
 ```
 
-Downloads `cm-lite-daemon.zip` and pip packages into `.files/` directory, then creates a tarball for transfer to airgapped systems.
+Downloads pip packages into `.files/` directory, then creates a tarball for transfer to airgapped systems.
+
+**Important:** In production airgapped environments, `deploy_bcm_switches.py` should use the **production BCM’s**
+`cm-lite-daemon.zip` at deploy time (do not bundle a zip from a different system).
 
 **Options:**
 - `--output FILE` - Custom output tarball path
-- `--skip-packages` - Skip downloading pip packages
 - `--python3-version X.Y` - **Required for best results**. Target switch Python version (e.g. `3.11`). Used to download compatible wheels for offline installation.
-- `--cm-lite-zip FILE` - Path to `cm-lite-daemon.zip` (if you are not running on BCM or the BCM default path is not available)
+- `--requirements/-r FILE` - Path to a `requirements.txt` file (copied from inside `cm-lite-daemon.zip`)
+- `--cm-lite-zip FILE` - Optional. Used only to extract `requirements.txt` if you did not provide `--requirements`
 
 **Python version note:** You should set `--python3-version` to match the switches you will deploy to. On a switch, you can check with:
 
@@ -85,7 +88,7 @@ Downloads `cm-lite-daemon.zip` and pip packages into `.files/` directory, then c
 python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
 ```
 
-**Where to run it:** `prep-airgapped.py` does **not** require BCM-specific tools (like `cmsh`). It can run on a laptop/WSL **as long as** you have internet access for `pip download` and you provide `cm-lite-daemon.zip` via `--cm-lite-zip` (or already have it in `.files/`).
+**Where to run it:** `prep-airgapped.py` does **not** require BCM-specific tools (like `cmsh`). It can run on a laptop/WSL **as long as** you have internet access for `pip download`.
 
 ### `air-sim-setup.py`
 Prepare an NVIDIA Air lab simulation for deployment/validation.
