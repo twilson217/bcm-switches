@@ -103,6 +103,15 @@ Configuration is stored in `.configs/config.json` and includes:
 - Selected BCM network
 - VRF setting
 
+### VRF names (what’s supported)
+
+BCM/Cumulus VRFs are implemented as Linux VRF netdevices, so **VRF names follow Linux interface naming rules**:
+- **No spaces**
+- **Typically max 15 characters**
+- Recommended characters: **letters, numbers, `_`, `-`, `.`**
+
+If your environment uses a non-standard VRF name, that’s fine — the deploy flow will auto-detect it when possible, or prompt you to enter it.
+
 On subsequent runs, you'll be asked whether to use existing configuration or update it.
 
 ## Prerequisites
