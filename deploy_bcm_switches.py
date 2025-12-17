@@ -700,24 +700,41 @@ class SwitchDiscovery:
         Returns:
             'enabled', 'disabled', or None if unable to check
         """
-        # Run: sudo ztp -s | grep -i service
-        # Need to use sudo, so we need to handle password
-        ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15"
-        cmd = f"sshpass -p '{self.password}' ssh {ssh_opts} {self.username}@{ip} " \
-              f"'echo {self.password} | sudo -S ztp -s 2>/dev/null | grep -i service'"
-        
-        try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-            output = result.stdout.lower()
-            
-            if 'disabled' in output:
-                return 'disabled'
-            elif 'enabled' in output:
-                return 'enabled'
-            else:
-                return None
-        except:
-            return None
+        # Prefer NVUE output (works on modern Cumulus and does not require sudo).
+        # Example:
+        #   nv show system ztp
+        #          operational
+        #   -------  -----------
+        #   service  disabled
+        #   status   disabled
+        out = self._run_ssh_command(ip, "nv show system ztp 2>/dev/null") or ""
+        out_low = out.lower()
+        if out:
+            for line in out_low.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                # Match "service  disabled" or "status   disabled"
+                if s.startswith("service") or s.startswith("status"):
+                    if "disabled" in s:
+                        return "disabled"
+                    if "enabled" in s:
+                        return "enabled"
+            # Fallback: any mention
+            if "disabled" in out_low:
+                return "disabled"
+            if "enabled" in out_low:
+                return "enabled"
+
+        # Fallback: older helper output (best-effort, no sudo to avoid prompting/quoting issues)
+        out2 = self._run_ssh_command(ip, "ztp -s 2>/dev/null || true") or ""
+        out2_low = out2.lower()
+        if "disabled" in out2_low:
+            return "disabled"
+        if "enabled" in out2_low:
+            return "enabled"
+
+        return None
     
     def get_vrf_for_ip(self, host: str, target_ip: str) -> Optional[str]:
         """Detect which VRF an IP address belongs to on a switch.
