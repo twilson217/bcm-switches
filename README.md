@@ -6,6 +6,10 @@ Automated deployment of Cumulus switches to NVIDIA Base Command Manager (BCM) wi
 
 This repository has been **tested on BCM 10.x only**. BCM 11.x support will come in a future iteration.
 
+## Disclaimer
+
+The code in this repo is provided **as-is**, with **no guarantees**. By using this code, you accept responsibility for all risks that may come from using it.
+
 ## Quick Start
 
 ```bash
