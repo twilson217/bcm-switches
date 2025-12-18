@@ -152,17 +152,17 @@ def _report_section(title: str) -> None:
 
 
 def _check(label: str, ok: bool, details: str = "") -> Tuple[bool, str]:
-    status = "OK" if ok else "TODO"
+    prefix = "✅" if ok else "⚠️"
     if details:
-        return ok, f"[{status}] {label}: {details}"
-    return ok, f"[{status}] {label}"
+        return ok, f"{prefix} {label}: {details}"
+    return ok, f"{prefix} {label}"
 
 
 def _missing(label: str, details: str = "") -> Tuple[bool, str]:
-    status = "MISSING"
+    prefix = "❌"
     if details:
-        return False, f"[{status}] {label}: {details}"
-    return False, f"[{status}] {label}"
+        return False, f"{prefix} {label}: {details}"
+    return False, f"{prefix} {label}"
 
 
 def _detect_dhcpd_conf_for_network(network: str) -> Optional[Path]:
@@ -494,10 +494,16 @@ def main() -> int:
             hostname = dev["hostname"]
             ok, lines, manual = _config_checks(dev)
             print(f"\n{hostname}")
-            for line in lines:
+            ok_lines = [l for l in lines if l.startswith("✅")]
+            missing_lines = [l for l in lines if l.startswith("❌")]
+            todo_lines = [l for l in lines if l.startswith("⚠️")]
+            other_lines = [l for l in lines if l not in ok_lines + missing_lines + todo_lines]
+
+            # Print in a stable order: OK first, then MISSING, then TODO.
+            for line in ok_lines + missing_lines + todo_lines + other_lines:
                 print(f"  {line}")
-                if line.startswith("[MISSING]"):
-                    overall_ok = False
+            if missing_lines:
+                overall_ok = False
             for line in manual:
                 print(f"  {line}")
                 # Manual items should keep the checklist in a TODO state by design.
@@ -512,10 +518,15 @@ def main() -> int:
             hostname = dev["hostname"]
             ok, lines, manual = _image_checks(dev, image_dir)
             print(f"\n{hostname}")
-            for line in lines:
+            ok_lines = [l for l in lines if l.startswith("✅")]
+            missing_lines = [l for l in lines if l.startswith("❌")]
+            todo_lines = [l for l in lines if l.startswith("⚠️")]
+            other_lines = [l for l in lines if l not in ok_lines + missing_lines + todo_lines]
+
+            for line in ok_lines + missing_lines + todo_lines + other_lines:
                 print(f"  {line}")
-                if line.startswith("[MISSING]"):
-                    overall_ok = False
+            if missing_lines:
+                overall_ok = False
             for line in manual:
                 print(f"  {line}")
             if ok:
