@@ -215,22 +215,24 @@ and runs:
 and sets `ztpsettings image` to the filename (while keeping `checkimageonboot=no`).
 
 ### `ztp-preflight.py`
-Validates ZTP readiness before you manually enable ZTP.
+Prints a BCM-sourced ZTP readiness **checklist** before you manually enable ZTP.
+
+It prints every check it performs, plus explicit **manual TODO steps** (like DHCP option config and switch-side ZTP enable/disable confirmation).
 
 By default it runs both config and image checks:
 
 ```bash
-./scripts/ztp-preflight.py --from-bcm
+./scripts/ztp-preflight.py
 ```
 
 **Only config checks:**
 
 ```bash
-./scripts/ztp-preflight.py --from-bcm --config-only
+./scripts/ztp-preflight.py --config-only
 ```
 
 **Only image checks:**
 
 ```bash
-./scripts/ztp-preflight.py --from-bcm --image-only
+./scripts/ztp-preflight.py --image-only
 ```
