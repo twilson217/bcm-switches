@@ -345,13 +345,7 @@ def _config_checks(dev: Dict) -> Tuple[bool, List[str], List[str]]:
     run_norm = _norm_cmsh_val(run_each_boot) or "(empty)"
     lines.append(_check("BCM ztpsettings.runztponeachboot is set (operator decision)", run_norm in {"yes", "no"}, f"current='{run_norm}'")[1])
 
-    # Manual actions that are intentionally not verifiable from BCM.
-    manual.append(
-        "[MANUAL] Switch state: confirm switch ZTP is currently DISABLED (until cutover). Example: `nv show system ztp` or `ztp -s` on the switch."
-    )
-    manual.append(
-        "[MANUAL] Cutover: when ready to use ZTP, enable ZTP / perform the reset/boot workflow appropriate for your environment (so the switch actually runs ZTP)."
-    )
+    # Intentionally not listing switch-side/cutover items here (per request: BCM-only checks).
 
     ok_all = all(not line.startswith("[MISSING]") for line in lines)
     return (ok_all, lines, manual)
@@ -389,12 +383,28 @@ def _image_checks(dev: Dict, image_dir: Optional[Path]) -> Tuple[bool, List[str]
             else:
                 lines.append(_missing("BCM image file exists in image directory", str(img_path))[1])
 
-    # For staging, checkimageonboot should typically be NO (manual enable step later).
-    check_norm = _norm_cmsh_val(check_on_boot)
-    if _is_truthy(check_on_boot):
-        lines.append(_check("BCM ztpsettings.checkimageonboot is NO (staging-safe)", False, f"current='{check_norm}'")[1])
-    else:
-        lines.append(_check("BCM ztpsettings.checkimageonboot is NO (staging-safe)", True, f"current='{check_norm or 'no'}'")[1])
+    # Image enforcement steps (BCM-verifiable):
+    # - checkimageonboot should be explicitly enabled when ready
+    # - cumulus-ztp.sh should contain CMD_IMAGE_URL after enable + initialize
+    check_norm = _norm_cmsh_val(check_on_boot) or "(empty)"
+    lines.append(
+        _check(
+            "BCM ztpsettings.checkimageonboot == yes (enable image enforcement)",
+            check_norm == "yes",
+            f"current='{check_norm}'",
+        )[1]
+    )
+
+    ztp_script = BCM_SWITCH_HTDOCS_DIR / hostname / "cumulus-ztp.sh"
+    vars_ = _parse_vars_from_ztp_script(ztp_script)
+    img_url = vars_.get("CMD_IMAGE_URL", "")
+    lines.append(
+        _check(
+            "ZTP script contains CMD_IMAGE_URL (run initialize after enabling checkimageonboot)",
+            bool(img_url),
+            img_url or "CMD_IMAGE_URL not present",
+        )[1]
+    )
 
     # If BCM is the DHCP server, it can also provide an image URL via DHCP (default-url).
     net = _cmsh_get_network(hostname)
@@ -412,16 +422,7 @@ def _image_checks(dev: Dict, image_dir: Optional[Path]) -> Tuple[bool, List[str]
         except Exception as e:
             lines.append(_missing("Read/parse BCM DHCP config for default-url", str(e))[1])
 
-    # Manual steps for image management
-    manual.append(
-        "[MANUAL] Validate image suitability: ensure the staged image matches your platform (Cumulus VX vs HW) and desired direction (upgrade vs downgrade)."
-    )
-    manual.append(
-        "[MANUAL] When ready for image enforcement, set `checkimageonboot yes` in BCM and run `cmsh -c \"device; use <switch>; initialize\"` so CMD_IMAGE_URL appears in cumulus-ztp.sh."
-    )
-    manual.append(
-        "[MANUAL] During cutover, confirm CMD_IMAGE_URL points to `/switch/image/<filename>` and the file is reachable over HTTP from the switch."
-    )
+    # Intentionally not listing non-verifiable items here (per request: BCM-only checklist output).
 
     ok_all = all(not line.startswith("[MISSING]") for line in lines)
     return (ok_all, lines, manual)
