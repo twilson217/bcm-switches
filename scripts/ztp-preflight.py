@@ -477,8 +477,19 @@ def main() -> int:
     image_dir = _detect_image_dir()
 
     print("\n" + "=" * 70)
-    print("ZTP PREFLIGHT (CHECKLIST)")
+    print("Welcome to the BCM Switch ZTP Preflight Checklist")
     print("=" * 70)
+    print(
+        "\nThis tool will help you ensure that your switches are prepared to receive their configuration "
+        "and/or software images from BCM via ZTP.\n"
+    )
+    print("Use this tool for the following scenarios:\n")
+    print("  - Replacing a switch that has gone bad")
+    print("  - A switch unexpectedly lost its configuration")
+    print("  - Preparing for switch maintenance such as image upgrades")
+    print("\n" + "-" * 70)
+    print("Checklist results")
+    print("-" * 70)
     print(f"Devices: {len(devices)}")
     if image_dir:
         print(f"BCM image dir: {image_dir}")
