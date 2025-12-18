@@ -41,6 +41,118 @@ CSV_FILE = CONFIG_DIR / "bcm_switches.csv"
 FILES_DIR = SCRIPT_DIR / ".files"
 CM_LITE_ZIP_PATH = Path("/cm/shared/apps/cm-lite-daemon-dist/cm-lite-daemon.zip")
 
+# Password handling:
+# - Never persist real passwords in .configs/config.json (store a placeholder instead)
+# - Keep the runtime password in-memory and in an environment variable for this process
+PASSWORD_ENV_VAR = "BCM_SWITCH_SSH_PASSWORD"
+PASSWORD_PLACEHOLDER = "user_must_enter_again"
+# NOTE: This default is intentionally retained for automated testing when running
+# non-interactive without --password.
+NON_INTERACTIVE_DEFAULT_PASSWORD = "Nvidia1234!"
+
+
+def _password_from_config_value(val: Optional[str]) -> str:
+    """Return a usable password from a config value, or '' if placeholder/empty."""
+    if not val:
+        return ""
+    if val == PASSWORD_PLACEHOLDER:
+        return ""
+    return val
+
+
+def _set_password_env(password: str) -> None:
+    # Stored for this process + inherited by child processes.
+    os.environ[PASSWORD_ENV_VAR] = password
+
+
+def _get_password_env() -> str:
+    return os.environ.get(PASSWORD_ENV_VAR, "")
+
+
+def resolve_password_non_interactive(*, args_password: Optional[str], config_password: Optional[str]) -> str:
+    """
+    Resolve the SSH password in non-interactive mode.
+
+    Priority:
+    - CLI --password
+    - Existing env var (if caller set it)
+    - Password present in config.json (if user manually put it there)
+    - NON_INTERACTIVE_DEFAULT_PASSWORD (automation/testing)
+    """
+    if args_password:
+        _set_password_env(args_password)
+        return args_password
+
+    env_pw = _get_password_env()
+    if env_pw:
+        return env_pw
+
+    cfg_pw = _password_from_config_value(config_password)
+    if cfg_pw:
+        _set_password_env(cfg_pw)
+        return cfg_pw
+
+    _set_password_env(NON_INTERACTIVE_DEFAULT_PASSWORD)
+    print(
+        f"  (non-interactive: no --password provided; using default password '{NON_INTERACTIVE_DEFAULT_PASSWORD}' for automated testing)"
+    )
+    return NON_INTERACTIVE_DEFAULT_PASSWORD
+
+
+def resolve_password_interactive(*, args_password: Optional[str], config_password: Optional[str], prompt: str) -> str:
+    """
+    Resolve the SSH password in interactive mode.
+
+    Priority:
+    - CLI --password
+    - Existing env var (avoid reprompting within the same run)
+    - If config.json contains a real password (user manually edited), ask whether to use it
+    - Otherwise prompt for entry
+    """
+    if args_password:
+        _set_password_env(args_password)
+        return args_password
+
+    env_pw = _get_password_env()
+    if env_pw:
+        return env_pw
+
+    cfg_pw = _password_from_config_value(config_password)
+    if cfg_pw:
+        resp = input("config.json contains a password. Use it? (y/n) [y]: ").strip().lower()
+        if resp not in ["n", "no"]:
+            _set_password_env(cfg_pw)
+            return cfg_pw
+
+    pw = getpass.getpass(prompt)
+    if not pw:
+        print("Error: Password is required.")
+        sys.exit(1)
+    _set_password_env(pw)
+    return pw
+
+
+def maybe_delete_config_file(*, non_interactive: bool) -> None:
+    """Optionally delete config.json after a fully successful run (no failed IPs)."""
+    if not CONFIG_FILE.exists():
+        return
+    if non_interactive:
+        try:
+            CONFIG_FILE.unlink()
+        except Exception as e:
+            print(f"\nWarning: Failed to delete {CONFIG_FILE}: {e}")
+        return
+
+    resp = input(
+        f"\nDeployment succeeded. Delete {CONFIG_FILE} (progress-tracking config)? (y/n) [y]: "
+    ).strip().lower()
+    if resp in ["", "y", "yes"]:
+        try:
+            CONFIG_FILE.unlink()
+            print(f"Deleted {CONFIG_FILE}")
+        except Exception as e:
+            print(f"\nWarning: Failed to delete {CONFIG_FILE}: {e}")
+
 # Default progress structure
 DEFAULT_PROGRESS = {
     'phase': 'discovery',
@@ -249,19 +361,23 @@ class ConfigManager:
         self.save()  # Save after username
         
         # Password
-        current_password = self.get('password')
-        if use_existing and current_password:
-            print("\nCurrent password: *******")
+        raw_cfg_pw = self.get('password')
+        cfg_pw = _password_from_config_value(raw_cfg_pw)
+        if use_existing and cfg_pw:
+            print("\nA password is currently stored in config.json (masked).")
             password = getpass.getpass("Enter SSH password for switches [Enter to keep]: ")
+            password = password if password else cfg_pw
         else:
             password = getpass.getpass("Enter SSH password for switches: ")
-        
-        if password:
-            self.config['password'] = password
-            self.save()  # Save after password
-        elif not current_password:
+
+        if not password:
             print("Error: Password is required.")
             sys.exit(1)
+
+        _set_password_env(password)
+        # Never persist the real password
+        self.config['password'] = PASSWORD_PLACEHOLDER
+        self.save()  # Save after password
 
 
 def run_connectivity_test(config: ConfigManager) -> Optional[str]:
@@ -272,7 +388,10 @@ def run_connectivity_test(config: ConfigManager) -> Optional[str]:
     """
     switch_ips = config.get('switch_ips', [])
     username = config.get('username', 'cumulus')
-    password = config.get('password', '')
+    password = _get_password_env() or _password_from_config_value(config.get('password', ''))
+    if not password:
+        print("Error: Password required to run connectivity test.")
+        return None
     
     if not switch_ips:
         print("No switch IPs configured.")
@@ -2116,30 +2235,29 @@ Notes:
             # Non-interactive: use command-line args or config
             config.load()
             username = args.username or config.get('username', 'cumulus')
-            password = args.password or config.get('password', '')
-            
-            if not password:
-                print("Error: Password required. Use --password or set in config.")
-                sys.exit(1)
-            
+            password = resolve_password_non_interactive(
+                args_password=args.password,
+                config_password=config.get('password', ''),
+            )
             print(f"\nUsing credentials: username={username}")
         else:
             # Interactive: prompt for credentials
             if config.load():
                 current_user = config.get('username', 'cumulus')
-                current_pass = config.get('password', '')
                 print(f"\nExisting credentials found (username: {current_user})")
                 response = input("Use existing credentials? (y/n) [y]: ").strip().lower()
                 if response not in ['n', 'no']:
                     username = current_user
-                    password = current_pass
                     print("Using existing credentials.")
                 else:
                     username = input(f"Enter SSH username [{current_user}]: ").strip() or current_user
-                    password = getpass.getpass("Enter SSH password: ")
             else:
                 username = input("Enter SSH username [cumulus]: ").strip() or "cumulus"
-                password = getpass.getpass("Enter SSH password: ")
+            password = resolve_password_interactive(
+                args_password=args.password,
+                config_password=config.get('password', '') if 'password' in config.config else None,
+                prompt="Enter SSH password: ",
+            )
         
         # Determine VRF
         configured_vrf = config.get('vrf')
@@ -2158,7 +2276,7 @@ Notes:
         
         # Save config
         config.set('username', username)
-        config.set('password', password)
+        config.set('password', PASSWORD_PLACEHOLDER)
         config.set('vrf', vrf)
         config.set('switch_ips', [sw['ip'] for sw in bcm_switches])
         config.save()
@@ -2279,6 +2397,8 @@ Notes:
         # Exit non-zero if any devices failed. We may still proceed through later phases
         # (especially in non-interactive mode), but callers (e.g., test-loop) need an
         # accurate success/failure signal.
+        if failed_count == 0:
+            maybe_delete_config_file(non_interactive=args.non_interactive)
         sys.exit(0 if failed_count == 0 else 1)
 
     # Handle CSV mode
@@ -2340,30 +2460,29 @@ Notes:
             # Non-interactive: use command-line args or config
             config.load()
             username = args.username or config.get('username', 'cumulus')
-            password = args.password or config.get('password', '')
-            
-            if not password:
-                print("Error: Password required. Use --password or set in config.")
-                sys.exit(1)
-            
+            password = resolve_password_non_interactive(
+                args_password=args.password,
+                config_password=config.get('password', ''),
+            )
             print(f"\nUsing credentials: username={username}")
         else:
             # Interactive: prompt for credentials
             if config.load():
                 current_user = config.get('username', 'cumulus')
-                current_pass = config.get('password', '')
                 print(f"\nExisting credentials found (username: {current_user})")
                 response = input("Use existing credentials? (y/n) [y]: ").strip().lower()
                 if response not in ['n', 'no']:
                     username = current_user
-                    password = current_pass
                     print("Using existing credentials.")
                 else:
                     username = input(f"Enter SSH username [{current_user}]: ").strip() or current_user
-                    password = getpass.getpass("Enter SSH password: ")
             else:
                 username = input("Enter SSH username [cumulus]: ").strip() or "cumulus"
-                password = getpass.getpass("Enter SSH password: ")
+            password = resolve_password_interactive(
+                args_password=args.password,
+                config_password=config.get('password', '') if 'password' in config.config else None,
+                prompt="Enter SSH password: ",
+            )
         
         # Determine network from CSV or detect
         networks_in_csv = set(d['network'] for d in csv_devices if d.get('network'))
@@ -2442,7 +2561,7 @@ Notes:
         
         # Save config
         config.set('username', username)
-        config.set('password', password)
+        config.set('password', PASSWORD_PLACEHOLDER)
         config.set('switch_ips', [d['ip'] for d in csv_devices])
         if network:
             config.set('network', network)
@@ -2633,6 +2752,7 @@ Notes:
         if config.progress['phase'] == 'complete' and not config.progress['failed_ips']:
             config.clear_progress()
             print("\nDeployment completed successfully!")
+            maybe_delete_config_file(non_interactive=args.non_interactive)
         
         # Exit non-zero if any devices failed.
         sys.exit(0 if not config.progress.get('failed_ips') else 1)
@@ -2701,7 +2821,21 @@ Notes:
     # Get configuration values
     switch_ips = config.get('switch_ips', [])
     username = config.get('username', 'cumulus')
-    password = config.get('password', '')
+    if args.non_interactive:
+        password = resolve_password_non_interactive(
+            args_password=args.password,
+            config_password=config.get('password', ''),
+        )
+    else:
+        password = resolve_password_interactive(
+            args_password=args.password,
+            config_password=config.get('password', ''),
+            prompt="Enter SSH password for switches: ",
+        )
+    # Never persist real password in config
+    if config.get('password') != PASSWORD_PLACEHOLDER:
+        config.set('password', PASSWORD_PLACEHOLDER)
+        config.save()
     
     if not switch_ips:
         print("Error: No switch IPs configured.")
@@ -3120,8 +3254,12 @@ Notes:
     if config.progress['phase'] == 'complete' and not config.progress['failed_ips']:
         config.clear_progress()
         print("\nDeployment completed successfully!")
+        maybe_delete_config_file(non_interactive=args.non_interactive)
     else:
         print(f"\nProgress saved. Run with --resume to continue.")
+
+    # Exit non-zero if any devices failed.
+    sys.exit(0 if not config.progress.get('failed_ips') else 1)
 
 
 if __name__ == "__main__":
