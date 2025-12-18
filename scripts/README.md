@@ -185,3 +185,52 @@ Comprehensive validation of BCM switch deployment. Checks both BCM-side and swit
 Scripts in `tests/` directory interact with the NVIDIA Air API and require additional Python packages.
 
 See [tests/README.md](tests/README.md) for setup instructions.
+
+---
+
+## ZTP Staging / Preflight (brownfield DR/RMA)
+
+These scripts prepare BCM-side artifacts for future ZTP use **without enabling ZTP automatically**.
+
+### `ztp-staging.py`
+Stages ZTP configuration artifacts from each switch’s current running config by copying:
+- `/etc/nvue.d/startup.yaml` (from the switch)
+to:
+- `/cm/local/apps/cmd/etc/htdocs/switch/<switch>/startup.yaml` (on BCM)
+
+It also sets in BCM:
+- `cumulusmode=file`
+- `cumulusfile=startup.yaml`
+and runs:
+- `cmsh -c "device; use <switch>; initialize"`
+
+**Config-only staging (default):**
+
+```bash
+./scripts/ztp-staging.py --from-bcm
+```
+
+**Optional image staging:** By default BCM serves images under the HTTP path `.../switch/image/<filename>` (note: `image` is singular on BCM 10.x/11.x we’ve checked). If you enable image staging, `ztp-staging.py` copies the selected `cumulus-*.bin` into:
+- `/cm/local/apps/cmd/etc/htdocs/switch/image/`
+and sets `ztpsettings image` to the filename (while keeping `checkimageonboot=no`).
+
+### `ztp-preflight.py`
+Validates ZTP readiness before you manually enable ZTP.
+
+By default it runs both config and image checks:
+
+```bash
+./scripts/ztp-preflight.py --from-bcm
+```
+
+**Only config checks:**
+
+```bash
+./scripts/ztp-preflight.py --from-bcm --config-only
+```
+
+**Only image checks:**
+
+```bash
+./scripts/ztp-preflight.py --from-bcm --image-only
+```

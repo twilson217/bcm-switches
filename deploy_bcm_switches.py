@@ -153,6 +153,46 @@ def maybe_delete_config_file(*, non_interactive: bool) -> None:
         except Exception as e:
             print(f"\nWarning: Failed to delete {CONFIG_FILE}: {e}")
 
+
+def prompt_stage_ztp(*, non_interactive: bool, cli_flag: bool) -> bool:
+    """
+    Decide whether to run ZTP staging after a successful deploy.
+
+    - Non-interactive: controlled by --stage-ztp.
+    - Interactive: prompt (default: no).
+    """
+    if non_interactive:
+        return bool(cli_flag)
+    resp = input(
+        "\nWould you like to stage ZTP (config/image prep for future DR/RMA) after deployment? (y/n) [n]: "
+    ).strip().lower()
+    return resp in ["y", "yes"]
+
+
+def write_ztp_staging_csv(devices: List[Dict], path: Path) -> None:
+    """Write a minimal Hostname/IP CSV suitable for scripts/ztp-staging.py."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["Hostname", "IP"])
+        writer.writeheader()
+        for d in devices:
+            writer.writerow({"Hostname": d.get("hostname", ""), "IP": d.get("ip", "")})
+
+
+def run_ztp_staging(*, csv_path: Path, username: str, non_interactive: bool) -> int:
+    """
+    Invoke scripts/ztp-staging.py as a subprocess.
+
+    Password is expected to be present in the environment (BCM_SWITCH_SSH_PASSWORD)
+    from deploy's credential resolution.
+    """
+    staging_script = SCRIPT_DIR / "scripts" / "ztp-staging.py"
+    cmd = [sys.executable, str(staging_script), "--csv", str(csv_path), "--username", username]
+    if non_interactive:
+        cmd.append("--non-interactive")
+    r = subprocess.run(cmd, text=True)
+    return r.returncode
+
 # Default progress structure
 DEFAULT_PROGRESS = {
     'phase': 'discovery',
@@ -2097,6 +2137,8 @@ Notes:
                        help="SSH password for switches (for non-interactive mode)")
     parser.add_argument("--exclude-ips", type=str, default=None,
                        help="IPs to exclude, comma-separated (for --from-bcm)")
+    parser.add_argument("--stage-ztp", action="store_true",
+                       help="After a successful deploy, run scripts/ztp-staging.py to stage ZTP artifacts (non-interactive only; interactive will prompt)")
     
     args = parser.parse_args()
     
@@ -2258,6 +2300,9 @@ Notes:
                 config_password=config.get('password', '') if 'password' in config.config else None,
                 prompt="Enter SSH password: ",
             )
+
+        # Optional: stage ZTP after a successful deployment
+        stage_ztp = prompt_stage_ztp(non_interactive=args.non_interactive, cli_flag=args.stage_ztp)
         
         # Determine VRF
         configured_vrf = config.get('vrf')
@@ -2280,6 +2325,9 @@ Notes:
         config.set('vrf', vrf)
         config.set('switch_ips', [sw['ip'] for sw in bcm_switches])
         config.save()
+
+        # Optional: stage ZTP after a successful deployment
+        stage_ztp = prompt_stage_ztp(non_interactive=args.non_interactive, cli_flag=args.stage_ztp)
         
         # Convert bcm_switches to devices format
         devices = bcm_switches
@@ -2398,7 +2446,15 @@ Notes:
         # (especially in non-interactive mode), but callers (e.g., test-loop) need an
         # accurate success/failure signal.
         if failed_count == 0:
-            maybe_delete_config_file(non_interactive=args.non_interactive)
+            if stage_ztp and not args.dry_run:
+                # Provide a CSV to staging so it reuses the exact switch set.
+                write_ztp_staging_csv(devices, CSV_FILE)
+                rc = run_ztp_staging(csv_path=CSV_FILE, username=username, non_interactive=args.non_interactive)
+                if rc != 0:
+                    print("\nZTP staging failed. Leaving config.json in place for troubleshooting.")
+                    sys.exit(1)
+            else:
+                maybe_delete_config_file(non_interactive=args.non_interactive)
         sys.exit(0 if failed_count == 0 else 1)
 
     # Handle CSV mode
@@ -2752,7 +2808,13 @@ Notes:
         if config.progress['phase'] == 'complete' and not config.progress['failed_ips']:
             config.clear_progress()
             print("\nDeployment completed successfully!")
-            maybe_delete_config_file(non_interactive=args.non_interactive)
+            if stage_ztp and not args.dry_run:
+                rc = run_ztp_staging(csv_path=args.csv, username=username, non_interactive=args.non_interactive)
+                if rc != 0:
+                    print("\nZTP staging failed. Leaving config.json in place for troubleshooting.")
+                    sys.exit(1)
+            else:
+                maybe_delete_config_file(non_interactive=args.non_interactive)
         
         # Exit non-zero if any devices failed.
         sys.exit(0 if not config.progress.get('failed_ips') else 1)
@@ -2836,6 +2898,9 @@ Notes:
     if config.get('password') != PASSWORD_PLACEHOLDER:
         config.set('password', PASSWORD_PLACEHOLDER)
         config.save()
+
+    # Optional: stage ZTP after a successful deployment
+    stage_ztp = prompt_stage_ztp(non_interactive=args.non_interactive, cli_flag=args.stage_ztp)
     
     if not switch_ips:
         print("Error: No switch IPs configured.")
@@ -3254,7 +3319,18 @@ Notes:
     if config.progress['phase'] == 'complete' and not config.progress['failed_ips']:
         config.clear_progress()
         print("\nDeployment completed successfully!")
-        maybe_delete_config_file(non_interactive=args.non_interactive)
+        if stage_ztp and not args.dry_run:
+            # Ensure a staging CSV exists for the exact device set.
+            try:
+                write_ztp_staging_csv(devices, CSV_FILE)
+            except Exception as e:
+                print(f"\nWarning: failed to write staging CSV ({CSV_FILE}): {e}")
+            rc = run_ztp_staging(csv_path=CSV_FILE, username=username, non_interactive=args.non_interactive)
+            if rc != 0:
+                print("\nZTP staging failed. Leaving config.json in place for troubleshooting.")
+                sys.exit(1)
+        else:
+            maybe_delete_config_file(non_interactive=args.non_interactive)
     else:
         print(f"\nProgress saved. Run with --resume to continue.")
 
