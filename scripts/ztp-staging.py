@@ -459,12 +459,9 @@ def main() -> int:
     elif args.update_config and args.non_interactive:
         update_policy = "changed"
 
-    # Image staging decision
+    # Image staging: only when explicitly requested via --stage-image.
     do_stage_image = args.stage_image
     image_path: Optional[Path] = args.image
-    if not args.non_interactive and not args.stage_image:
-        resp = input("\nEnable image staging now? (y/n) [n]: ").strip().lower()
-        do_stage_image = resp in ["y", "yes"]
 
     image_dir: Optional[Path] = None
     staged_image_filename: Optional[str] = None
