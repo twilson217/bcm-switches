@@ -118,77 +118,107 @@ def _handle_expired_password(ip: str, current_password: str, new_password: str, 
     Returns (success, working_password).
     On fresh Cumulus switches the default password is expired and SSH forces a change.
     """
+    # Use a more sequential expect script that explicitly handles the expired password flow
     expect_script = f'''
-set timeout 30
+set timeout 60
+log_user 1
+
 spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {username}@{ip}
 
+# Step 1: Handle SSH connection and initial password
 expect {{
     "Are you sure you want to continue connecting" {{
         send "yes\\r"
         exp_continue
     }}
-    "Current password:" {{
+    -re "assword:" {{
         send "{current_password}\\r"
-        exp_continue
     }}
-    "New password:" {{
-        send "{new_password}\\r"
-        exp_continue
+    timeout {{
+        puts "RESULT:TIMEOUT_SSH"
+        exit 1
     }}
-    "Retype new password:" {{
+    eof {{
+        puts "RESULT:EOF_SSH"
+        exit 1
+    }}
+}}
+
+# Step 2: After password accepted, wait to see what happens
+# Either we get password change prompts (expired) or a shell prompt (not expired)
+expect {{
+    "Current password:" {{
+        # Password is expired - handle the change flow
+        send "{current_password}\\r"
+        expect "New password:"
         send "{new_password}\\r"
+        expect "Retype new password:"
+        send "{new_password}\\r"
+        # Wait for confirmation or disconnect
         expect {{
-            "passwd: password updated successfully" {{
-                puts "PASSWORD_CHANGED_SUCCESS"
-            }}
-            "Connection to" {{
-                puts "PASSWORD_CHANGED_SUCCESS"
+            "updated successfully" {{
+                puts "RESULT:PASSWORD_CHANGED"
             }}
             eof {{
-                puts "PASSWORD_CHANGED_SUCCESS"
+                puts "RESULT:PASSWORD_CHANGED"
             }}
             timeout {{
-                puts "PASSWORD_TIMEOUT"
+                puts "RESULT:CHANGE_TIMEOUT"
             }}
         }}
     }}
-    -re "assword:" {{
-        send "{current_password}\\r"
+    "password has expired" {{
+        # Keep waiting for the actual prompt
         exp_continue
     }}
-    "Permission denied" {{
-        puts "AUTH_FAILED"
+    "must change your password" {{
+        # Keep waiting for the actual prompt
+        exp_continue
     }}
-    "\\$" {{
-        # Got shell prompt - password not expired, exit cleanly
+    "Changing password" {{
+        # Keep waiting for Current password prompt
+        exp_continue
+    }}
+    -re "\\$ $" {{
+        # Got a shell prompt - password not expired
         send "exit\\r"
-        puts "ALREADY_OK"
+        expect eof
+        puts "RESULT:NOT_EXPIRED"
+    }}
+    "Permission denied" {{
+        puts "RESULT:AUTH_FAILED"
     }}
     timeout {{
-        puts "TIMEOUT"
+        puts "RESULT:TIMEOUT_AFTER_LOGIN"
     }}
     eof {{
-        puts "EARLY_EOF"
+        # Connection closed - might mean password was already changed
+        puts "RESULT:EOF_AFTER_LOGIN"
     }}
 }}
 '''
     try:
         proc = subprocess.run(
             ["expect", "-c", expect_script],
-            capture_output=True, text=True, timeout=60
+            capture_output=True, text=True, timeout=90
         )
-        output = proc.stdout or ""
-        if "PASSWORD_CHANGED_SUCCESS" in output:
+        output = (proc.stdout or "") + (proc.stderr or "")
+        
+        if "RESULT:PASSWORD_CHANGED" in output:
             return True, new_password
-        if "ALREADY_OK" in output:
-            # Password wasn't expired; current_password still works
+        if "RESULT:NOT_EXPIRED" in output:
             return True, current_password
-        if "AUTH_FAILED" in output:
-            # May already be changed to new_password
+        if "RESULT:AUTH_FAILED" in output:
+            # Password might already be the new one
             return True, new_password
-        # Some other failure
+        if "RESULT:EOF_AFTER_LOGIN" in output:
+            # Connection closed after login - try with new password
+            return True, new_password
+        # Some other failure - log it
+        print(f"    [DEBUG] expect output: {output[-300:]}")
         return False, current_password
-    except Exception:
+    except Exception as e:
+        print(f"    [DEBUG] expect exception: {e}")
         return False, current_password
 
 
