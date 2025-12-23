@@ -264,46 +264,51 @@ def download_packages_on_switch(host: str, username: str, password: str,
     print(f"    ✓ Downloaded {total_count} pip packages ({wheel_count} wheels)")
     
     # Download deb packages
+    # Only download the packages we explicitly need - base system deps are already on Cumulus
     print("    Downloading deb packages...")
-    deb_pkgs = " ".join(REQUIRED_DEB_PACKAGES)
     
-    # Get all dependencies
-    deps_cmd = (
-        f"apt-cache depends --recurse --no-recommends --no-suggests "
-        f"--no-conflicts --no-breaks --no-replaces --no-enhances {deb_pkgs} 2>/dev/null "
-        f"| grep -E '^\\w' | sort -u"
-    )
+    # First, update package lists to ensure we have latest info
+    print("    Running apt-get update...")
+    update_cmd = "sudo apt-get update -q 2>&1 | tail -3"
+    run_on_switch(host, username, password, update_cmd, check=False, timeout=120)
+    
+    # Download only the top-level packages we need (not all dependencies)
+    # Dependencies like libc6, gcc-12-base etc. are already on Cumulus
+    packages_to_download = REQUIRED_DEB_PACKAGES.copy()
+    
+    print(f"    Downloading: {', '.join(packages_to_download)}")
+    
+    # Download each package individually to handle errors gracefully
+    downloaded = 0
+    for pkg in packages_to_download:
+        dl_cmd = f"cd {deb_dir} && apt-get download {pkg} 2>&1"
+        result = run_on_switch(host, username, password, dl_cmd, check=False, timeout=60)
+        
+        if result.returncode == 0 and "E:" not in (result.stdout or ""):
+            downloaded += 1
+        else:
+            # Check if it's a metapackage (no .deb to download)
+            check_cmd = f"apt-cache show {pkg} 2>/dev/null | grep -E '^Filename:' | head -1"
+            check_result = run_on_switch(host, username, password, check_cmd, check=False)
+            
+            if "Filename:" in (check_result.stdout or ""):
+                print(f"    ⚠ Failed to download {pkg}: {(result.stdout or '')[:100]}")
+            else:
+                print(f"    ℹ {pkg} is a metapackage (no .deb file)")
+    
+    # Also try to get the direct dependencies of build-essential that have .deb files
+    print("    Getting build-essential components...")
+    deps_cmd = "apt-cache depends build-essential 2>/dev/null | grep 'Depends:' | awk '{print $2}'"
     result = run_on_switch(host, username, password, deps_cmd, check=False)
     
-    # Download each package
     if result.returncode == 0 and result.stdout.strip():
-        packages = result.stdout.strip().split("\n")
-        # Filter out virtual packages and duplicates
-        valid_packages = []
-        for pkg in packages:
-            pkg = pkg.strip()
-            if pkg and not pkg.startswith("<") and not pkg.startswith("|") and not pkg.startswith(" "):
-                valid_packages.append(pkg)
-        valid_packages = list(set(valid_packages))  # Remove duplicates
-        
-        print(f"    Resolved {len(valid_packages)} packages (including dependencies)")
-        
-        # Download all packages at once (more efficient and shows errors better)
-        # apt-get download doesn't require sudo, but we need to be in the right directory
-        pkg_list = " ".join(valid_packages[:50])  # Limit to avoid command line too long
-        dl_cmd = f"cd {deb_dir} && apt-get download {pkg_list} 2>&1"
-        result = run_on_switch(host, username, password, dl_cmd, check=False, timeout=120)
-        
-        if result.returncode != 0 or "E:" in result.stdout:
-            print(f"    [DEBUG] apt-get download output: {result.stdout[:500] if result.stdout else 'none'}")
-            print(f"    [DEBUG] apt-get download stderr: {result.stderr[:500] if result.stderr else 'none'}")
-            
-            # Try with sudo if regular download failed
-            print("    Retrying with sudo...")
-            dl_cmd = f"cd {deb_dir} && sudo apt-get download {pkg_list} 2>&1"
-            result = run_on_switch(host, username, password, dl_cmd, check=False, timeout=120)
-            if result.returncode != 0 or "E:" in result.stdout:
-                print(f"    [DEBUG] sudo apt-get output: {result.stdout[:500] if result.stdout else 'none'}")
+        for dep in result.stdout.strip().split("\n"):
+            dep = dep.strip()
+            if dep and not dep.startswith("<"):
+                dl_cmd = f"cd {deb_dir} && apt-get download {dep} 2>&1"
+                dl_result = run_on_switch(host, username, password, dl_cmd, check=False, timeout=60)
+                if dl_result.returncode == 0 and "E:" not in (dl_result.stdout or ""):
+                    downloaded += 1
     
     # Count deb packages and verify they exist
     result = run_on_switch(host, username, password, f"ls -la {deb_dir}/ 2>/dev/null | head -5", check=False)
