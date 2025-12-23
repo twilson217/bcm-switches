@@ -1294,7 +1294,7 @@ class BCMDeployer:
 
         # Create env file from template.
         env_cmd = (
-            "sudo sh -lc '"
+            "sudo bash -c '"
             "PY_BIN=$(command -v python3); PY_DIR=$(dirname \"$PY_BIN\"); "
             "ROOT=/opt/cm-lite-daemon; PIDFILE=/var/run/cm-lite-daemon.pid; "
             "PATHVAL=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
@@ -1310,7 +1310,7 @@ class BCMDeployer:
 
         # Install systemd unit file to /etc/systemd/system (highest precedence).
         unit_cmd = (
-            "sudo sh -lc '"
+            "sudo bash -c '"
             "ROOT=/opt/cm-lite-daemon; PIDFILE=/var/run/cm-lite-daemon.pid; "
             f"RUNENV=\"{run_env}\"; "
             "sed -e \"s#@ROOT@#$ROOT#g\" "
