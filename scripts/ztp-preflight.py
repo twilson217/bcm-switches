@@ -207,26 +207,62 @@ def _dhcpd_service_active() -> Tuple[bool, str]:
     return False, "dhcpd/isc-dhcp-server"
 
 
-def _parse_dhcp_host_block(conf_text: str, hostname: str) -> Optional[str]:
+def _parse_dhcp_host_block(conf_text: str, hostname: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Extract the host block for a hostname from ISC dhcpd config.
-    Minimal parser: finds `host <hostname> {` and returns up to its matching `}`.
+
+    BCM may name host blocks with suffixes (e.g. `host leaf-01.eth.cluster { ... option host-name "leaf-01"; ... }`),
+    so we match in this order:
+      1) exact `host <hostname> {`
+      2) any host block containing `option host-name "<hostname>";`
+      3) any host block whose declared name starts with `<hostname>.`
     """
-    pat = re.compile(rf"(^\s*host\s+{re.escape(hostname)}\s*\{{)", re.MULTILINE)
-    m = pat.search(conf_text)
-    if not m:
+    host = (hostname or "").strip()
+    if not host:
+        return None, None
+
+    # Helper: given the index of a "host ... {" line, return the full block.
+    def _extract_block(start: int) -> Optional[str]:
+        depth = 0
+        for i in range(start, len(conf_text)):
+            ch = conf_text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return conf_text[start : i + 1]
         return None
-    start = m.start(1)
-    depth = 0
-    for i in range(start, len(conf_text)):
-        ch = conf_text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return conf_text[start : i + 1]
-    return None
+
+    # 1) exact match
+    pat_exact = re.compile(rf"(^\s*host\s+{re.escape(host)}\s*\{{)", re.MULTILINE)
+    m = pat_exact.search(conf_text)
+    if m:
+        blk = _extract_block(m.start(1))
+        return blk, host
+
+    # 2/3) scan all host blocks and match by option host-name or prefix
+    pat_any = re.compile(r"(^\s*host\s+([^\s{]+)\s*\{)", re.MULTILINE)
+    candidates: List[Tuple[str, str]] = []
+    for m2 in pat_any.finditer(conf_text):
+        decl = m2.group(2).strip()
+        blk = _extract_block(m2.start(1))
+        if not blk:
+            continue
+        candidates.append((decl, blk))
+
+    # Prefer option host-name match
+    hn_pat = re.compile(rf'option\s+host-name\s+"{re.escape(host)}"\s*;', re.IGNORECASE)
+    for decl, blk in candidates:
+        if hn_pat.search(blk):
+            return blk, decl
+
+    # Fallback: declared name startswith "<hostname>."
+    for decl, blk in candidates:
+        if decl.startswith(host + "."):
+            return blk, decl
+
+    return None, None
 
 
 def _dhcp_option_value(block: str, option_name: str) -> Optional[str]:
@@ -307,11 +343,11 @@ def _config_checks(dev: Dict) -> Tuple[bool, List[str], List[str]]:
         lines.append(_check("BCM DHCP config file exists for network", True, str(conf_path))[1])
         try:
             conf_txt = conf_path.read_text(errors="replace")
-            block = _parse_dhcp_host_block(conf_txt, hostname)
+            block, decl = _parse_dhcp_host_block(conf_txt, hostname)
             if not block:
-                lines.append(_missing("BCM DHCP has host block for switch", f"host {hostname} not found in {conf_path}")[1])
+                lines.append(_missing("BCM DHCP has host block for switch", f"host block for '{hostname}' not found in {conf_path}")[1])
             else:
-                lines.append(_check("BCM DHCP has host block for switch", True, f"host {hostname}")[1])
+                lines.append(_check("BCM DHCP has host block for switch", True, f"host {decl or hostname}")[1])
                 if mac:
                     if mac.lower() in block.lower():
                         lines.append(_check("BCM DHCP host block contains switch MAC", True, mac)[1])
@@ -417,7 +453,7 @@ def _image_checks(dev: Dict, image_dir: Optional[Path]) -> Tuple[bool, List[str]
     if img and conf_path and conf_path.exists():
         try:
             conf_txt = conf_path.read_text(errors="replace")
-            block = _parse_dhcp_host_block(conf_txt, hostname)
+            block, _decl = _parse_dhcp_host_block(conf_txt, hostname)
             if block:
                 default_url = _dhcp_option_value(block, "default-url")
                 if default_url:
@@ -441,7 +477,9 @@ def main() -> int:
     parser.add_argument("--image-only", action="store_true", help="Run only image-management checks")
     args = parser.parse_args()
 
-    if not shutil.which("cmsh"):
+    # Prefer bcm_compat's full-path cmsh detection (BCM commonly exposes cmsh via modules, not PATH).
+    cmsh_cmd = get_cmsh_cmd()
+    if not (Path(cmsh_cmd).exists() or shutil.which(cmsh_cmd)):
         print("Error: cmsh not found. Run this on a BCM head node.")
         return 2
 
