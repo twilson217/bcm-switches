@@ -159,9 +159,23 @@ def run_on_switch(host: str, username: str, password: str, command: str,
                   *, timeout: int = 300, check: bool = True) -> subprocess.CompletedProcess:
     """Run a command on a Cumulus switch via SSH."""
     if host == "localhost":
+        # For localhost, handle sudo commands by piping password
+        if command.strip().startswith("sudo "):
+            # Use sudo -S to read password from stdin
+            sudo_cmd = command.replace("sudo ", "sudo -S ", 1)
+            proc = subprocess.run(
+                sudo_cmd, shell=True, capture_output=True, text=True,
+                timeout=timeout, input=f"{password}\n"
+            )
+            return proc
         return subprocess.run(command, shell=True, capture_output=True, text=True, 
                             timeout=timeout, check=check)
     else:
+        # For remote, handle sudo by piping password through echo
+        if "sudo " in command:
+            # Replace sudo with echo password | sudo -S
+            command = command.replace("sudo ", f"echo '{password}' | sudo -S ", 1)
+        
         ssh_cmd = ["sshpass", "-p", password, "ssh",
                    "-o", "StrictHostKeyChecking=no",
                    "-o", "UserKnownHostsFile=/dev/null",
