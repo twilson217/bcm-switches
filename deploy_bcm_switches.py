@@ -1622,7 +1622,70 @@ class BCMDeployer:
                          capture_output=True, text=True, timeout=120)
             
             if result.returncode != 0:
-                print(f"    ⚠ Registration command returned non-zero, checking service...")
+                print(f"    ⚠ Registration command returned non-zero; continuing with service installation checks...")
+                # Surface useful register_node output (often indicates why service wasn't installed)
+                stderr_tail = (result.stderr or "").strip()[-1500:]
+                stdout_tail = (result.stdout or "").strip()[-1500:]
+                if stdout_tail:
+                    print("    register_node stdout (tail):")
+                    print(stdout_tail)
+                if stderr_tail:
+                    print("    register_node stderr (tail):")
+                    print(stderr_tail)
+
+            # Ensure systemd unit + env file are installed.
+            #
+            # cm-lite-daemon's helper may write to /usr/lib/systemd/system which is not present
+            # on some Cumulus/Debian variants (or not searched depending on usr-merge).
+            # We make this robust by installing to /etc/systemd/system if the unit isn't found.
+            #
+            # Also note: we no longer require unzip on the switch because we rsync the extracted
+            # /opt/cm-lite-daemon tree earlier.
+            def _sudo(cmd: str, timeout: int = 45) -> subprocess.CompletedProcess:
+                full = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
+                return subprocess.run(full, input=f"{self.password}\n",
+                                      capture_output=True, text=True, timeout=timeout)
+
+            # If the unit doesn't exist in common locations, create it from the shipped template.
+            unit_check = self._run_ssh_command(
+                device["ip"],
+                "test -f /etc/systemd/system/cm-lite-daemon.service && echo yes || "
+                "test -f /usr/lib/systemd/system/cm-lite-daemon.service && echo yes || "
+                "test -f /lib/systemd/system/cm-lite-daemon.service && echo yes || echo no"
+            )
+            if unit_check != "yes":
+                print("    Installing systemd unit for cm-lite-daemon...")
+                run_env = f"/usr/sbin/ip vrf exec {self.vrf} " if self.vrf else ""
+                # Create env file from template.
+                env_cmd = (
+                    "sudo sh -lc '"
+                    "PY_BIN=$(command -v python3); PY_DIR=$(dirname \"$PY_BIN\"); "
+                    "ROOT=/opt/cm-lite-daemon; PIDFILE=/var/run/cm-lite-daemon.pid; "
+                    "PATHVAL=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
+                    "sed -e \"s#@ROOT@#$ROOT#g\" "
+                    "    -e \"s#@PIDFILE@#$PIDFILE#g\" "
+                    "    -e \"s#@PYTHON_PATH@#$PY_DIR#g\" "
+                    "    -e \"s#@PATH@#$PATHVAL#g\" "
+                    "    $ROOT/etc/cm-lite-daemon.env.in > $ROOT/etc/cm-lite-daemon.env && "
+                    "chmod 600 $ROOT/etc/cm-lite-daemon.env'"
+                )
+                _sudo(env_cmd, timeout=60)
+
+                # Install systemd unit file to /etc/systemd/system (highest precedence).
+                unit_cmd = (
+                    "sudo sh -lc '"
+                    "ROOT=/opt/cm-lite-daemon; PIDFILE=/var/run/cm-lite-daemon.pid; "
+                    f"RUNENV=\"{run_env}\"; "
+                    "sed -e \"s#@ROOT@#$ROOT#g\" "
+                    "    -e \"s#@PIDFILE@#$PIDFILE#g\" "
+                    "    -e \"s#@RUN_ENV@#$RUNENV#g\" "
+                    "    $ROOT/service/systemd > /etc/systemd/system/cm-lite-daemon.service && "
+                    "chmod 644 /etc/systemd/system/cm-lite-daemon.service'"
+                )
+                _sudo(unit_cmd, timeout=60)
+
+                _sudo("sudo systemctl daemon-reload", timeout=45)
+                _sudo("sudo systemctl enable cm-lite-daemon.service", timeout=45)
             
             # Start the service
             print(f"    Starting cm-lite-daemon service...")
@@ -1651,17 +1714,12 @@ class BCMDeployer:
 
             print(f"    ✗ Service not running after {max_wait}s: {last_state}")
 
-            # Pull diagnostics to make failures actionable.
-            def _sudo(cmd: str, timeout: int = 45) -> subprocess.CompletedProcess:
-                full = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
-                return subprocess.run(full, input=f"{self.password}\n",
-                                      capture_output=True, text=True, timeout=timeout)
-
             status_cmd = "sudo systemctl status cm-lite-daemon --no-pager -l"
             status_result = _sudo(status_cmd, timeout=45)
-            if status_result.stdout:
+            if status_result.stdout or status_result.stderr:
                 print("    Service status (tail):")
-                print(status_result.stdout[-1500:])
+                out = (status_result.stdout or "") + ("\n" + status_result.stderr if status_result.stderr else "")
+                print(out[-1500:])
 
             journal_cmd = "sudo journalctl -u cm-lite-daemon --no-pager -n 200"
             journal_result = _sudo(journal_cmd, timeout=45)
