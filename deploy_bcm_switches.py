@@ -181,9 +181,10 @@ def prompt_stage_ztp(*, non_interactive: bool, cli_flag: bool) -> bool:
     if non_interactive:
         return bool(cli_flag)
     resp = input(
-        "\nWould you like to stage ZTP (config/image prep for future DR/RMA) after deployment? (y/n) [n]: "
+        "\nWould you like to stage ZTP (config/image prep for future DR/RMA) after deployment? (y/n) [y]: "
     ).strip().lower()
-    return resp in ["y", "yes"]
+    # Default is now "yes" - only explicit "n" or "no" opts out
+    return resp not in ["n", "no"]
 
 
 def write_ztp_staging_csv(devices: List[Dict], path: Path) -> None:
