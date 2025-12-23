@@ -3,20 +3,32 @@
 Airgapped Deployment Preparation Script
 
 This script prepares a self-contained deployment package for airgapped BCM systems.
-It collects all required external files and creates a tarball that can be transferred
-to systems without internet access.
+It downloads all required files (pip packages, deb packages, cm-lite-daemon) from
+a Cumulus switch and creates a tarball that can be transferred to airgapped systems.
+
+IMPORTANT: This script must be run with access to a Cumulus Linux switch that:
+  1. Is running the SAME Cumulus version as your production switches
+  2. Has internet access to download packages
+
+You can run this script:
+  - Directly ON a Cumulus switch (default: localhost)
+  - From any system with SSH access to a Cumulus switch
 
 Usage:
-    python3 prep-airgapped.py
-    python3 prep-airgapped.py --output /path/to/output.tar.gz
+    python3 prep-airgapped.py                           # Interactive mode
+    python3 prep-airgapped.py --switch 192.168.1.100    # Specify switch
+    python3 prep-airgapped.py --output /path/to/out.tar.gz
+
+For testing, you can use NVIDIA Air with Cumulus switches:
+    https://github.com/twilson217/bcm-in-nvidia-air
 
 Requirements:
-    - Internet access (to download pip packages)
-    - pip must be available for downloading packages
-    - Either a requirements file (recommended) or access to cm-lite-daemon.zip to extract requirements.txt
+    - Access to a Cumulus Linux switch with internet connectivity
+    - Either a requirements file, cm-lite-daemon.zip, or use the built-in defaults
 """
 
 import argparse
+import getpass
 import os
 import shutil
 import subprocess
@@ -44,8 +56,9 @@ REQUIRED_DEB_PACKAGES = [
     "unzip",
 ]
 
-# Default requirements for BCM 10.x (verified on BCM 10.24.03 and BCM 10.30.0)
-DEFAULT_REQUIREMENTS_BCM10 = """\
+# Default requirements for cm-lite-daemon
+# Compatible with both BCM 10.x and BCM 11.x (includes natsort for BCM 11)
+DEFAULT_REQUIREMENTS = """\
 pyOpenSSL>=21.0.0
 websocket-client
 pyyaml
@@ -55,6 +68,7 @@ uptime
 netifaces
 py-dmidecode
 requests
+natsort
 """
 
 
@@ -69,78 +83,201 @@ def _python_version_to_tags(py_version: str) -> tuple[str, str]:
     minor = int(parts[1])
     if major != 3:
         raise ValueError(f"Unsupported python major version '{major}' (expected 3.x)")
-    abi = f"cp{major}{minor}" if minor < 10 else f"cp{major}{minor}"
+    abi = f"cp{major}{minor}"
     return f"{major}.{minor}", abi
 
 
-def _extract_missing_pkgs(stderr_text: str) -> list[str]:
-    missing: list[str] = []
-    if not stderr_text:
-        return missing
-    low = stderr_text.lower()
-    for m in re.finditer(r"no matching distribution found for ([a-z0-9_.-]+)", low):
-        missing.append(m.group(1))
-    for m in re.finditer(r"satisfies the requirement ([a-z0-9_.-]+)", low):
-        missing.append(m.group(1))
-    out: list[str] = []
-    for x in missing:
-        if x not in out:
-            out.append(x)
-    return out
-
-
-def check_prerequisites(*, need_requirements_source: bool):
-    """Check that all prerequisites are met."""
-    print("Checking prerequisites...")
+def check_cumulus_localhost() -> tuple[bool, str, str]:
+    """
+    Check if localhost is a Cumulus Linux system.
     
-    errors = []
-    
-    # Check for pip
-    if not shutil.which("pip") and not shutil.which("pip3"):
-        errors.append("pip/pip3 is not installed or not in PATH")
-    
-    # Check requirements source (either requirements.txt provided, or cm-lite-daemon.zip available)
-    if need_requirements_source:
-        errors.append("requirements source not available (provide --requirements, or --cm-lite-zip, or rely on BCM10 default requirements)")
-    
-    # Check internet connectivity
+    Returns:
+        Tuple of (is_cumulus, version, error_message)
+    """
     try:
-        result = subprocess.run(
-            ["pip", "index", "versions", "requests"],
-            capture_output=True, text=True, timeout=30
-        )
+        with open("/etc/os-release") as f:
+            content = f.read()
+        
+        if "cumulus" not in content.lower():
+            return False, "", "This system is not running Cumulus Linux"
+        
+        # Extract version
+        version = ""
+        for line in content.splitlines():
+            if line.startswith("VERSION_ID="):
+                version = line.split("=", 1)[1].strip().strip('"')
+                break
+        
+        return True, version, ""
+    except FileNotFoundError:
+        return False, "", "/etc/os-release not found"
+    except Exception as e:
+        return False, "", str(e)
+
+
+def check_cumulus_remote(host: str, username: str, password: str) -> tuple[bool, str, str]:
+    """
+    Check if a remote host is a Cumulus Linux system via SSH.
+    
+    Returns:
+        Tuple of (is_cumulus, version, error_message)
+    """
+    try:
+        cmd = ["sshpass", "-p", password, "ssh",
+               "-o", "StrictHostKeyChecking=no",
+               "-o", "UserKnownHostsFile=/dev/null",
+               "-o", "ConnectTimeout=10",
+               f"{username}@{host}",
+               "cat /etc/os-release"]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
         if result.returncode != 0:
-            # Try alternative check
-            result = subprocess.run(
-                ["pip", "search", "requests"],
-                capture_output=True, text=True, timeout=30
-            )
+            return False, "", f"SSH failed: {result.stderr.strip()[:200]}"
+        
+        content = result.stdout
+        if "cumulus" not in content.lower():
+            return False, "", "Remote system is not running Cumulus Linux"
+        
+        # Extract version
+        version = ""
+        for line in content.splitlines():
+            if line.startswith("VERSION_ID="):
+                version = line.split("=", 1)[1].strip().strip('"')
+                break
+        
+        return True, version, ""
     except subprocess.TimeoutExpired:
-        errors.append("Network timeout - check internet connectivity")
-    except Exception:
-        pass  # Some pip versions don't support these commands
-    
-    if errors:
-        print("\n✗ Prerequisites check failed:")
-        for error in errors:
-            print(f"  - {error}")
+        return False, "", "SSH connection timed out"
+    except FileNotFoundError:
+        return False, "", "sshpass not installed (required for remote access)"
+    except Exception as e:
+        return False, "", str(e)
+
+
+def run_on_switch(host: str, username: str, password: str, command: str, 
+                  *, timeout: int = 300, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a command on a Cumulus switch via SSH."""
+    if host == "localhost":
+        return subprocess.run(command, shell=True, capture_output=True, text=True, 
+                            timeout=timeout, check=check)
+    else:
+        ssh_cmd = ["sshpass", "-p", password, "ssh",
+                   "-o", "StrictHostKeyChecking=no",
+                   "-o", "UserKnownHostsFile=/dev/null",
+                   f"{username}@{host}",
+                   command]
+        return subprocess.run(ssh_cmd, capture_output=True, text=True, 
+                            timeout=timeout, check=check)
+
+
+def copy_from_switch(host: str, username: str, password: str, 
+                     remote_path: str, local_path: str) -> bool:
+    """Copy files from a remote switch to local system."""
+    if host == "localhost":
+        if Path(remote_path).exists():
+            if Path(remote_path).is_dir():
+                shutil.copytree(remote_path, local_path, dirs_exist_ok=True)
+            else:
+                shutil.copy2(remote_path, local_path)
+            return True
         return False
-    
-    print("✓ All prerequisites met")
-    return True
+    else:
+        # Use rsync for remote copy
+        rsync_cmd = [
+            "sshpass", "-p", password,
+            "rsync", "-avz",
+            "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+            f"{username}@{host}:{remote_path}",
+            local_path
+        ]
+        result = subprocess.run(rsync_cmd, capture_output=True, text=True, timeout=300)
+        return result.returncode == 0
 
 
-def copy_cm_lite_daemon(src_zip: Path):
-    """Copy cm-lite-daemon.zip to files directory."""
-    print("\nCopying cm-lite-daemon.zip...")
+def download_packages_on_switch(host: str, username: str, password: str,
+                                requirements: str, python_version: str) -> tuple[str, str]:
+    """
+    Download pip and deb packages on a Cumulus switch.
     
-    FILES_DIR.mkdir(parents=True, exist_ok=True)
-    dest = FILES_DIR / "cm-lite-daemon.zip"
+    Returns:
+        Tuple of (pip_packages_dir, deb_packages_dir) on the switch
+    """
+    # Create temp directory on switch
+    result = run_on_switch(host, username, password, "mktemp -d")
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to create temp dir: {result.stderr}")
+    temp_dir = result.stdout.strip()
     
-    shutil.copy2(src_zip, dest)
-    print(f"✓ Copied to {dest}")
+    pip_dir = f"{temp_dir}/pip_packages_dep"
+    deb_dir = f"{temp_dir}/deb_packages"
     
-    return dest
+    print(f"\n  Downloading packages on {host}...")
+    print(f"    Temp directory: {temp_dir}")
+    
+    # Create directories
+    run_on_switch(host, username, password, f"mkdir -p {pip_dir} {deb_dir}")
+    
+    # Write requirements to switch
+    req_file = f"{temp_dir}/requirements.txt"
+    # Escape the requirements for shell
+    escaped_req = requirements.replace("'", "'\\''")
+    run_on_switch(host, username, password, f"echo '{escaped_req}' > {req_file}")
+    
+    # Download pip packages
+    print("    Downloading pip packages...")
+    v_norm, abi = _python_version_to_tags(python_version)
+    
+    # First try to download wheels
+    pip_cmd = (
+        f"pip3 download -r {req_file} --dest {pip_dir} "
+        f"--python-version {v_norm} --implementation cp --abi {abi} "
+        f"--platform manylinux2014_x86_64 --only-binary :all: 2>/dev/null || true"
+    )
+    run_on_switch(host, username, password, pip_cmd, timeout=600, check=False)
+    
+    # Download any missing packages as source (for packages without wheels)
+    pip_any_cmd = f"pip3 download -r {req_file} --dest {pip_dir} --no-deps 2>/dev/null || true"
+    run_on_switch(host, username, password, pip_any_cmd, timeout=600, check=False)
+    
+    # Count pip packages
+    result = run_on_switch(host, username, password, f"ls {pip_dir}/*.whl 2>/dev/null | wc -l")
+    wheel_count = int(result.stdout.strip() or "0")
+    result = run_on_switch(host, username, password, f"ls {pip_dir}/* 2>/dev/null | wc -l")
+    total_count = int(result.stdout.strip() or "0")
+    print(f"    ✓ Downloaded {total_count} pip packages ({wheel_count} wheels)")
+    
+    # Download deb packages
+    print("    Downloading deb packages...")
+    deb_pkgs = " ".join(REQUIRED_DEB_PACKAGES)
+    
+    # Get all dependencies
+    deps_cmd = (
+        f"apt-cache depends --recurse --no-recommends --no-suggests "
+        f"--no-conflicts --no-breaks --no-replaces --no-enhances {deb_pkgs} 2>/dev/null "
+        f"| grep -E '^\\w' | sort -u"
+    )
+    result = run_on_switch(host, username, password, deps_cmd, check=False)
+    
+    # Download each package
+    if result.returncode == 0 and result.stdout.strip():
+        packages = result.stdout.strip().split("\n")
+        print(f"    Resolved {len(packages)} packages (including dependencies)")
+        
+        # Download in batches
+        for pkg in packages:
+            pkg = pkg.strip()
+            if not pkg or pkg.startswith("<") or pkg.startswith("|"):
+                continue
+            dl_cmd = f"cd {deb_dir} && apt-get download {pkg} 2>/dev/null || true"
+            run_on_switch(host, username, password, dl_cmd, check=False, timeout=60)
+    
+    # Count deb packages
+    result = run_on_switch(host, username, password, f"ls {deb_dir}/*.deb 2>/dev/null | wc -l")
+    deb_count = int(result.stdout.strip() or "0")
+    print(f"    ✓ Downloaded {deb_count} deb packages")
+    
+    return pip_dir, deb_dir, temp_dir
 
 
 def extract_requirements(zip_path: Path) -> str:
@@ -170,240 +307,25 @@ def load_requirements(*, requirements_path: Path | None, cm_lite_zip_src: Path |
         txt = extract_requirements(cm_lite_zip_src)
         return txt, f"requirements extracted from: {cm_lite_zip_src}"
 
-    # Fall back to BCM10 default list
-    return DEFAULT_REQUIREMENTS_BCM10, "built-in BCM 10.x default requirements"
-
-
-def download_pip_packages(requirements: str, python3_version: str):
-    """Download pip packages for offline installation."""
-    v_norm, abi = _python_version_to_tags(python3_version)
-    print(f"\nDownloading pip packages (target python {v_norm}, ABI {abi})...")
-    
-    pip_dir = FILES_DIR / "pip_packages_dep"
-    pip_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Write temporary requirements file
-    temp_req = FILES_DIR / "requirements.txt"
-    temp_req.write_text(requirements)
-    
-    try:
-        # Wheelhouse strategy (aligned with deploy_bcm_switches.py):
-        # - Prefer wheels for offline install, targeted at the switch python ABI + platform.
-        # - If pip reports "no matching distribution" for a package under those constraints,
-        #   automatically allow it as sdist and retry.
-        # - Always include sdist-only packages like uptime.
-        sdist_allowlist = {"uptime"}
-
-        def _pkg_name_from_req_line(line: str) -> str | None:
-            s = (line or "").strip()
-            if not s or s.startswith("#"):
-                return None
-            return s.split("==", 1)[0].split("[", 1)[0].strip()
-
-        def _write_filtered_requirements() -> Path:
-            filtered_lines = []
-            for line in requirements.splitlines():
-                pkg = _pkg_name_from_req_line(line)
-                if pkg and pkg in sdist_allowlist:
-                    continue
-                filtered_lines.append(line)
-            filtered_req = FILES_DIR / "requirements.filtered.txt"
-            filtered_req.write_text("\n".join(filtered_lines).strip() + "\n")
-            return filtered_req
-
-        # Retry wheel download a few times, expanding sdist allowlist based on pip error output
-        attempt = 0
-        last = None
-        while attempt < 3:
-            attempt += 1
-            filtered_req = _write_filtered_requirements()
-            cmd = [
-                "pip", "download",
-                "-r", str(filtered_req),
-                "--dest", str(pip_dir),
-                "--python-version", v_norm,
-                "--implementation", "cp",
-                "--abi", abi,
-                "--platform", "manylinux2014_x86_64",
-                "--only-binary", ":all:",
-                "--no-binary", ":none:",
-            ]
-            last = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if last.returncode == 0:
-                break
-            missing = _extract_missing_pkgs(last.stderr or "")
-            added = False
-            for pkg in missing:
-                if pkg and pkg not in sdist_allowlist:
-                    sdist_allowlist.add(pkg)
-                    added = True
-            if not added:
-                break
-
-        # Download sdists for allowlisted packages
-        for pkg in sorted(sdist_allowlist):
-            print(f"  Downloading sdist for '{pkg}'...")
-            sdist_cmd = ["pip", "download", "--no-binary", ":all:", "--no-deps", "--dest", str(pip_dir), pkg]
-            subprocess.run(sdist_cmd, capture_output=True, text=True, timeout=300)
-
-        packages = list(pip_dir.glob("*"))
-        wheel_count = len(list(pip_dir.glob("*.whl")))
-        if not packages or wheel_count == 0:
-            print("  ✗ Failed to download required pip packages for offline install")
-            print(f"    Downloaded files: {len(packages)} (wheels: {wheel_count})")
-            if last is not None and last.returncode != 0:
-                if last.stderr:
-                    print(f"    pip stderr (first 500 chars): {last.stderr[:500]}")
-                if last.stdout:
-                    print(f"    pip stdout (first 500 chars): {last.stdout[:500]}")
-            raise RuntimeError("pip package download failed")
-        
-        # List downloaded packages
-        packages = list(pip_dir.glob("*"))
-        print(f"\n✓ Downloaded {len(packages)} package files:")
-        for pkg in sorted(packages)[:10]:
-            print(f"    - {pkg.name}")
-        if len(packages) > 10:
-            print(f"    ... and {len(packages) - 10} more")
-        
-    finally:
-        # Clean up temp requirements
-        if temp_req.exists():
-            temp_req.unlink()
-    
-    return pip_dir
-
-
-def download_deb_packages(target_distro: str = "bookworm", target_arch: str = "amd64"):
-    """
-    Download .deb packages for offline installation on switches.
-    
-    This downloads the required packages and all their dependencies so they can
-    be installed on switches without internet access.
-    
-    Args:
-        target_distro: Target Debian distribution codename (e.g., 'bookworm' for Debian 12,
-                       'bullseye' for Debian 11). Cumulus 5.x is based on Debian.
-        target_arch: Target architecture (typically 'amd64')
-    """
-    print(f"\nDownloading .deb packages for {target_distro}/{target_arch}...")
-    print(f"  Packages: {', '.join(REQUIRED_DEB_PACKAGES)}")
-    
-    deb_dir = FILES_DIR / "deb_packages"
-    deb_dir.mkdir(parents=True, exist_ok=True)
-    
-    # First, get the list of all dependencies
-    print("  Resolving dependencies...")
-    deps_cmd = [
-        "apt-cache", "depends", "--recurse", "--no-recommends", "--no-suggests",
-        "--no-conflicts", "--no-breaks", "--no-replaces", "--no-enhances",
-    ] + REQUIRED_DEB_PACKAGES
-    
-    try:
-        result = subprocess.run(deps_cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            print(f"  Warning: apt-cache depends returned non-zero: {result.stderr[:200]}")
-        
-        # Parse the output to get package names
-        # apt-cache depends output has lines like "  Depends: package" or just "package"
-        packages_to_download = set()
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            # Skip lines that are dependency type markers or empty
-            if not line or line.startswith("<") or line.startswith("|"):
-                continue
-            if ":" in line:
-                # Lines like "Depends: package" or "PreDepends: package"
-                parts = line.split(":", 1)
-                if len(parts) == 2:
-                    pkg = parts[1].strip()
-                    if pkg and not pkg.startswith("<"):
-                        packages_to_download.add(pkg)
-            else:
-                # Direct package name
-                if line and not line.startswith("<"):
-                    packages_to_download.add(line)
-        
-        # Always include the explicitly requested packages
-        for pkg in REQUIRED_DEB_PACKAGES:
-            packages_to_download.add(pkg)
-        
-        print(f"  Found {len(packages_to_download)} packages (including dependencies)")
-        
-        # Download each package
-        print("  Downloading packages...")
-        downloaded = 0
-        skipped = 0
-        failed = []
-        
-        for pkg in sorted(packages_to_download):
-            # Skip virtual packages and packages that start with special chars
-            if pkg.startswith("<") or pkg.startswith("|"):
-                continue
-            
-            # Check if already downloaded
-            existing = list(deb_dir.glob(f"{pkg}_*.deb"))
-            if existing:
-                skipped += 1
-                continue
-            
-            # Download using apt-get download
-            dl_cmd = ["apt-get", "download", pkg]
-            dl_result = subprocess.run(
-                dl_cmd, 
-                capture_output=True, 
-                text=True, 
-                timeout=60,
-                cwd=str(deb_dir)
-            )
-            
-            if dl_result.returncode == 0:
-                downloaded += 1
-            else:
-                # Some packages may be virtual or not available
-                if "has no installation candidate" not in dl_result.stderr:
-                    failed.append(pkg)
-        
-        # Count what we have
-        all_debs = list(deb_dir.glob("*.deb"))
-        total_size = sum(f.stat().st_size for f in all_debs)
-        
-        print(f"\n✓ Downloaded {downloaded} new packages, {skipped} already present")
-        print(f"  Total: {len(all_debs)} .deb files ({total_size / (1024*1024):.1f} MB)")
-        
-        if failed:
-            print(f"  Note: {len(failed)} packages could not be downloaded (may be virtual/meta packages)")
-        
-        # Verify we have the critical packages
-        missing_critical = []
-        for pkg in REQUIRED_DEB_PACKAGES:
-            if not list(deb_dir.glob(f"{pkg}_*.deb")):
-                missing_critical.append(pkg)
-        
-        if missing_critical:
-            print(f"  ⚠ Warning: Could not find .deb files for: {', '.join(missing_critical)}")
-            print("    These may need to be downloaded on a Debian-based system")
-        
-    except subprocess.TimeoutExpired:
-        print("  ✗ Timeout while resolving/downloading packages")
-        raise
-    except Exception as e:
-        print(f"  ✗ Error downloading .deb packages: {e}")
-        raise
-    
-    return deb_dir
+    # Fall back to default list (compatible with BCM 10.x and 11.x)
+    return DEFAULT_REQUIREMENTS, "built-in default requirements (BCM 10.x/11.x compatible)"
 
 
 def create_tarball(output_path: Path):
     """Create compressed tarball of the entire repository with files."""
     print(f"\nCreating tarball: {output_path}")
     
+    def _tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        """Exclude cm-lite-daemon.zip from tarball (use target BCM's version)."""
+        n = tarinfo.name.replace("\\", "/")
+        if n.endswith("/.files/cm-lite-daemon.zip"):
+            return None
+        return tarinfo
+    
     # Create tarball
     with tarfile.open(output_path, "w:gz") as tar:
-        # Add all files from repo, excluding certain directories
         for item in REPO_DIR.iterdir():
-            # Skip items we don't want in the tarball
-            if item.name in ['.git', '.configs', '__pycache__', '.gitignore']:
+            if item.name in ['.git', '.configs', '__pycache__', '.gitignore', '.docs']:
                 continue
             if item.name.endswith('.tar.gz'):
                 continue
@@ -412,7 +334,6 @@ def create_tarball(output_path: Path):
             print(f"  Adding {item.name}...")
             tar.add(item, arcname=arcname, filter=_tar_filter)
     
-    # Get file size
     size_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"\n✓ Created tarball: {output_path}")
     print(f"  Size: {size_mb:.2f} MB")
@@ -426,7 +347,6 @@ def print_summary():
     print("COLLECTION SUMMARY")
     print("=" * 60)
     
-    # Check files directory
     if FILES_DIR.exists():
         print(f"\nFiles in {FILES_DIR}:")
         
@@ -445,37 +365,27 @@ def print_summary():
         print(f"\n  Total: {total_size / (1024*1024):.2f} MB")
 
 
-def _tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
-    """
-    Exclude cm-lite-daemon.zip from the tarball by default.
-    In airgapped production, deploy_bcm_switches.py should use the target BCM's own
-    cm-lite-daemon.zip (production version), not a potentially different one bundled
-    from another system.
-    """
-    # tarinfo.name is the archive name (we use bcm-switch-deploy/<...>)
-    n = tarinfo.name.replace("\\", "/")
-    if n.endswith("/.files/cm-lite-daemon.zip"):
-        return None
-    return tarinfo
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Prepare airgapped deployment package for BCM switch deployment",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-This script collects all files needed for airgapped deployment:
-  1. cm-lite-daemon.zip from BCM
-  2. All required pip packages
-  3. All required .deb packages (build-essential, python3-dev, etc.)
+This script downloads all files needed for airgapped deployment from a Cumulus switch:
+  1. pip packages for cm-lite-daemon
+  2. deb packages (build-essential, python3-dev, etc.)
 
-The output tarball can be transferred to an airgapped BCM system
-and extracted for use with deploy_bcm_switches.py --airgapped.
+IMPORTANT: The Cumulus switch used for downloads must:
+  - Run the SAME Cumulus version as your production switches
+  - Have internet access to download packages
 
 Examples:
-  %(prog)s                                    # Create default tarball
-  %(prog)s --output /tmp/deploy-package.tar.gz  # Custom output path
-  %(prog)s --skip-debs                        # Skip .deb download (if running on non-Debian)
+  %(prog)s                                    # Interactive - prompts for switch
+  %(prog)s --switch 192.168.1.100             # Use specific switch
+  %(prog)s --switch localhost                 # Run directly on a Cumulus switch
+  %(prog)s --output /tmp/deploy-pkg.tar.gz    # Custom output path
+
+For testing, set up NVIDIA Air with Cumulus switches:
+  https://github.com/twilson217/bcm-in-nvidia-air
         """
     )
     
@@ -487,48 +397,57 @@ Examples:
     )
     
     parser.add_argument(
+        "--switch", "-s",
+        type=str,
+        default=None,
+        help="Hostname or IP of a Cumulus switch with internet access (default: prompt)"
+    )
+    
+    parser.add_argument(
+        "--username", "-u",
+        type=str,
+        default="cumulus",
+        help="SSH username for the switch (default: cumulus)"
+    )
+    
+    parser.add_argument(
+        "--password", "-p",
+        type=str,
+        default=None,
+        help="SSH password for the switch (default: prompt if needed)"
+    )
+    
+    parser.add_argument(
         "--python3-version",
         type=str,
         default="3.11",
-        help="Target switch Python version (MAJOR.MINOR), e.g. 3.11. "
-             "This is used to download compatible wheels for offline install. "
-             "If omitted, defaults to 3.11."
+        help="Target switch Python version (default: 3.11)"
     )
 
     parser.add_argument(
         "--cm-lite-zip",
         type=Path,
         default=None,
-        help="Path to cm-lite-daemon.zip. If omitted, we try the BCM default path "
-             f"({CM_LITE_ZIP_PATH}) then .files/cm-lite-daemon.zip."
-    )
-
-    parser.add_argument(
-        "--include-cm-lite-zip",
-        action="store_true",
-        help="Include cm-lite-daemon.zip in the tarball (NOT recommended; prefer using the target BCM's production zip)."
+        help="Path to cm-lite-daemon.zip (optional)"
     )
 
     parser.add_argument(
         "--requirements", "-r",
         type=Path,
         default=None,
-        help="Path to a requirements.txt file (contents from inside cm-lite-daemon.zip). "
-             "Useful when you cannot move the zip file but can copy the text file."
+        help="Path to requirements.txt file (optional)"
     )
-    
+
     parser.add_argument(
-        "--skip-debs",
+        "--include-cm-lite-zip",
         action="store_true",
-        help="Skip downloading .deb packages (use if running on a non-Debian system or if debs already present)."
+        help="Include cm-lite-daemon.zip in tarball (not recommended)"
     )
     
     parser.add_argument(
-        "--target-distro",
-        type=str,
-        default="bookworm",
-        help="Target Debian distribution codename (default: bookworm for Debian 12/Cumulus 5.x). "
-             "Use 'bullseye' for Debian 11."
+        "--non-interactive",
+        action="store_true",
+        help="Non-interactive mode (requires --switch)"
     )
     
     args = parser.parse_args()
@@ -537,69 +456,133 @@ Examples:
     print("BCM Switch Deployment - Airgapped Preparation")
     print("=" * 60)
     
-    # Determine cm-lite-daemon.zip source (optional; only used if we need to extract requirements)
-    cm_lite_zip_src = args.cm_lite_zip
-    if cm_lite_zip_src is None:
-        if CM_LITE_ZIP_PATH.exists():
-            cm_lite_zip_src = CM_LITE_ZIP_PATH
+    print("""
+This script prepares packages for airgapped cm-lite-daemon deployment.
 
-    # Validate requirements path if provided
+IMPORTANT: You need access to a Cumulus Linux switch that:
+  1. Is running the SAME Cumulus version as your production switches
+  2. Has internet access to download packages
+
+The packages will be downloaded ON that switch to ensure compatibility.
+""")
+    
+    # Determine switch to use
+    switch_host = args.switch
+    username = args.username
+    password = args.password
+    
+    if switch_host is None:
+        if args.non_interactive:
+            print("Error: --switch is required in non-interactive mode")
+            sys.exit(1)
+        
+        switch_host = input("Enter Cumulus switch hostname or IP [localhost]: ").strip()
+        if not switch_host:
+            switch_host = "localhost"
+    
+    # Check if it's a valid Cumulus system
+    print(f"\nChecking {switch_host}...")
+    
+    if switch_host == "localhost":
+        is_cumulus, version, error = check_cumulus_localhost()
+        if not is_cumulus:
+            print(f"✗ {error}")
+            print("\nTo use this script on localhost, you must run it on a Cumulus Linux switch.")
+            print("Otherwise, specify a remote Cumulus switch with --switch <hostname>")
+            sys.exit(1)
+        print(f"✓ Cumulus Linux {version} detected")
+    else:
+        # Need credentials for remote access
+        if password is None:
+            if args.non_interactive:
+                print("Error: --password is required for remote switches in non-interactive mode")
+                sys.exit(1)
+            password = getpass.getpass(f"Enter password for {username}@{switch_host}: ")
+        
+        is_cumulus, version, error = check_cumulus_remote(switch_host, username, password)
+        if not is_cumulus:
+            print(f"✗ {error}")
+            sys.exit(1)
+        print(f"✓ Cumulus Linux {version} detected on {switch_host}")
+    
+    # Determine requirements
+    cm_lite_zip_src = args.cm_lite_zip
+    if cm_lite_zip_src is None and CM_LITE_ZIP_PATH.exists():
+        cm_lite_zip_src = CM_LITE_ZIP_PATH
+    
     if args.requirements is not None and not args.requirements.exists():
         print(f"Error: requirements file not found: {args.requirements}")
         sys.exit(1)
-
-    # Check prerequisites (pip + internet). Requirements source is optional because we have a BCM10 default.
-    if not check_prerequisites(need_requirements_source=False):
-        sys.exit(1)
+    
+    requirements, req_src = load_requirements(
+        requirements_path=args.requirements,
+        cm_lite_zip_src=cm_lite_zip_src,
+    )
+    print(f"\nUsing requirements source: {req_src}")
     
     try:
-        # Step 1: Determine requirements and download pip packages
-        requirements, req_src = load_requirements(
-            requirements_path=args.requirements,
-            cm_lite_zip_src=cm_lite_zip_src,
-        )
-        print(f"\nUsing requirements source: {req_src}")
-        download_pip_packages(requirements, python3_version=args.python3_version)
-
-        # Step 2: Download .deb packages for offline apt install
-        if not args.skip_debs:
-            try:
-                download_deb_packages(target_distro=args.target_distro)
-            except Exception as e:
-                print(f"\n⚠ Warning: Could not download .deb packages: {e}")
-                print("  If running on a non-Debian system, use --skip-debs")
-                print("  Debs can be downloaded later on the BCM head node")
-        else:
-            print("\n⚠ Skipping .deb package download (--skip-debs)")
-            print("  deploy_bcm_switches.py will attempt to download debs on the BCM head node")
-
-        # Optionally copy cm-lite-daemon.zip into .files (not included in tarball unless requested)
-        if args.include_cm_lite_zip:
-            if not cm_lite_zip_src:
-                raise FileNotFoundError("Cannot include cm-lite-daemon.zip: source not found. Provide --cm-lite-zip.")
-            copy_cm_lite_daemon(cm_lite_zip_src)
+        # Ensure local .files directory exists
+        FILES_DIR.mkdir(parents=True, exist_ok=True)
         
-        # Print summary of collected files
+        # Download packages on the switch
+        pip_dir, deb_dir, temp_dir = download_packages_on_switch(
+            switch_host, username, password or "",
+            requirements, args.python3_version
+        )
+        
+        # Copy packages back to local .files directory
+        print(f"\n  Copying packages to {FILES_DIR}...")
+        
+        local_pip_dir = FILES_DIR / "pip_packages_dep"
+        local_deb_dir = FILES_DIR / "deb_packages"
+        local_pip_dir.mkdir(parents=True, exist_ok=True)
+        local_deb_dir.mkdir(parents=True, exist_ok=True)
+        
+        if copy_from_switch(switch_host, username, password or "", f"{pip_dir}/", str(local_pip_dir)):
+            pip_count = len(list(local_pip_dir.glob("*")))
+            print(f"    ✓ Copied {pip_count} pip packages")
+        else:
+            print("    ⚠ Failed to copy pip packages")
+        
+        if copy_from_switch(switch_host, username, password or "", f"{deb_dir}/", str(local_deb_dir)):
+            deb_count = len(list(local_deb_dir.glob("*.deb")))
+            print(f"    ✓ Copied {deb_count} deb packages")
+        else:
+            print("    ⚠ Failed to copy deb packages")
+        
+        # Clean up temp directory on switch
+        if switch_host != "localhost":
+            run_on_switch(switch_host, username, password or "", f"rm -rf {temp_dir}", check=False)
+        
+        # Optionally copy cm-lite-daemon.zip
+        if args.include_cm_lite_zip and cm_lite_zip_src and cm_lite_zip_src.exists():
+            dest = FILES_DIR / "cm-lite-daemon.zip"
+            shutil.copy2(cm_lite_zip_src, dest)
+            print(f"    ✓ Copied cm-lite-daemon.zip")
+        
+        # Print summary
         print_summary()
         
-        # Step 2: Create tarball
+        # Create tarball
         tarball = create_tarball(args.output)
         
         print("\n" + "=" * 60)
         print("PREPARATION COMPLETE")
         print("=" * 60)
         print(f"\nAirgapped deployment package created: {tarball}")
-        print("\nTo use on an airgapped system:")
+        print("\nTo use on an airgapped BCM system:")
         print(f"  1. Transfer {tarball.name} to the target BCM system")
         print("  2. Extract: tar -xzf " + tarball.name)
         print("  3. cd bcm-switch-deploy")
-        print("  4. python3 deploy_bcm_switches.py --airgapped")
+        print("  4. python3 deploy_bcm_switches.py")
+        print("\nThe deploy script will use the cached packages from .files/")
         
     except Exception as e:
         print(f"\n✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-

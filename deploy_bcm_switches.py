@@ -1396,6 +1396,20 @@ class BCMDeployer:
         except (ValueError, AttributeError):
             has_pip_unzip = False
         
+        # Check if we have cached deb packages (from prep-airgapped.py)
+        deb_packages_dir = DEB_PACKAGES_DIR
+        has_cached_debs = deb_packages_dir.exists() and len(list(deb_packages_dir.glob("*.deb"))) >= 5
+        
+        # Check if we have cached deb packages on the switch (transferred earlier)
+        has_switch_debs = False
+        if has_cached_debs:
+            deb_check = self._run_ssh_command(device['ip'],
+                f"ls /home/{self.username}/deb_packages/*.deb 2>/dev/null | wc -l")
+            try:
+                has_switch_debs = int(deb_check.strip()) >= 5
+            except (ValueError, AttributeError):
+                pass
+        
         # Check if we have any sdist (source) packages that would need compilation
         # If all packages are wheels (.whl), we don't need build-essential
         pip_packages_dir = FILES_DIR / "pip_packages_dep"
@@ -1408,8 +1422,9 @@ class BCMDeployer:
                     break
         
         # Determine installation strategy
-        # Strategy 1: pip/unzip already installed + all wheels = no apt needed
-        # Strategy 2: missing packages = try apt (with internet or local debs)
+        # Priority 1: pip/unzip already installed + all wheels = no apt needed
+        # Priority 2: use cached deb packages (from prep-airgapped.py) 
+        # Priority 3: install from internet
         
         if has_pip_unzip and not has_sdists:
             # Best case: everything we need is already there or in wheel form
@@ -1423,12 +1438,31 @@ class BCMDeployer:
                  f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
                 ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
             ]
-        elif has_pip_unzip and has_sdists:
-            # Have pip/unzip but need build tools for sdists - try to install just build-essential
-            print(f"    ⚠ Source packages detected, attempting to install build tools...")
+        elif has_switch_debs:
+            # Use cached deb packages from prep-airgapped.py (airgapped mode)
+            print(f"    ✓ Using cached deb packages (airgapped mode)")
+            deb_install_cmd = (
+                f"cd /home/{self.username}/deb_packages && "
+                f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q ./*.deb 2>/dev/null || "
+                f"echo 'some packages may already be installed'"
+            )
             steps = [
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
-                ("Installing build tools (if available)...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev 2>/dev/null || echo 'build tools not available, will try wheel-only'"),
+                ("Installing dependencies (from cached packages)...", deb_install_cmd),
+                ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
+                ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
+                ("Installing Python packages (this may take a while)...", 
+                 f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
+                 f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon.zip /home/{self.username}/deb_packages"),
+            ]
+        elif has_pip_unzip and has_sdists:
+            # Have pip/unzip but need build tools for sdists - try to install from internet
+            print(f"    ⚠ Source packages detected, attempting to install build tools from internet...")
+            steps = [
+                ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
+                ("Updating package lists...", "sudo apt-get update -q 2>/dev/null || echo 'apt update failed'"),
+                ("Installing build tools...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev 2>/dev/null || echo 'build tools not available, will try wheel-only'"),
                 ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
                 ("Installing Python packages (this may take a while)...", 
@@ -1437,12 +1471,12 @@ class BCMDeployer:
                 ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
             ]
         else:
-            # Need to install pip/unzip - requires internet or working local debs
-            print(f"    ⚠ Missing python3-pip or unzip, attempting apt install...")
+            # Need to install pip/unzip from internet
+            print(f"    ⚠ Missing python3-pip or unzip, installing from internet...")
             steps = [
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
-                ("Updating package lists...", "sudo apt-get update -q 2>/dev/null || echo 'apt update failed, trying cached packages'"),
-                ("Installing dependencies...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-pip unzip 2>/dev/null || echo 'some packages may be missing'"),
+                ("Updating package lists...", "sudo apt-get update -q"),
+                ("Installing dependencies...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev python3-pip unzip"),
                 ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
                 ("Installing Python packages (this may take a while)...", 
@@ -2060,130 +2094,42 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
             if temp_req.exists():
                 temp_req.unlink()
     
-    # Ensure deb packages are also available
-    ensure_deb_packages()
+    # Check for cached deb packages (prepared by prep-airgapped.py)
+    check_cached_packages()
     
     return True
 
 
-def ensure_deb_packages() -> bool:
+def check_cached_packages() -> tuple[bool, bool]:
     """
-    Ensure .deb packages are available for offline installation on switches.
+    Check if cached packages are available in .files/ directory.
     
-    Downloads build-essential, python3-dev, python3-pip, unzip and all their
-    dependencies so they can be installed on switches without internet access.
+    These packages should be prepared using scripts/prep-airgapped.py on a
+    Cumulus switch with internet access.
     
-    NOTE: This only works if the BCM head node is Debian-based (like Cumulus).
-    Ubuntu packages are NOT compatible with Debian/Cumulus switches.
-    
-    Returns True if packages are ready, False otherwise.
+    Returns:
+        Tuple of (has_pip_packages, has_deb_packages)
     """
-    # Check if we're on a Debian-compatible system
-    # Ubuntu packages won't work on Cumulus (Debian-based) due to version mismatches
-    try:
-        with open("/etc/os-release") as f:
-            os_release = f.read().lower()
-        if "ubuntu" in os_release:
-            print(f"\n⚠ Skipping .deb package download: BCM head node is Ubuntu-based")
-            print(f"  Ubuntu packages are incompatible with Cumulus Linux (Debian-based)")
-            print(f"  The installer will check if required packages are already on switches")
-            print(f"  (python3-pip and unzip are typically pre-installed on Cumulus)")
-            return False
-    except FileNotFoundError:
-        pass  # Can't detect OS, proceed with download attempt
+    pip_packages_dir = FILES_DIR / "pip_packages_dep"
+    deb_packages_dir = DEB_PACKAGES_DIR
     
-    DEB_PACKAGES_DIR.mkdir(parents=True, exist_ok=True)
+    has_pip = pip_packages_dir.exists() and len(list(pip_packages_dir.glob("*"))) > 0
+    has_deb = deb_packages_dir.exists() and len(list(deb_packages_dir.glob("*.deb"))) >= 5
     
-    # Check if we already have a reasonable set of packages
-    existing_debs = list(DEB_PACKAGES_DIR.glob("*.deb"))
-    if len(existing_debs) >= 10:  # Reasonable threshold - build-essential alone has many deps
-        # Check we have the critical ones
-        critical_found = 0
-        for pkg in REQUIRED_DEB_PACKAGES:
-            if list(DEB_PACKAGES_DIR.glob(f"{pkg}_*.deb")):
-                critical_found += 1
-        
-        if critical_found >= len(REQUIRED_DEB_PACKAGES) - 1:  # Allow one missing (might be meta-package)
-            print(f"✓ Using cached .deb packages from {DEB_PACKAGES_DIR} ({len(existing_debs)} files)")
-            return True
+    if has_pip:
+        pip_count = len(list(pip_packages_dir.glob("*")))
+        print(f"✓ Found {pip_count} cached pip packages in {pip_packages_dir}")
     
-    print(f"\nDownloading .deb packages for offline installation...")
-    print(f"  Packages: {', '.join(REQUIRED_DEB_PACKAGES)}")
+    if has_deb:
+        deb_count = len(list(deb_packages_dir.glob("*.deb")))
+        print(f"✓ Found {deb_count} cached deb packages in {deb_packages_dir}")
     
-    # Get list of all dependencies
-    print("  Resolving dependencies...")
-    deps_cmd = [
-        "apt-cache", "depends", "--recurse", "--no-recommends", "--no-suggests",
-        "--no-conflicts", "--no-breaks", "--no-replaces", "--no-enhances",
-    ] + REQUIRED_DEB_PACKAGES
+    if not has_pip and not has_deb:
+        print(f"ℹ No cached packages found in {FILES_DIR}")
+        print(f"  Switches will download packages from the internet")
+        print(f"  For airgapped deployment, run: python3 scripts/prep-airgapped.py")
     
-    try:
-        result = subprocess.run(deps_cmd, capture_output=True, text=True, timeout=120)
-        
-        # Parse the output to get package names
-        packages_to_download = set()
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line or line.startswith("<") or line.startswith("|"):
-                continue
-            if ":" in line:
-                parts = line.split(":", 1)
-                if len(parts) == 2:
-                    pkg = parts[1].strip()
-                    if pkg and not pkg.startswith("<"):
-                        packages_to_download.add(pkg)
-            else:
-                if line and not line.startswith("<"):
-                    packages_to_download.add(line)
-        
-        # Always include explicitly requested packages
-        for pkg in REQUIRED_DEB_PACKAGES:
-            packages_to_download.add(pkg)
-        
-        print(f"  Found {len(packages_to_download)} packages (including dependencies)")
-        
-        # Download each package
-        print("  Downloading packages...")
-        downloaded = 0
-        skipped = 0
-        
-        for pkg in sorted(packages_to_download):
-            if pkg.startswith("<") or pkg.startswith("|"):
-                continue
-            
-            # Check if already downloaded
-            existing = list(DEB_PACKAGES_DIR.glob(f"{pkg}_*.deb"))
-            if existing:
-                skipped += 1
-                continue
-            
-            dl_cmd = ["apt-get", "download", pkg]
-            dl_result = subprocess.run(
-                dl_cmd,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                cwd=str(DEB_PACKAGES_DIR)
-            )
-            
-            if dl_result.returncode == 0:
-                downloaded += 1
-        
-        # Count results
-        all_debs = list(DEB_PACKAGES_DIR.glob("*.deb"))
-        total_size = sum(f.stat().st_size for f in all_debs)
-        
-        print(f"  ✓ Downloaded {downloaded} new packages, {skipped} already present")
-        print(f"    Total: {len(all_debs)} .deb files ({total_size / (1024*1024):.1f} MB)")
-        
-        return True
-        
-    except subprocess.TimeoutExpired:
-        print("  ⚠ Timeout resolving/downloading packages")
-        return False
-    except Exception as e:
-        print(f"  ⚠ Error downloading .deb packages: {e}")
-        return False
+    return has_pip, has_deb
 
 
 def get_bcm_switches() -> List[Dict]:
