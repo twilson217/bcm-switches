@@ -1254,7 +1254,27 @@ class BCMDeployer:
     def _cm_lite_is_active(self, device: Dict) -> bool:
         """Check if cm-lite-daemon service is active on the device."""
         state = self._run_ssh_command(device["ip"], "systemctl is-active cm-lite-daemon 2>/dev/null || true")
-        return (state or "").strip() == "active"
+        return self._stdout_has_token(state, "active")
+
+    def _cm_lite_systemctl_show(self, device: Dict) -> Dict[str, str]:
+        """
+        Get key systemd properties for cm-lite-daemon as a dict.
+
+        Uses `systemctl show` (not `status`) so we can reliably parse state even when
+        SSH prints extra banner/MOTD output.
+        """
+        keys = ["ActiveState", "SubState", "Result", "ExecMainStatus", "NRestarts", "MainPID"]
+        cmd = "systemctl show cm-lite-daemon " + " ".join(f"-p {k}" for k in keys) + " 2>/dev/null || true"
+        out = self._run_ssh_command(device["ip"], cmd) or ""
+        props: Dict[str, str] = {}
+        for line in out.splitlines():
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k in keys:
+                props[k] = v.strip()
+        return props
 
     def _ensure_cm_lite_systemd_unit(self, device: Dict, *, enable: bool) -> bool:
         """
@@ -1289,7 +1309,7 @@ class BCMDeployer:
             return False
 
         # If /opt/cm-lite-daemon isn't present, we can't generate the unit from template.
-        if self._run_ssh_command(device["ip"], "test -d /opt/cm-lite-daemon && echo yes") != "yes":
+        if not self._stdout_has_token(self._run_ssh_command(device["ip"], "test -d /opt/cm-lite-daemon && echo yes"), "yes"):
             return False
 
         if self._cm_lite_unit_present(device):
@@ -1392,17 +1412,38 @@ class BCMDeployer:
                     print(f"        {line}")
             return False
 
-        # Poll a bit; first start can take time.
-        max_wait = 45
+        # Poll a bit; first start can take time. Require a *stable* running state
+        # (not a transient "active" between auto-restart cycles).
+        max_wait = 60
         interval = 3
+        stable_required = 2  # consecutive "running" observations
+        stable = 0
         waited = 0
+        last_props: Dict[str, str] = {}
         while waited <= max_wait:
-            if self._cm_lite_is_active(device):
-                return True
+            props = self._cm_lite_systemctl_show(device)
+            last_props = props
+            active = props.get("ActiveState")
+            sub = props.get("SubState")
+            result = props.get("Result")
+            exec_status = props.get("ExecMainStatus")
+
+            is_running = (active == "active" and sub == "running")
+            is_ok = (exec_status in (None, "", "0")) and (result in (None, "", "success"))
+
+            if is_running and is_ok:
+                stable += 1
+                if stable >= stable_required:
+                    return True
+            else:
+                stable = 0
+
             time.sleep(interval)
             waited += interval
 
         # Print debugging
+        if last_props:
+            print(f"    systemd state: {last_props}")
         status = _sudo("sudo systemctl status cm-lite-daemon --no-pager -l", timeout=45)
         journal = _sudo("sudo journalctl -u cm-lite-daemon --no-pager -n 200", timeout=45)
         print("    ✗ cm-lite-daemon is not active")
@@ -1488,12 +1529,14 @@ class BCMDeployer:
             return True
         
         # Try to add/update the device
+        props = BCMProps()
+        access_force = props.access_force_param  # BCM10: force, BCM11: "update in ztp"
         commands = [
             (f"{CMSH} -c 'device; add switch {hostname}; commit'", "Adding device"),
             (f"{CMSH} -c 'device; use {hostname}; set ip {device['ip']}; set mac {device['mac']}; "
              f"set network {network}; set hasclientdaemon yes; commit'", "Setting properties"),
             (f"{CMSH} -c 'device; use {hostname}; accesssettings; set username {self.username}; "
-             f"set password {self.password}; set -e force true; commit'", "Setting access"),
+             f"set password {self.password}; set -e \"{access_force}\" true; commit'", "Setting access"),
             (f"{CMSH} -c 'device; use {hostname}; ztpsettings; set enableapi yes; commit'", "Setting ZTP"),
             (f"{CMSH} -c 'device; use {hostname}; initialize'", "Initializing")
         ]
