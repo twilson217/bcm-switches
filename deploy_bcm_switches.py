@@ -1200,13 +1200,14 @@ class BCMDeployer:
     def check_transfer_complete(self, device: Dict) -> bool:
         """Check if all required files have been transferred to the device."""
         # Validate payload, not just existence:
-        # - zip is non-empty
+        # - cm-lite-daemon directory exists (we extract on BCM and rsync the directory so switches don't need unzip)
         # - pip dir exists and has at least 1 file
         # - if we have cached debs locally, require deb_packages on the switch too
         has_cached_debs = DEB_PACKAGES_DIR.exists() and len(list(DEB_PACKAGES_DIR.glob("*.deb"))) >= 5
 
         base_checks = (
-            f"test -s /home/{self.username}/cm-lite-daemon.zip && "
+            f"test -d /home/{self.username}/cm-lite-daemon && "
+            f"test -f /home/{self.username}/cm-lite-daemon/requirements.txt && "
             f"test -d /home/{self.username}/pip_packages_dep && "
             f"ls /home/{self.username}/pip_packages_dep/* >/dev/null 2>&1"
         )
@@ -1306,10 +1307,16 @@ class BCMDeployer:
         
         # Always use local files from .files/ directory (ensure_local_files() prepares them)
         local_zip = FILES_DIR / "cm-lite-daemon.zip"
+        local_dir = FILES_DIR / "cm-lite-daemon"
         pip_packages_dir = FILES_DIR / "pip_packages_dep"
         
         if not local_zip.exists():
             print(f"    ✗ cm-lite-daemon.zip not found in {FILES_DIR}")
+            print(f"      Run ensure_local_files() first or check your setup")
+            return False
+
+        if not local_dir.exists() or not (local_dir / "requirements.txt").exists():
+            print(f"    ✗ Extracted cm-lite-daemon/ not found in {FILES_DIR}")
             print(f"      Run ensure_local_files() first or check your setup")
             return False
         
@@ -1355,8 +1362,10 @@ class BCMDeployer:
                         return True
                 return False
             
-            if not run_rsync(str(local_zip), target, "Transferring cm-lite-daemon.zip"):
-                print(f"    ✗ Failed to transfer cm-lite-daemon.zip")
+            # Transfer extracted daemon directory so the switch doesn't need unzip
+            daemon_target = f"{self.username}@{device['ip']}:/home/{self.username}/cm-lite-daemon/"
+            if not run_rsync(str(local_dir) + "/", daemon_target, "Transferring cm-lite-daemon/ directory"):
+                print(f"    ✗ Failed to transfer cm-lite-daemon directory")
                 return False
             
             # pip packages need to go to pip_packages_dep/ subdirectory
@@ -1446,15 +1455,14 @@ class BCMDeployer:
         
         if has_pip_unzip and not has_sdists:
             # Best case: everything we need is already there or in wheel form
-            print(f"    ✓ python3-pip and unzip already installed, using wheel-only install")
+            print(f"    ✓ python3-pip available and wheelhouse is wheels-only, using wheel-only install")
             steps = [
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
-                ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
                 ("Installing Python packages (this may take a while)...", 
                  f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
                  f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
-                ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
             ]
         elif has_switch_debs:
             # Use cached deb packages from prep-airgapped.py (airgapped mode)
@@ -1466,12 +1474,11 @@ class BCMDeployer:
             steps = [
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
                 ("Installing dependencies (from cached packages)...", deb_install_cmd),
-                ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
                 ("Installing Python packages (this may take a while)...", 
                  f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
                  f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
-                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon.zip /home/{self.username}/deb_packages"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon /home/{self.username}/deb_packages"),
             ]
         elif has_pip_unzip and has_sdists:
             # Have pip/unzip but need build tools for sdists - try to install from internet
@@ -1480,12 +1487,11 @@ class BCMDeployer:
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
                 ("Updating package lists...", "sudo apt-get update -q 2>/dev/null || echo 'apt update failed'"),
                 ("Installing build tools...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev 2>/dev/null || echo 'build tools not available, will try wheel-only'"),
-                ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
                 ("Installing Python packages (this may take a while)...", 
                  f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
                  f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
-                ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
             ]
         else:
             # Need to install pip/unzip from internet
@@ -1494,12 +1500,11 @@ class BCMDeployer:
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
                 ("Updating package lists...", "sudo apt-get update -q"),
                 ("Installing dependencies...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev python3-pip unzip"),
-                ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
                 ("Installing Python packages (this may take a while)...", 
                  f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
                  f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
-                ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
             ]
         
         total_steps = len(steps)
@@ -1907,6 +1912,7 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
     FILES_DIR.mkdir(parents=True, exist_ok=True)
     
     cm_lite_zip = FILES_DIR / "cm-lite-daemon.zip"
+    cm_lite_dir = FILES_DIR / "cm-lite-daemon"
     pip_packages = FILES_DIR / "pip_packages_dep"
     
     # Default target if caller didn't detect versions.
@@ -1944,6 +1950,24 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
         else:
             print(f"  ✗ cm-lite-daemon.zip not found at {CM_LITE_ZIP_PATH}")
             return False
+
+    # Extract cm-lite-daemon on the BCM headnode so switches do NOT need 'unzip'.
+    # This also makes the transfer check more reliable (directory presence vs unzip success).
+    try:
+        needs_extract = (not cm_lite_dir.exists()) or (not (cm_lite_dir / "requirements.txt").exists())
+        if needs_extract:
+            if cm_lite_dir.exists():
+                shutil.rmtree(cm_lite_dir, ignore_errors=True)
+            print("  Extracting cm-lite-daemon.zip (so switches don't need unzip)...")
+            with zipfile.ZipFile(cm_lite_zip, "r") as zf:
+                zf.extractall(FILES_DIR)
+            if not (cm_lite_dir / "requirements.txt").exists():
+                print("  ✗ Extraction did not produce .files/cm-lite-daemon/requirements.txt")
+                return False
+            print("  ✓ Extracted cm-lite-daemon/")
+    except Exception as e:
+        print(f"  ✗ Failed to extract cm-lite-daemon.zip: {e}")
+        return False
     
     # Extract requirements and download pip packages if not present OR cache is incomplete.
     if needs_pip_rebuild:
