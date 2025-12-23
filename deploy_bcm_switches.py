@@ -1199,10 +1199,28 @@ class BCMDeployer:
     
     def check_transfer_complete(self, device: Dict) -> bool:
         """Check if all required files have been transferred to the device."""
-        # Check for both cm-lite-daemon.zip and pip_packages_dep directory
-        result = self._run_ssh_command(device['ip'], 
+        # Validate payload, not just existence:
+        # - zip is non-empty
+        # - pip dir exists and has at least 1 file
+        # - if we have cached debs locally, require deb_packages on the switch too
+        has_cached_debs = DEB_PACKAGES_DIR.exists() and len(list(DEB_PACKAGES_DIR.glob("*.deb"))) >= 5
+
+        base_checks = (
+            f"test -s /home/{self.username}/cm-lite-daemon.zip && "
             f"test -d /home/{self.username}/pip_packages_dep && "
-            f"test -f /home/{self.username}/cm-lite-daemon.zip && echo yes")
+            f"ls /home/{self.username}/pip_packages_dep/* >/dev/null 2>&1"
+        )
+        if has_cached_debs:
+            cmd = (
+                f"{base_checks} && "
+                f"test -d /home/{self.username}/deb_packages && "
+                f"ls /home/{self.username}/deb_packages/*.deb >/dev/null 2>&1 && "
+                f"echo yes"
+            )
+        else:
+            cmd = f"{base_checks} && echo yes"
+
+        result = self._run_ssh_command(device['ip'], cmd)
         return result == "yes"
     
     def check_daemon_registered(self, device: Dict) -> bool:
@@ -1443,8 +1461,7 @@ class BCMDeployer:
             print(f"    ✓ Using cached deb packages (airgapped mode)")
             deb_install_cmd = (
                 f"cd /home/{self.username}/deb_packages && "
-                f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q ./*.deb 2>/dev/null || "
-                f"echo 'some packages may already be installed'"
+                f"sudo DEBIAN_FRONTEND=noninteractive apt install -y ./*.deb"
             )
             steps = [
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
@@ -1504,11 +1521,16 @@ class BCMDeployer:
                 step_elapsed = time.time() - step_start
                 
                 if result.returncode != 0 and "already" not in result.stderr.lower():
-                    # Some non-critical errors are OK
-                    if "unzip" in cmd or "rm " in cmd:
+                    # Only cleanup commands (rm) are non-critical
+                    if cmd.startswith("rm ") or "rm -f" in cmd:
                         print(f" skipped ({step_elapsed:.1f}s)")
                         continue
                     print(f" FAILED ({step_elapsed:.1f}s)")
+                    # Extra hint for a common failure mode: unzip missing or zip missing/corrupt.
+                    if "unzip" in cmd:
+                        print("        Hint: 'unzip' failed. This often means:")
+                        print("          - unzip was not installed (cached-deb install may have failed)")
+                        print("          - /home/{u}/cm-lite-daemon.zip is missing or corrupted".format(u=self.username))
                     # Surface useful error output. SSH banners/warnings can pollute stderr/stdout,
                     # so print the tail of both to help pinpoint the real failure (pip, sudo, etc.).
                     stderr_tail = (result.stderr or "").strip()[-1200:]

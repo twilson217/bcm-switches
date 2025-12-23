@@ -265,6 +265,32 @@ def download_packages_on_switch(host: str, username: str, password: str,
     # Download any missing packages as source (for packages without wheels)
     pip_any_cmd = f"pip3 download -r {req_file} --dest {pip_dir} --no-deps 2>/dev/null || true"
     run_on_switch(host, username, password, pip_any_cmd, timeout=600, check=False)
+
+    # If we ended up with sdists (e.g., netifaces/uptime), build wheels NOW on the internet-connected
+    # prep switch so the airgapped deploy can stay wheel-only and avoid installing toolchains offline.
+    sdist_check_cmd = (
+        f"ls {pip_dir}/*.tar.gz {pip_dir}/*.tar.bz2 {pip_dir}/*.zip 2>/dev/null | wc -l"
+    )
+    sdist_count_result = run_on_switch(host, username, password, sdist_check_cmd, check=False)
+    try:
+        sdist_count = int((sdist_count_result.stdout or "").strip() or "0")
+    except ValueError:
+        sdist_count = 0
+
+    if sdist_count > 0:
+        print(f"    ⚠ Detected {sdist_count} source package(s); building wheels on {host}...")
+        # Ensure build deps exist on the prep switch (internet-connected).
+        run_on_switch(host, username, password, "sudo apt-get update -q", check=False, timeout=180)
+        run_on_switch(
+            host, username, password,
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev",
+            check=False, timeout=600
+        )
+        # Build wheels into the same pip_dir.
+        wheel_cmd = f"pip3 wheel -r {req_file} --wheel-dir {pip_dir} 2>/dev/null || true"
+        run_on_switch(host, username, password, wheel_cmd, timeout=900, check=False)
+        # Remove sdists so deploy won't attempt builds offline.
+        run_on_switch(host, username, password, f"rm -f {pip_dir}/*.tar.gz {pip_dir}/*.tar.bz2 {pip_dir}/*.zip", check=False)
     
     # Count pip packages and verify they exist
     result = run_on_switch(host, username, password, f"ls -la {pip_dir}/ 2>/dev/null | head -5", check=False)
@@ -316,9 +342,19 @@ def download_packages_on_switch(host: str, username: str, password: str,
         downloaded = 0
         failed = []
         
+        # Debug: show first few download attempts
+        debug_shown = 0
+        
         for pkg in sorted(packages_to_download):
-            dl_cmd = f"cd {deb_dir} && sudo apt-get download {pkg} 2>&1"
+            dl_cmd = f"cd {deb_dir} && apt-get download {pkg} 2>&1"
             dl_result = run_on_switch(host, username, password, dl_cmd, check=False, timeout=60)
+            
+            # Show debug for first few failures
+            if debug_shown < 3:
+                output = (dl_result.stdout or "").strip()[:200]
+                if dl_result.returncode != 0 or "E:" in output:
+                    print(f"    [DEBUG] {pkg}: rc={dl_result.returncode}, output={output}")
+                    debug_shown += 1
             
             # Check if download succeeded (look for .deb file or success message)
             if dl_result.returncode == 0 and "E:" not in (dl_result.stdout or ""):
