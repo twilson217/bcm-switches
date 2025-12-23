@@ -278,15 +278,32 @@ def download_packages_on_switch(host: str, username: str, password: str,
     # Download each package
     if result.returncode == 0 and result.stdout.strip():
         packages = result.stdout.strip().split("\n")
-        print(f"    Resolved {len(packages)} packages (including dependencies)")
-        
-        # Download in batches
+        # Filter out virtual packages and duplicates
+        valid_packages = []
         for pkg in packages:
             pkg = pkg.strip()
-            if not pkg or pkg.startswith("<") or pkg.startswith("|"):
-                continue
-            dl_cmd = f"cd {deb_dir} && apt-get download {pkg} 2>/dev/null || true"
-            run_on_switch(host, username, password, dl_cmd, check=False, timeout=60)
+            if pkg and not pkg.startswith("<") and not pkg.startswith("|") and not pkg.startswith(" "):
+                valid_packages.append(pkg)
+        valid_packages = list(set(valid_packages))  # Remove duplicates
+        
+        print(f"    Resolved {len(valid_packages)} packages (including dependencies)")
+        
+        # Download all packages at once (more efficient and shows errors better)
+        # apt-get download doesn't require sudo, but we need to be in the right directory
+        pkg_list = " ".join(valid_packages[:50])  # Limit to avoid command line too long
+        dl_cmd = f"cd {deb_dir} && apt-get download {pkg_list} 2>&1"
+        result = run_on_switch(host, username, password, dl_cmd, check=False, timeout=120)
+        
+        if result.returncode != 0 or "E:" in result.stdout:
+            print(f"    [DEBUG] apt-get download output: {result.stdout[:500] if result.stdout else 'none'}")
+            print(f"    [DEBUG] apt-get download stderr: {result.stderr[:500] if result.stderr else 'none'}")
+            
+            # Try with sudo if regular download failed
+            print("    Retrying with sudo...")
+            dl_cmd = f"cd {deb_dir} && sudo apt-get download {pkg_list} 2>&1"
+            result = run_on_switch(host, username, password, dl_cmd, check=False, timeout=120)
+            if result.returncode != 0 or "E:" in result.stdout:
+                print(f"    [DEBUG] sudo apt-get output: {result.stdout[:500] if result.stdout else 'none'}")
     
     # Count deb packages and verify they exist
     result = run_on_switch(host, username, password, f"ls -la {deb_dir}/ 2>/dev/null | head -5", check=False)
