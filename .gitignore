@@ -2,6 +2,7 @@
 .configs/
 .docs/
 
+
 # Local logs
 .logs/
 
