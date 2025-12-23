@@ -1238,9 +1238,43 @@ class BCMDeployer:
     
     def check_daemon_registered(self, device: Dict) -> bool:
         """Check if device is already registered with BCM (has certificates)."""
-        result = self._run_ssh_command(device['ip'], 
-            "test -f /opt/cm-lite-daemon/etc/bootstrap.key && echo yes")
+        # bootstrap.* just means we copied bootstrap files; it does NOT mean the node completed
+        # registration. A successful register_node run should produce cert.key + cert.pem.
+        result = self._run_ssh_command(
+            device["ip"],
+            "test -f /opt/cm-lite-daemon/etc/cert.key -a -f /opt/cm-lite-daemon/etc/cert.pem && echo yes",
+        )
         return self._stdout_has_token(result, "yes")
+
+    def _run_register_node(self, device: Dict) -> bool:
+        """Run register_node on the switch to (re)register and refresh certs."""
+        hostname = device.get("hostname", device.get("ip", "unknown"))
+        bcm_master_ip = self.get_bcm_master_ip()
+
+        ssh_base = ["sshpass", "-p", self.password, "ssh",
+                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                    f"{self.username}@{device['ip']}"]
+
+        cmd = (
+            f"cd /opt/cm-lite-daemon && "
+            f"sudo ./register_node --host {bcm_master_ip} --disable-cert-check --vrf {self.vrf}"
+        )
+        full_cmd = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
+        result = subprocess.run(full_cmd, input=f"{self.password}\n",
+                                capture_output=True, text=True, timeout=180)
+        if result.returncode == 0:
+            return True
+
+        print(f"    ✗ register_node failed on {hostname}")
+        stderr_tail = (result.stderr or "").strip()[-1500:]
+        stdout_tail = (result.stdout or "").strip()[-1500:]
+        if stdout_tail:
+            print("    register_node stdout (tail):")
+            print(stdout_tail)
+        if stderr_tail:
+            print("    register_node stderr (tail):")
+            print(stderr_tail)
+        return False
 
     def _cm_lite_unit_present(self, device: Dict) -> bool:
         """Check if cm-lite-daemon systemd unit exists on the device."""
@@ -1840,6 +1874,15 @@ class BCMDeployer:
             # Even if already registered, we still must ensure the systemd unit exists and
             # the service is running, otherwise BCM will show the switch as DOWN.
             print(f"    ✓ {device['hostname']} already registered with BCM, checking service...")
+            if self._ensure_cm_lite_service_running(device):
+                print(f"    ✓ Registration complete")
+                return True
+
+            # If the service is crash-looping, (re)run register_node to refresh certs/config,
+            # then try starting again.
+            print(f"    ⚠ Service not healthy; re-running register_node to repair...")
+            if not self._run_register_node(device):
+                return False
             if self._ensure_cm_lite_service_running(device):
                 print(f"    ✓ Registration complete")
                 return True
