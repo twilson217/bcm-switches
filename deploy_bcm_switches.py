@@ -1386,42 +1386,63 @@ class BCMDeployer:
                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                    f"{self.username}@{device['ip']}"]
         
-        # Check if we have local deb packages for offline installation
-        # This enables partially-airgapped deployment where switches don't need internet
-        deb_packages_check = self._run_ssh_command(device['ip'],
-            f"ls /home/{self.username}/deb_packages/*.deb 2>/dev/null | wc -l")
-        has_local_debs = False
+        # Check what packages are already installed on the switch
+        # Cumulus Linux often has python3-pip and unzip pre-installed
+        installed_check = self._run_ssh_command(device['ip'],
+            "dpkg -l python3-pip unzip 2>/dev/null | grep -c '^ii' || echo 0")
         try:
-            deb_count = int(deb_packages_check.strip())
-            has_local_debs = deb_count > 5  # Expect at least several .deb files
+            installed_count = int(installed_check.strip())
+            has_pip_unzip = installed_count >= 2
         except (ValueError, AttributeError):
-            pass
+            has_pip_unzip = False
         
-        # Commands with descriptions for progress feedback
-        # Note: Using apt-get instead of apt for stable CLI interface in scripts
-        if has_local_debs:
-            # Use local deb packages - no internet required on switch
-            deb_install_cmd = (
-                f"cd /home/{self.username}/deb_packages && "
-                f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q ./*.deb"
-            )
+        # Check if we have any sdist (source) packages that would need compilation
+        # If all packages are wheels (.whl), we don't need build-essential
+        pip_packages_dir = FILES_DIR / "pip_packages_dep"
+        has_sdists = False
+        if pip_packages_dir.exists():
+            sdist_extensions = ['.tar.gz', '.tar.bz2', '.zip']
+            for f in pip_packages_dir.iterdir():
+                if any(f.name.endswith(ext) for ext in sdist_extensions) and not f.name.endswith('.whl'):
+                    has_sdists = True
+                    break
+        
+        # Determine installation strategy
+        # Strategy 1: pip/unzip already installed + all wheels = no apt needed
+        # Strategy 2: missing packages = try apt (with internet or local debs)
+        
+        if has_pip_unzip and not has_sdists:
+            # Best case: everything we need is already there or in wheel form
+            print(f"    ✓ python3-pip and unzip already installed, using wheel-only install")
             steps = [
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
-                ("Installing build dependencies (from local packages)...", deb_install_cmd),
                 ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
                 ("Installing Python packages (this may take a while)...", 
                  f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
                  f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
-                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon.zip /home/{self.username}/deb_packages"),
+                ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
             ]
-        else:
-            # Fall back to internet-based apt install
-            print(f"    ⚠ No local .deb packages found, using apt-get from internet...")
+        elif has_pip_unzip and has_sdists:
+            # Have pip/unzip but need build tools for sdists - try to install just build-essential
+            print(f"    ⚠ Source packages detected, attempting to install build tools...")
             steps = [
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
-                ("Updating package lists...", "sudo apt-get update -q"),
-                ("Installing build dependencies...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev python3-pip unzip"),
+                ("Installing build tools (if available)...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev 2>/dev/null || echo 'build tools not available, will try wheel-only'"),
+                ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
+                ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
+                ("Installing Python packages (this may take a while)...", 
+                 f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
+                 f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
+                ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
+            ]
+        else:
+            # Need to install pip/unzip - requires internet or working local debs
+            print(f"    ⚠ Missing python3-pip or unzip, attempting apt install...")
+            steps = [
+                ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
+                ("Updating package lists...", "sudo apt-get update -q 2>/dev/null || echo 'apt update failed, trying cached packages'"),
+                ("Installing dependencies...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-pip unzip 2>/dev/null || echo 'some packages may be missing'"),
                 ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
                 ("Installing Python packages (this may take a while)...", 
@@ -2052,8 +2073,25 @@ def ensure_deb_packages() -> bool:
     Downloads build-essential, python3-dev, python3-pip, unzip and all their
     dependencies so they can be installed on switches without internet access.
     
+    NOTE: This only works if the BCM head node is Debian-based (like Cumulus).
+    Ubuntu packages are NOT compatible with Debian/Cumulus switches.
+    
     Returns True if packages are ready, False otherwise.
     """
+    # Check if we're on a Debian-compatible system
+    # Ubuntu packages won't work on Cumulus (Debian-based) due to version mismatches
+    try:
+        with open("/etc/os-release") as f:
+            os_release = f.read().lower()
+        if "ubuntu" in os_release:
+            print(f"\n⚠ Skipping .deb package download: BCM head node is Ubuntu-based")
+            print(f"  Ubuntu packages are incompatible with Cumulus Linux (Debian-based)")
+            print(f"  The installer will check if required packages are already on switches")
+            print(f"  (python3-pip and unzip are typically pre-installed on Cumulus)")
+            return False
+    except FileNotFoundError:
+        pass  # Can't detect OS, proceed with download attempt
+    
     DEB_PACKAGES_DIR.mkdir(parents=True, exist_ok=True)
     
     # Check if we already have a reasonable set of packages
