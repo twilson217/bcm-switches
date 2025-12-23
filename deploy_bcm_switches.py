@@ -1191,11 +1191,23 @@ class BCMDeployer:
         except:
             pass
         return None
+
+    @staticmethod
+    def _stdout_has_token(output: Optional[str], token: str) -> bool:
+        """
+        Return True if stdout contains a line that exactly matches token.
+
+        Some Cumulus environments print extra informational text on non-interactive SSH
+        (e.g. last reboot cause), which can pollute stdout and break strict equality checks.
+        """
+        if not output:
+            return False
+        return any(line.strip() == token for line in output.splitlines())
     
     def check_daemon_installed(self, device: Dict) -> bool:
         """Check if cm-lite-daemon is already installed on the device."""
         result = self._run_ssh_command(device['ip'], "test -d /opt/cm-lite-daemon && echo yes")
-        return result == "yes"
+        return self._stdout_has_token(result, "yes")
     
     def check_transfer_complete(self, device: Dict) -> bool:
         """Check if all required files have been transferred to the device."""
@@ -1222,23 +1234,22 @@ class BCMDeployer:
             cmd = f"{base_checks} && echo yes"
 
         result = self._run_ssh_command(device['ip'], cmd)
-        return result == "yes"
+        return self._stdout_has_token(result, "yes")
     
     def check_daemon_registered(self, device: Dict) -> bool:
         """Check if device is already registered with BCM (has certificates)."""
         result = self._run_ssh_command(device['ip'], 
             "test -f /opt/cm-lite-daemon/etc/bootstrap.key && echo yes")
-        return result == "yes"
+        return self._stdout_has_token(result, "yes")
 
     def _cm_lite_unit_present(self, device: Dict) -> bool:
         """Check if cm-lite-daemon systemd unit exists on the device."""
         unit_check = self._run_ssh_command(
             device["ip"],
-            "test -f /etc/systemd/system/cm-lite-daemon.service && echo yes || "
-            "test -f /usr/lib/systemd/system/cm-lite-daemon.service && echo yes || "
-            "test -f /lib/systemd/system/cm-lite-daemon.service && echo yes || echo no",
+            'for p in /etc/systemd/system/cm-lite-daemon.service /usr/lib/systemd/system/cm-lite-daemon.service '
+            '/lib/systemd/system/cm-lite-daemon.service; do [ -f "$p" ] && echo yes && exit 0; done; echo no',
         )
-        return unit_check == "yes"
+        return self._stdout_has_token(unit_check, "yes")
 
     def _cm_lite_is_active(self, device: Dict) -> bool:
         """Check if cm-lite-daemon service is active on the device."""
@@ -1351,6 +1362,20 @@ class BCMDeployer:
 
         if not self._ensure_cm_lite_systemd_unit(device, enable=True):
             return False
+
+        # Ensure entrypoint is executable (defensive repair for older transfers/extractions).
+        _sudo(
+            "sudo chmod 755 "
+            "/opt/cm-lite-daemon/cm-lite-daemon "
+            "/opt/cm-lite-daemon/cm-lite-daemon_ctl "
+            "/opt/cm-lite-daemon/register_node "
+            "/opt/cm-lite-daemon/unregister_node "
+            "/opt/cm-lite-daemon/request_certificate "
+            "/opt/cm-lite-daemon/connection_test "
+            "/opt/cm-lite-daemon/install-required-pip-packages "
+            "2>/dev/null || true",
+            timeout=45,
+        )
 
         start_res = _sudo("sudo systemctl start cm-lite-daemon", timeout=60)
         if start_res.returncode != 0:
@@ -1602,11 +1627,11 @@ class BCMDeployer:
             # Verify Python deps are installed by checking if we can import a key module
             check_result = self._run_ssh_command(device['ip'], 
                 "python3 -c 'import websocket' 2>/dev/null && echo ok")
-            if check_result == "ok":
+            if self._stdout_has_token(check_result, "ok"):
                 # If unit/service is missing, don't "skip" — repair it.
                 if not self._cm_lite_unit_present(device):
                     print(f"    ⚠ cm-lite-daemon installed but systemd unit missing; repairing...")
-                    if not self._ensure_cm_lite_systemd_unit(device, enable=False):
+                    if not self._ensure_cm_lite_systemd_unit(device, enable=True):
                         print(f"    ✗ Failed to install systemd unit")
                         return False
                 print(f"    ✓ cm-lite-daemon already installed on {device['hostname']}, skipping")
@@ -1622,7 +1647,10 @@ class BCMDeployer:
         #
         # NOTE: We no longer require 'unzip' on the switch because we extract cm-lite-daemon on the
         # BCM head node and rsync the extracted directory.
-        has_pip = (self._run_ssh_command(device['ip'], "python3 -m pip --version >/dev/null 2>&1 && echo yes") == "yes")
+        has_pip = self._stdout_has_token(
+            self._run_ssh_command(device['ip'], "python3 -m pip --version >/dev/null 2>&1 && echo yes"),
+            "yes",
+        )
         
         # Check if we have cached deb packages (from prep-airgapped.py)
         deb_packages_dir = DEB_PACKAGES_DIR
@@ -2122,6 +2150,24 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
             if not (cm_lite_dir / "requirements.txt").exists():
                 print("  ✗ Extraction did not produce .files/cm-lite-daemon/requirements.txt")
                 return False
+            # Ensure expected entrypoints are executable. Some zip distributions lose +x bits
+            # depending on how they were created/extracted, which causes systemd ExecStart
+            # to fail with "Permission denied".
+            for rel in [
+                "cm-lite-daemon",
+                "cm-lite-daemon_ctl",
+                "register_node",
+                "unregister_node",
+                "request_certificate",
+                "connection_test",
+                "install-required-pip-packages",
+            ]:
+                p = cm_lite_dir / rel
+                try:
+                    if p.exists():
+                        p.chmod(p.stat().st_mode | 0o111)
+                except Exception:
+                    pass
             print("  ✓ Extracted cm-lite-daemon/")
     except Exception as e:
         print(f"  ✗ Failed to extract cm-lite-daemon.zip: {e}")
