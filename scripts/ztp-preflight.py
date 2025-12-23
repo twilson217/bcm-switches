@@ -22,6 +22,9 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# BCM version compatibility
+from bcm_compat import BCMProps, get_bcm_version, get_cmsh_cmd
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FILES_DIR = REPO_ROOT / ".files"
@@ -37,7 +40,7 @@ DHCPD_CONF_DIR = Path("/etc")
 
 def _run_cmsh(cmsh_cmd: str, *, timeout: int = 60) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["cmsh", "-c", cmsh_cmd],
+        [get_cmsh_cmd(), "-c", cmsh_cmd],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -88,7 +91,7 @@ def _parse_bcm_switch_list(output: str) -> List[Dict]:
 
 
 def _get_bcm_switches() -> List[Dict]:
-    r = subprocess.run(["cmsh", "-c", "device;list -t switch"], capture_output=True, text=True, timeout=60)
+    r = subprocess.run([get_cmsh_cmd(), "-c", "device;list -t switch"], capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "cmsh device list failed")
     return _parse_bcm_switch_list(r.stdout)
@@ -244,12 +247,14 @@ def _config_checks(dev: Dict) -> Tuple[bool, List[str], List[str]]:
         lines.append(_missing("Device hostname", "missing hostname (cannot query BCM device object)")[1])
         return (False, lines, manual)
 
-    cmode = _norm_cmsh_val(_cmsh_get(hostname, "cumulusmode"))
-    cfile = _norm_cmsh_val(_cmsh_get(hostname, "cumulusfile"))
-    ok, msg = _check("BCM device.cumulusmode == FILE", cmode == "file", f"current='{cmode or '(empty)'}'")
-    lines.append(msg if ok else _missing("BCM device.cumulusmode", f"current='{cmode or '(empty)'}', expected 'file'")[1])
-    ok, msg = _check("BCM device.cumulusfile == startup.yaml", cfile == "startup.yaml", f"current='{cfile or '(empty)'}'")
-    lines.append(msg if ok else _missing("BCM device.cumulusfile", f"current='{cfile or '(empty)'}', expected 'startup.yaml'")[1])
+    # BCM 10 uses cumulusmode/cumulusfile, BCM 11 uses nvconfigurationmode/nvconfigurationfile
+    props = BCMProps()
+    cmode = _norm_cmsh_val(_cmsh_get(hostname, props.config_mode))
+    cfile = _norm_cmsh_val(_cmsh_get(hostname, props.config_file))
+    ok, msg = _check(f"BCM device.{props.config_mode} == FILE", cmode == "file", f"current='{cmode or '(empty)'}'")
+    lines.append(msg if ok else _missing(f"BCM device.{props.config_mode}", f"current='{cmode or '(empty)'}', expected 'file'")[1])
+    ok, msg = _check(f"BCM device.{props.config_file} == startup.yaml", cfile == "startup.yaml", f"current='{cfile or '(empty)'}'")
+    lines.append(msg if ok else _missing(f"BCM device.{props.config_file}", f"current='{cfile or '(empty)'}', expected 'startup.yaml'")[1])
 
     staged = BCM_SWITCH_HTDOCS_DIR / hostname / "startup.yaml"
     if staged.exists():

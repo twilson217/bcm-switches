@@ -22,6 +22,9 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# BCM version compatibility
+from bcm_compat import BCMProps, get_bcm_version, get_cmsh_cmd
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / ".configs"
@@ -111,7 +114,7 @@ def _set_env_password(pw: str) -> None:
 
 def _run_cmsh(cmsh_cmd: str, *, timeout: int = 60) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["cmsh", "-c", cmsh_cmd],
+        [get_cmsh_cmd(), "-c", cmsh_cmd],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -193,7 +196,7 @@ def _read_devices_from_csv(csv_path: Path) -> List[Dict]:
 
 
 def _get_bcm_switches() -> List[Dict]:
-    r = subprocess.run(["cmsh", "-c", "device;list -t switch"], capture_output=True, text=True, timeout=60)
+    r = subprocess.run([get_cmsh_cmd(), "-c", "device;list -t switch"], capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "cmsh device list failed")
     return _parse_bcm_switch_list(r.stdout)
@@ -339,9 +342,11 @@ def _stage_startup_yaml(
 
 
 def _cmsh_set_file_mode(hostname: str) -> None:
-    r = _run_cmsh(f"device; use {hostname}; set cumulusmode file; set cumulusfile startup.yaml; commit")
+    # BCM 10 uses cumulusmode/cumulusfile, BCM 11 uses nvconfigurationmode/nvconfigurationfile
+    props = BCMProps()
+    r = _run_cmsh(f"device; use {hostname}; set {props.config_mode} file; set {props.config_file} startup.yaml; commit")
     if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or r.stdout.strip() or "cmsh set cumulusmode/file failed")
+        raise RuntimeError(r.stderr.strip() or r.stdout.strip() or f"cmsh set {props.config_mode}/{props.config_file} failed")
 
 
 def _cmsh_initialize(hostname: str) -> None:
@@ -508,7 +513,8 @@ def main() -> int:
 
         try:
             _cmsh_set_file_mode(dev["hostname"])
-            print("  - BCM: set cumulusmode=file, cumulusfile=startup.yaml")
+            props = BCMProps()
+            print(f"  - BCM: set {props.config_mode}=file, {props.config_file}=startup.yaml")
             _cmsh_initialize(dev["hostname"])
             print("  - BCM: initialize complete")
         except Exception as e:

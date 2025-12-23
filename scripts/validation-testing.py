@@ -35,6 +35,12 @@ import getpass
 import shlex
 from typing import Dict, List, Optional, Tuple
 
+# BCM version compatibility
+from bcm_compat import BCMProps, get_bcm_version, get_cmsh_cmd
+
+# cmsh command - use full path to avoid dependency on 'module load cmsh'
+CMSH = get_cmsh_cmd()
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -334,7 +340,7 @@ class BCMDeviceValidator:
     def _load_device_info(self):
         """Load device info from BCM."""
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; show' 2>/dev/null"
+            f"{CMSH} -c 'device; use {self.hostname}; show' 2>/dev/null"
         )
         if rc == 0:
             for line in out.split('\n'):
@@ -348,7 +354,7 @@ class BCMDeviceValidator:
     def check_device_exists(self) -> CheckResult:
         """Check if device exists in BCM."""
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; get hostname' 2>/dev/null"
+            f"{CMSH} -c 'device; use {self.hostname}; get hostname' 2>/dev/null"
         )
         if self.hostname in out:
             return CheckResult(
@@ -366,7 +372,7 @@ class BCMDeviceValidator:
     def check_device_status(self) -> CheckResult:
         """Check device status in BCM."""
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; get status' 2>/dev/null"
+            f"{CMSH} -c 'device; use {self.hostname}; get status' 2>/dev/null"
         )
         status = out.strip()
         
@@ -401,22 +407,23 @@ class BCMDeviceValidator:
         )
     
     def check_cumulus_mode(self) -> CheckResult:
-        """Check if cumulusmode is set to MANUAL."""
+        """Check if config mode is set to MANUAL (BCM 10: cumulusmode, BCM 11: nvconfigurationmode)."""
+        props = BCMProps()
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; get cumulusmode' 2>/dev/null"
+            f"{CMSH} -c 'device; use {self.hostname}; get {props.config_mode}' 2>/dev/null"
         )
         mode = out.strip().upper()
         
         if 'MANUAL' in mode:
             return CheckResult(
-                name="Cumulus mode",
+                name="Config mode",
                 passed=True,
-                message="cumulusmode is MANUAL (monitoring-only)"
+                message=f"{props.config_mode} is MANUAL (monitoring-only)"
             )
         return CheckResult(
-            name="Cumulus mode",
+            name="Config mode",
             passed=False,
-            message=f"cumulusmode is {mode}, expected MANUAL",
+            message=f"{props.config_mode} is {mode}, expected MANUAL",
             details="Run deploy script to set monitoring-only mode",
             severity="warning"
         )
@@ -424,7 +431,7 @@ class BCMDeviceValidator:
     def check_ztp_disabled(self) -> CheckResult:
         """Check if ZTP 'run on each boot' is disabled in BCM."""
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; ztpsettings; "
+            f"{CMSH} -c 'device; use {self.hostname}; ztpsettings; "
             f"get runztponeachboot' 2>/dev/null"
         )
         
@@ -445,7 +452,7 @@ class BCMDeviceValidator:
     def check_has_client_daemon(self) -> CheckResult:
         """Check if hasclientdaemon is set."""
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; get hasclientdaemon' 2>/dev/null"
+            f"{CMSH} -c 'device; use {self.hostname}; get hasclientdaemon' 2>/dev/null"
         )
         
         if 'yes' in out.lower():
@@ -1003,7 +1010,7 @@ Examples:
         switches = read_csv_file(csv_path)
     else:
         # Try to get switches from BCM
-        rc, out, err = run_cmd("cmsh -c 'device; list' 2>/dev/null")
+        rc, out, err = run_cmd(f"{CMSH} -c 'device; list' 2>/dev/null")
         if rc == 0:
             for line in out.split('\n'):
                 if 'Switch' in line:

@@ -52,6 +52,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# BCM version compatibility
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from bcm_compat import BCMProps, get_bcm_version, get_cmsh_cmd
+
+# cmsh command - use full path to avoid dependency on "module load cmsh"
+CMSH = get_cmsh_cmd()
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -517,11 +524,11 @@ def add_devices_to_bcm_only(csv_path: Path, username: str, password: str) -> boo
             
             # Add device to BCM using cmsh
             cmds = [
-                f"cmsh -c 'device; add switch {hostname}; commit'",
-                f"cmsh -c \"device; use {hostname}; set ip {ip}; set mac {mac}; set network {network}; set hasclientdaemon yes; commit\"",
-                f"cmsh -c \"device; use {hostname}; accesssettings; set username {username}; set password {password}; set -e force true; commit\"",
-                f"cmsh -c \"device; use {hostname}; ztpsettings; set enableapi yes; commit\"",
-                f"cmsh -c \"device; use {hostname}; initialize\"",
+                f"{CMSH} -c 'device; add switch {hostname}; commit'",
+                f"{CMSH} -c \"device; use {hostname}; set ip {ip}; set mac {mac}; set network {network}; set hasclientdaemon yes; commit\"",
+                f"{CMSH} -c \"device; use {hostname}; accesssettings; set username {username}; set password {password}; set -e {BCMProps().access_force_param} yes; commit\"",
+                f"{CMSH} -c \"device; use {hostname}; ztpsettings; set enableapi yes; commit\"",
+                f"{CMSH} -c \"device; use {hostname}; initialize\"",
             ]
             for cmd in cmds:
                 res = subprocess.run(cmd, shell=True, capture_output=True, text=True)

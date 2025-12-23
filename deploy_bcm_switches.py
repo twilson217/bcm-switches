@@ -32,6 +32,10 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Add scripts directory to path for bcm_compat import
+sys.path.insert(0, str(Path(__file__).parent / "scripts"))
+from bcm_compat import BCMProps, get_bcm_version, get_cmsh_cmd
+
 
 # Constants
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -40,6 +44,9 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 CSV_FILE = CONFIG_DIR / "bcm_switches.csv"
 FILES_DIR = SCRIPT_DIR / ".files"
 CM_LITE_ZIP_PATH = Path("/cm/shared/apps/cm-lite-daemon-dist/cm-lite-daemon.zip")
+
+# cmsh command - use full path to avoid dependency on 'module load cmsh'
+CMSH = get_cmsh_cmd()
 
 # Password handling:
 # - Never persist real passwords in .configs/config.json (store a placeholder instead)
@@ -1197,7 +1204,7 @@ class BCMDeployer:
         """Check if device already exists in BCM by hostname."""
         try:
             result = subprocess.run(
-                f"cmsh -c 'device; use {hostname}; get hostname'",
+                f"{CMSH} -c 'device; use {hostname}; get hostname'",
                 shell=True, capture_output=True, text=True
             )
             return result.returncode == 0 and hostname in result.stdout
@@ -1228,13 +1235,13 @@ class BCMDeployer:
         
         # Try to add/update the device
         commands = [
-            (f"cmsh -c 'device; add switch {hostname}; commit'", "Adding device"),
-            (f"cmsh -c 'device; use {hostname}; set ip {device['ip']}; set mac {device['mac']}; "
+            (f"{CMSH} -c 'device; add switch {hostname}; commit'", "Adding device"),
+            (f"{CMSH} -c 'device; use {hostname}; set ip {device['ip']}; set mac {device['mac']}; "
              f"set network {network}; set hasclientdaemon yes; commit'", "Setting properties"),
-            (f"cmsh -c 'device; use {hostname}; accesssettings; set username {self.username}; "
+            (f"{CMSH} -c 'device; use {hostname}; accesssettings; set username {self.username}; "
              f"set password {self.password}; set -e force true; commit'", "Setting access"),
-            (f"cmsh -c 'device; use {hostname}; ztpsettings; set enableapi yes; commit'", "Setting ZTP"),
-            (f"cmsh -c 'device; use {hostname}; initialize'", "Initializing")
+            (f"{CMSH} -c 'device; use {hostname}; ztpsettings; set enableapi yes; commit'", "Setting ZTP"),
+            (f"{CMSH} -c 'device; use {hostname}; initialize'", "Initializing")
         ]
         
         for cmd, description in commands:
@@ -1557,19 +1564,24 @@ def configure_monitoring_only_mode(devices: List[Dict], dry_run: bool = False) -
     """Configure switches for monitoring-only mode in BCM.
     
     This sets:
-    1. cumulusmode = manual (BCM won't push config to switches)
+    1. cumulusmode/nvconfigurationmode = manual (BCM won't push config to switches)
     2. runztponeachboot = no (ZTP won't run on every boot)
     
     The result is non-disruptive monitoring:
     - cm-lite-daemon provides metrics to BCM
     - BCM doesn't change anything on the switches
     - ZTP config remains in BCM for future disaster recovery use
+    
+    Note: BCM 10 uses cumulusmode, BCM 11 uses nvconfigurationmode
     """
     if not devices:
         return True
     
+    # BCM 10 uses cumulusmode, BCM 11 uses nvconfigurationmode
+    props = BCMProps()
+    
     print("\nConfiguring switches for monitoring-only mode...")
-    print("  - Setting cumulusmode to 'manual' (no auto-config push)")
+    print(f"  - Setting {props.config_mode} to 'manual' (no auto-config push)")
     print("  - Disabling 'run ZTP on each boot' (no boot-time provisioning)")
     
     if dry_run:
@@ -1581,10 +1593,10 @@ def configure_monitoring_only_mode(devices: List[Dict], dry_run: bool = False) -
     success_count = 0
     for hostname in hostnames:
         try:
-            # Set cumulusmode to manual AND disable ZTP run on each boot
+            # Set config mode to manual AND disable ZTP run on each boot
             # Using a single cmsh command for efficiency
-            cmd = (f"cmsh -c \"device; use {hostname}; "
-                   f"set cumulusmode manual; "
+            cmd = (f"{CMSH} -c \"device; use {hostname}; "
+                   f"set {props.config_mode} manual; "
                    f"ztpsettings; set runztponeachboot no; "
                    f"exit; commit\"")
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)

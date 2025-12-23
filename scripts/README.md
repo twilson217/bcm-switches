@@ -148,7 +148,7 @@ Comprehensive validation of BCM switch deployment. Checks both BCM-side and swit
 *Per-Switch BCM Checks:*
 - Device exists in BCM
 - Device status (UP vs INSTALLER_UNREACHABLE)
-- `cumulusmode` set to MANUAL (monitoring-only)
+- Config mode set to MANUAL (BCM 10: `cumulusmode`, BCM 11: `nvconfigurationmode`)
 - ZTP "run on each boot" disabled
 - `hasclientdaemon` set
 - Network assignment
@@ -199,8 +199,8 @@ to:
 - `/cm/local/apps/cmd/etc/htdocs/switch/<switch>/startup.yaml` (on BCM)
 
 It also sets in BCM:
-- `cumulusmode=file`
-- `cumulusfile=startup.yaml`
+- Config mode = file (BCM 10: `cumulusmode`, BCM 11: `nvconfigurationmode`)
+- Config file = startup.yaml (BCM 10: `cumulusfile`, BCM 11: `nvconfigurationfile`)
 and runs:
 - `cmsh -c "device; use <switch>; initialize"`
 
