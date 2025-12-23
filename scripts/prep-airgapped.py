@@ -175,24 +175,36 @@ def copy_from_switch(host: str, username: str, password: str,
                      remote_path: str, local_path: str) -> bool:
     """Copy files from a remote switch to local system."""
     if host == "localhost":
-        if Path(remote_path).exists():
-            if Path(remote_path).is_dir():
-                shutil.copytree(remote_path, local_path, dirs_exist_ok=True)
+        if Path(remote_path.rstrip('/')).exists():
+            src = Path(remote_path.rstrip('/'))
+            if src.is_dir():
+                shutil.copytree(src, local_path, dirs_exist_ok=True)
             else:
-                shutil.copy2(remote_path, local_path)
+                shutil.copy2(src, local_path)
             return True
+        print(f"      [DEBUG] Local path not found: {remote_path}")
         return False
     else:
         # Use rsync for remote copy
+        # Ensure local_path ends with / for directory copy
+        local_target = str(local_path)
+        if not local_target.endswith('/'):
+            local_target += '/'
+        
         rsync_cmd = [
             "sshpass", "-p", password,
-            "rsync", "-avz",
+            "rsync", "-avz", "--progress",
             "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
             f"{username}@{host}:{remote_path}",
-            local_path
+            local_target
         ]
         result = subprocess.run(rsync_cmd, capture_output=True, text=True, timeout=300)
-        return result.returncode == 0
+        
+        if result.returncode != 0:
+            print(f"      [DEBUG] rsync failed: {result.stderr[:500] if result.stderr else 'no error output'}")
+            return False
+        
+        return True
 
 
 def download_packages_on_switch(host: str, username: str, password: str,
@@ -240,7 +252,11 @@ def download_packages_on_switch(host: str, username: str, password: str,
     pip_any_cmd = f"pip3 download -r {req_file} --dest {pip_dir} --no-deps 2>/dev/null || true"
     run_on_switch(host, username, password, pip_any_cmd, timeout=600, check=False)
     
-    # Count pip packages
+    # Count pip packages and verify they exist
+    result = run_on_switch(host, username, password, f"ls -la {pip_dir}/ 2>/dev/null | head -5", check=False)
+    if result.stdout:
+        print(f"    [DEBUG] pip_dir contents: {result.stdout.strip()[:200]}")
+    
     result = run_on_switch(host, username, password, f"ls {pip_dir}/*.whl 2>/dev/null | wc -l")
     wheel_count = int(result.stdout.strip() or "0")
     result = run_on_switch(host, username, password, f"ls {pip_dir}/* 2>/dev/null | wc -l")
@@ -272,7 +288,11 @@ def download_packages_on_switch(host: str, username: str, password: str,
             dl_cmd = f"cd {deb_dir} && apt-get download {pkg} 2>/dev/null || true"
             run_on_switch(host, username, password, dl_cmd, check=False, timeout=60)
     
-    # Count deb packages
+    # Count deb packages and verify they exist
+    result = run_on_switch(host, username, password, f"ls -la {deb_dir}/ 2>/dev/null | head -5", check=False)
+    if result.stdout:
+        print(f"    [DEBUG] deb_dir contents: {result.stdout.strip()[:200]}")
+    
     result = run_on_switch(host, username, password, f"ls {deb_dir}/*.deb 2>/dev/null | wc -l")
     deb_count = int(result.stdout.strip() or "0")
     print(f"    ✓ Downloaded {deb_count} deb packages")
