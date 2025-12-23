@@ -264,51 +264,35 @@ def download_packages_on_switch(host: str, username: str, password: str,
     print(f"    ✓ Downloaded {total_count} pip packages ({wheel_count} wheels)")
     
     # Download deb packages
-    # Only download the packages we explicitly need - base system deps are already on Cumulus
+    # Strategy: Install packages on switch, then copy from apt cache
     print("    Downloading deb packages...")
     
-    # First, update package lists to ensure we have latest info
+    # First, update package lists
     print("    Running apt-get update...")
     update_cmd = "sudo apt-get update -q 2>&1 | tail -3"
     run_on_switch(host, username, password, update_cmd, check=False, timeout=120)
     
-    # Download only the top-level packages we need (not all dependencies)
-    # Dependencies like libc6, gcc-12-base etc. are already on Cumulus
-    packages_to_download = REQUIRED_DEB_PACKAGES.copy()
+    # Install the packages we need (this downloads them to apt cache)
+    # Using --reinstall to ensure .deb files are in cache even if already installed
+    pkg_list = " ".join(REQUIRED_DEB_PACKAGES)
+    print(f"    Installing: {pkg_list}")
+    install_cmd = f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall -d {pkg_list} 2>&1"
+    result = run_on_switch(host, username, password, install_cmd, check=False, timeout=300)
     
-    print(f"    Downloading: {', '.join(packages_to_download)}")
+    if "E:" in (result.stdout or ""):
+        print(f"    [DEBUG] apt-get install output: {result.stdout[:500] if result.stdout else 'none'}")
     
-    # Download each package individually to handle errors gracefully
-    downloaded = 0
-    for pkg in packages_to_download:
-        dl_cmd = f"cd {deb_dir} && apt-get download {pkg} 2>&1"
-        result = run_on_switch(host, username, password, dl_cmd, check=False, timeout=60)
-        
-        if result.returncode == 0 and "E:" not in (result.stdout or ""):
-            downloaded += 1
-        else:
-            # Check if it's a metapackage (no .deb to download)
-            check_cmd = f"apt-cache show {pkg} 2>/dev/null | grep -E '^Filename:' | head -1"
-            check_result = run_on_switch(host, username, password, check_cmd, check=False)
-            
-            if "Filename:" in (check_result.stdout or ""):
-                print(f"    ⚠ Failed to download {pkg}: {(result.stdout or '')[:100]}")
-            else:
-                print(f"    ℹ {pkg} is a metapackage (no .deb file)")
+    # Copy .deb files from apt cache to our temp directory
+    print("    Copying from apt cache...")
+    copy_cmd = f"cp /var/cache/apt/archives/*.deb {deb_dir}/ 2>/dev/null; ls {deb_dir}/*.deb 2>/dev/null | wc -l"
+    result = run_on_switch(host, username, password, copy_cmd, check=False)
     
-    # Also try to get the direct dependencies of build-essential that have .deb files
-    print("    Getting build-essential components...")
-    deps_cmd = "apt-cache depends build-essential 2>/dev/null | grep 'Depends:' | awk '{print $2}'"
-    result = run_on_switch(host, username, password, deps_cmd, check=False)
-    
-    if result.returncode == 0 and result.stdout.strip():
-        for dep in result.stdout.strip().split("\n"):
-            dep = dep.strip()
-            if dep and not dep.startswith("<"):
-                dl_cmd = f"cd {deb_dir} && apt-get download {dep} 2>&1"
-                dl_result = run_on_switch(host, username, password, dl_cmd, check=False, timeout=60)
-                if dl_result.returncode == 0 and "E:" not in (dl_result.stdout or ""):
-                    downloaded += 1
+    try:
+        cached_count = int(result.stdout.strip().split('\n')[-1])
+        if cached_count > 0:
+            print(f"    ✓ Found {cached_count} packages in apt cache")
+    except:
+        pass
     
     # Count deb packages and verify they exist
     result = run_on_switch(host, username, password, f"ls -la {deb_dir}/ 2>/dev/null | head -5", check=False)
