@@ -493,6 +493,12 @@ The packages will be downloaded ON that switch to ensure compatibility.
         print(f"✓ Cumulus Linux {version} detected")
     else:
         # Need credentials for remote access
+        if username == "cumulus" and not args.non_interactive:
+            # Prompt for username (show default)
+            user_input = input(f"Enter username for {switch_host} [cumulus]: ").strip()
+            if user_input:
+                username = user_input
+        
         if password is None:
             if args.non_interactive:
                 print("Error: --password is required for remote switches in non-interactive mode")
