@@ -264,7 +264,7 @@ def download_packages_on_switch(host: str, username: str, password: str,
     print(f"    ✓ Downloaded {total_count} pip packages ({wheel_count} wheels)")
     
     # Download deb packages
-    # Strategy: Install packages on switch, then copy from apt cache
+    # Strategy: Use dry-run to get full dependency list, then download each package
     print("    Downloading deb packages...")
     
     # First, update package lists
@@ -272,27 +272,49 @@ def download_packages_on_switch(host: str, username: str, password: str,
     update_cmd = "sudo apt-get update -q 2>&1 | tail -3"
     run_on_switch(host, username, password, update_cmd, check=False, timeout=120)
     
-    # Install the packages we need (this downloads them to apt cache)
-    # Using --reinstall to ensure .deb files are in cache even if already installed
+    # Use dry-run to get the complete list of packages that would be installed
     pkg_list = " ".join(REQUIRED_DEB_PACKAGES)
-    print(f"    Installing: {pkg_list}")
-    install_cmd = f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall -d {pkg_list} 2>&1"
-    result = run_on_switch(host, username, password, install_cmd, check=False, timeout=300)
+    print(f"    Resolving dependencies for: {pkg_list}")
     
-    if "E:" in (result.stdout or ""):
-        print(f"    [DEBUG] apt-get install output: {result.stdout[:500] if result.stdout else 'none'}")
+    # apt-get install --dry-run shows all packages that would be installed
+    dryrun_cmd = f"apt-get install --dry-run {pkg_list} 2>&1"
+    result = run_on_switch(host, username, password, dryrun_cmd, check=False, timeout=60)
     
-    # Copy .deb files from apt cache to our temp directory
-    print("    Copying from apt cache...")
-    copy_cmd = f"cp /var/cache/apt/archives/*.deb {deb_dir}/ 2>/dev/null; ls {deb_dir}/*.deb 2>/dev/null | wc -l"
-    result = run_on_switch(host, username, password, copy_cmd, check=False)
+    # Parse the dry-run output to extract package names
+    # Look for lines like "Inst package-name (version ...)"
+    packages_to_download = set()
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("Inst "):
+            # Format: "Inst package-name (version repo [arch])"
+            parts = line.split()
+            if len(parts) >= 2:
+                pkg_name = parts[1]
+                packages_to_download.add(pkg_name)
     
-    try:
-        cached_count = int(result.stdout.strip().split('\n')[-1])
-        if cached_count > 0:
-            print(f"    ✓ Found {cached_count} packages in apt cache")
-    except:
-        pass
+    if not packages_to_download:
+        print(f"    ⚠ Could not parse dependencies. Dry-run output:")
+        print(f"    {(result.stdout or '')[:500]}")
+    else:
+        print(f"    Found {len(packages_to_download)} packages to download (including dependencies)")
+        
+        # Download each package
+        downloaded = 0
+        failed = []
+        
+        for pkg in sorted(packages_to_download):
+            dl_cmd = f"cd {deb_dir} && sudo apt-get download {pkg} 2>&1"
+            dl_result = run_on_switch(host, username, password, dl_cmd, check=False, timeout=60)
+            
+            # Check if download succeeded (look for .deb file or success message)
+            if dl_result.returncode == 0 and "E:" not in (dl_result.stdout or ""):
+                downloaded += 1
+            else:
+                failed.append(pkg)
+        
+        print(f"    ✓ Downloaded {downloaded}/{len(packages_to_download)} packages")
+        if failed and len(failed) <= 5:
+            print(f"    ⚠ Failed: {', '.join(failed)}")
     
     # Count deb packages and verify they exist
     result = run_on_switch(host, username, password, f"ls -la {deb_dir}/ 2>/dev/null | head -5", check=False)
