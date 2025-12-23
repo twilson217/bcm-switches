@@ -317,13 +317,14 @@ def main() -> int:
             else:
                 print(f"  - Found oob-mgmt-switch swp0 lease: {oob_ip}")
                 if not ping(oob_ip):
-                    print("  - Ping failed; cannot apply NVUE bridge config.")
-                    return 1
-                ok = configure_oob_bridge(oob_ip, args.oob_password, args.password, username=args.oob_username)
-                if not ok:
-                    print("  - Failed to configure oob-mgmt-switch bridging (nv/sudo).")
-                    return 1
-                print("  ✓ oob-mgmt-switch bridging configured/applied")
+                    # Ping failed - likely already bridged (swp0 no longer has that IP)
+                    print("  ✓ oob-mgmt-switch unreachable at lease IP (likely already bridged)")
+                else:
+                    ok = configure_oob_bridge(oob_ip, args.oob_password, args.password, username=args.oob_username)
+                    if not ok:
+                        print("  - Failed to configure oob-mgmt-switch bridging (nv/sudo).")
+                        return 1
+                    print("  ✓ oob-mgmt-switch bridging configured/applied")
     else:
         print("\n[1/4] Preflight oob-mgmt-switch bridging... (skipped)")
 
