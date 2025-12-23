@@ -112,22 +112,116 @@ def ping(ip: str) -> bool:
         return False
 
 
-def configure_oob_bridge(ip: str, password: str, username: str = "cumulus") -> bool:
+def _handle_expired_password(ip: str, current_password: str, new_password: str, username: str = "cumulus") -> Tuple[bool, str]:
+    """
+    Handle Cumulus expired password prompt via expect.
+    Returns (success, working_password).
+    On fresh Cumulus switches the default password is expired and SSH forces a change.
+    """
+    expect_script = f'''
+set timeout 30
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {username}@{ip}
+
+expect {{
+    "Are you sure you want to continue connecting" {{
+        send "yes\\r"
+        exp_continue
+    }}
+    "Current password:" {{
+        send "{current_password}\\r"
+        exp_continue
+    }}
+    "New password:" {{
+        send "{new_password}\\r"
+        exp_continue
+    }}
+    "Retype new password:" {{
+        send "{new_password}\\r"
+        expect {{
+            "passwd: password updated successfully" {{
+                puts "PASSWORD_CHANGED_SUCCESS"
+            }}
+            "Connection to" {{
+                puts "PASSWORD_CHANGED_SUCCESS"
+            }}
+            eof {{
+                puts "PASSWORD_CHANGED_SUCCESS"
+            }}
+            timeout {{
+                puts "PASSWORD_TIMEOUT"
+            }}
+        }}
+    }}
+    -re "assword:" {{
+        send "{current_password}\\r"
+        exp_continue
+    }}
+    "Permission denied" {{
+        puts "AUTH_FAILED"
+    }}
+    "\\$" {{
+        # Got shell prompt - password not expired, exit cleanly
+        send "exit\\r"
+        puts "ALREADY_OK"
+    }}
+    timeout {{
+        puts "TIMEOUT"
+    }}
+    eof {{
+        puts "EARLY_EOF"
+    }}
+}}
+'''
+    try:
+        proc = subprocess.run(
+            ["expect", "-c", expect_script],
+            capture_output=True, text=True, timeout=60
+        )
+        output = proc.stdout or ""
+        if "PASSWORD_CHANGED_SUCCESS" in output:
+            return True, new_password
+        if "ALREADY_OK" in output:
+            # Password wasn't expired; current_password still works
+            return True, current_password
+        if "AUTH_FAILED" in output:
+            # May already be changed to new_password
+            return True, new_password
+        # Some other failure
+        return False, current_password
+    except Exception:
+        return False, current_password
+
+
+def configure_oob_bridge(ip: str, password: str, new_password: str, username: str = "cumulus") -> bool:
     """
     Configure oob-mgmt-switch swp0-50 as bridged ports using NVUE.
-    Tries direct nv commands; if permission fails, retries via sudo -S.
+    First handles expired password if needed, then runs nv commands.
     """
+    # Step 1: Handle expired password (fresh Cumulus switches)
+    print("    Checking/handling expired password...")
+    ok, working_pw = _handle_expired_password(ip, password, new_password, username)
+    if not ok:
+        print("    ✗ Could not handle password")
+        return False
+    if working_pw != password:
+        print("    ✓ Password updated")
+    else:
+        print("    ✓ Password OK (not expired)")
+
+    time.sleep(1)  # Allow connection to settle
+
+    # Step 2: Run bridge configuration
     cmds = [
         "nv set interface swp0-50 bridge domain br_default",
         "nv config apply -y",
     ]
     for c in cmds:
-        base = f"sshpass -p {shlex.quote(password)} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {username}@{ip} {shlex.quote(c)}"
+        base = f"sshpass -p {shlex.quote(working_pw)} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {username}@{ip} {shlex.quote(c)}"
         r = subprocess.run(base, shell=True, capture_output=True, text=True, timeout=120)
         if r.returncode == 0:
             continue
-        sudo_cmd = f"echo {shlex.quote(password)} | sudo -S {c}"
-        sudo = f"sshpass -p {shlex.quote(password)} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {username}@{ip} {shlex.quote(sudo_cmd)}"
+        sudo_cmd = f"echo {shlex.quote(working_pw)} | sudo -S {c}"
+        sudo = f"sshpass -p {shlex.quote(working_pw)} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {username}@{ip} {shlex.quote(sudo_cmd)}"
         r2 = subprocess.run(sudo, shell=True, capture_output=True, text=True, timeout=120)
         if r2.returncode != 0:
             return False
@@ -168,7 +262,7 @@ def main() -> int:
                 if not ping(oob_ip):
                     print("  - Ping failed; cannot apply NVUE bridge config.")
                     return 1
-                ok = configure_oob_bridge(oob_ip, args.oob_password, username=args.oob_username)
+                ok = configure_oob_bridge(oob_ip, args.oob_password, args.password, username=args.oob_username)
                 if not ok:
                     print("  - Failed to configure oob-mgmt-switch bridging (nv/sudo).")
                     return 1
