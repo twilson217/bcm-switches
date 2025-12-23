@@ -45,6 +45,16 @@ CSV_FILE = CONFIG_DIR / "bcm_switches.csv"
 FILES_DIR = SCRIPT_DIR / ".files"
 CM_LITE_ZIP_PATH = Path("/cm/shared/apps/cm-lite-daemon-dist/cm-lite-daemon.zip")
 
+# Debian packages required for cm-lite-daemon installation
+# These are needed to build Python packages with native extensions
+REQUIRED_DEB_PACKAGES = [
+    "build-essential",
+    "python3-dev",
+    "python3-pip",
+    "unzip",
+]
+DEB_PACKAGES_DIR = FILES_DIR / "deb_packages"
+
 # cmsh command - use full path to avoid dependency on 'module load cmsh'
 CMSH = get_cmsh_cmd()
 
@@ -1336,6 +1346,16 @@ class BCMDeployer:
                 print(f"    ✗ Failed to transfer pip_packages_dep")
                 return False
             
+            # Transfer deb packages for offline apt installation
+            deb_packages_dir = FILES_DIR / "deb_packages"
+            if deb_packages_dir.exists() and list(deb_packages_dir.glob("*.deb")):
+                deb_target = f"{self.username}@{device['ip']}:/home/{self.username}/deb_packages/"
+                if not run_rsync(str(deb_packages_dir) + "/", deb_target, "Transferring deb packages"):
+                    print(f"    ⚠ Failed to transfer deb_packages (will try apt-get install)")
+                    # Not a fatal error - we can fall back to apt-get install from internet
+            else:
+                print(f"    ⚠ No .deb packages cached - will use apt-get install from internet")
+            
             return True
             
         except Exception as e:
@@ -1365,19 +1385,49 @@ class BCMDeployer:
                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                    f"{self.username}@{device['ip']}"]
         
+        # Check if we have local deb packages for offline installation
+        # This enables partially-airgapped deployment where switches don't need internet
+        deb_packages_check = self._run_ssh_command(device['ip'],
+            f"ls /home/{self.username}/deb_packages/*.deb 2>/dev/null | wc -l")
+        has_local_debs = False
+        try:
+            deb_count = int(deb_packages_check.strip())
+            has_local_debs = deb_count > 5  # Expect at least several .deb files
+        except (ValueError, AttributeError):
+            pass
+        
         # Commands with descriptions for progress feedback
         # Note: Using apt-get instead of apt for stable CLI interface in scripts
-        steps = [
-            ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
-            ("Updating package lists...", "sudo apt-get update -q"),
-            ("Installing build dependencies...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev python3-pip unzip"),
-            ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
-            ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
-            ("Installing Python packages (this may take a while)...", 
-             f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
-             f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
-            ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
-        ]
+        if has_local_debs:
+            # Use local deb packages - no internet required on switch
+            deb_install_cmd = (
+                f"cd /home/{self.username}/deb_packages && "
+                f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q ./*.deb"
+            )
+            steps = [
+                ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
+                ("Installing build dependencies (from local packages)...", deb_install_cmd),
+                ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
+                ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
+                ("Installing Python packages (this may take a while)...", 
+                 f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
+                 f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon.zip /home/{self.username}/deb_packages"),
+            ]
+        else:
+            # Fall back to internet-based apt install
+            print(f"    ⚠ No local .deb packages found, using apt-get from internet...")
+            steps = [
+                ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
+                ("Updating package lists...", "sudo apt-get update -q"),
+                ("Installing build dependencies...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev python3-pip unzip"),
+                ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
+                ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
+                ("Installing Python packages (this may take a while)...", 
+                 f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
+                 f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
+                ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
+            ]
         
         total_steps = len(steps)
         overall_start = time.time()
@@ -1988,7 +2038,113 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
             if temp_req.exists():
                 temp_req.unlink()
     
+    # Ensure deb packages are also available
+    ensure_deb_packages()
+    
     return True
+
+
+def ensure_deb_packages() -> bool:
+    """
+    Ensure .deb packages are available for offline installation on switches.
+    
+    Downloads build-essential, python3-dev, python3-pip, unzip and all their
+    dependencies so they can be installed on switches without internet access.
+    
+    Returns True if packages are ready, False otherwise.
+    """
+    DEB_PACKAGES_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Check if we already have a reasonable set of packages
+    existing_debs = list(DEB_PACKAGES_DIR.glob("*.deb"))
+    if len(existing_debs) >= 10:  # Reasonable threshold - build-essential alone has many deps
+        # Check we have the critical ones
+        critical_found = 0
+        for pkg in REQUIRED_DEB_PACKAGES:
+            if list(DEB_PACKAGES_DIR.glob(f"{pkg}_*.deb")):
+                critical_found += 1
+        
+        if critical_found >= len(REQUIRED_DEB_PACKAGES) - 1:  # Allow one missing (might be meta-package)
+            print(f"✓ Using cached .deb packages from {DEB_PACKAGES_DIR} ({len(existing_debs)} files)")
+            return True
+    
+    print(f"\nDownloading .deb packages for offline installation...")
+    print(f"  Packages: {', '.join(REQUIRED_DEB_PACKAGES)}")
+    
+    # Get list of all dependencies
+    print("  Resolving dependencies...")
+    deps_cmd = [
+        "apt-cache", "depends", "--recurse", "--no-recommends", "--no-suggests",
+        "--no-conflicts", "--no-breaks", "--no-replaces", "--no-enhances",
+    ] + REQUIRED_DEB_PACKAGES
+    
+    try:
+        result = subprocess.run(deps_cmd, capture_output=True, text=True, timeout=120)
+        
+        # Parse the output to get package names
+        packages_to_download = set()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("<") or line.startswith("|"):
+                continue
+            if ":" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    pkg = parts[1].strip()
+                    if pkg and not pkg.startswith("<"):
+                        packages_to_download.add(pkg)
+            else:
+                if line and not line.startswith("<"):
+                    packages_to_download.add(line)
+        
+        # Always include explicitly requested packages
+        for pkg in REQUIRED_DEB_PACKAGES:
+            packages_to_download.add(pkg)
+        
+        print(f"  Found {len(packages_to_download)} packages (including dependencies)")
+        
+        # Download each package
+        print("  Downloading packages...")
+        downloaded = 0
+        skipped = 0
+        
+        for pkg in sorted(packages_to_download):
+            if pkg.startswith("<") or pkg.startswith("|"):
+                continue
+            
+            # Check if already downloaded
+            existing = list(DEB_PACKAGES_DIR.glob(f"{pkg}_*.deb"))
+            if existing:
+                skipped += 1
+                continue
+            
+            dl_cmd = ["apt-get", "download", pkg]
+            dl_result = subprocess.run(
+                dl_cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=str(DEB_PACKAGES_DIR)
+            )
+            
+            if dl_result.returncode == 0:
+                downloaded += 1
+        
+        # Count results
+        all_debs = list(DEB_PACKAGES_DIR.glob("*.deb"))
+        total_size = sum(f.stat().st_size for f in all_debs)
+        
+        print(f"  ✓ Downloaded {downloaded} new packages, {skipped} already present")
+        print(f"    Total: {len(all_debs)} .deb files ({total_size / (1024*1024):.1f} MB)")
+        
+        return True
+        
+    except subprocess.TimeoutExpired:
+        print("  ⚠ Timeout resolving/downloading packages")
+        return False
+    except Exception as e:
+        print(f"  ⚠ Error downloading .deb packages: {e}")
+        return False
 
 
 def get_bcm_switches() -> List[Dict]:

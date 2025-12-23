@@ -35,6 +35,15 @@ REPO_DIR = SCRIPT_DIR.parent
 FILES_DIR = REPO_DIR / ".files"
 CM_LITE_ZIP_PATH = Path("/cm/shared/apps/cm-lite-daemon-dist/cm-lite-daemon.zip")
 
+# Debian packages required for cm-lite-daemon installation
+# These are needed to build Python packages with native extensions
+REQUIRED_DEB_PACKAGES = [
+    "build-essential",
+    "python3-dev",
+    "python3-pip",
+    "unzip",
+]
+
 # Default requirements for BCM 10.x (verified on BCM 10.24.03 and BCM 10.30.0)
 DEFAULT_REQUIREMENTS_BCM10 = """\
 pyOpenSSL>=21.0.0
@@ -265,6 +274,126 @@ def download_pip_packages(requirements: str, python3_version: str):
     return pip_dir
 
 
+def download_deb_packages(target_distro: str = "bookworm", target_arch: str = "amd64"):
+    """
+    Download .deb packages for offline installation on switches.
+    
+    This downloads the required packages and all their dependencies so they can
+    be installed on switches without internet access.
+    
+    Args:
+        target_distro: Target Debian distribution codename (e.g., 'bookworm' for Debian 12,
+                       'bullseye' for Debian 11). Cumulus 5.x is based on Debian.
+        target_arch: Target architecture (typically 'amd64')
+    """
+    print(f"\nDownloading .deb packages for {target_distro}/{target_arch}...")
+    print(f"  Packages: {', '.join(REQUIRED_DEB_PACKAGES)}")
+    
+    deb_dir = FILES_DIR / "deb_packages"
+    deb_dir.mkdir(parents=True, exist_ok=True)
+    
+    # First, get the list of all dependencies
+    print("  Resolving dependencies...")
+    deps_cmd = [
+        "apt-cache", "depends", "--recurse", "--no-recommends", "--no-suggests",
+        "--no-conflicts", "--no-breaks", "--no-replaces", "--no-enhances",
+    ] + REQUIRED_DEB_PACKAGES
+    
+    try:
+        result = subprocess.run(deps_cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            print(f"  Warning: apt-cache depends returned non-zero: {result.stderr[:200]}")
+        
+        # Parse the output to get package names
+        # apt-cache depends output has lines like "  Depends: package" or just "package"
+        packages_to_download = set()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            # Skip lines that are dependency type markers or empty
+            if not line or line.startswith("<") or line.startswith("|"):
+                continue
+            if ":" in line:
+                # Lines like "Depends: package" or "PreDepends: package"
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    pkg = parts[1].strip()
+                    if pkg and not pkg.startswith("<"):
+                        packages_to_download.add(pkg)
+            else:
+                # Direct package name
+                if line and not line.startswith("<"):
+                    packages_to_download.add(line)
+        
+        # Always include the explicitly requested packages
+        for pkg in REQUIRED_DEB_PACKAGES:
+            packages_to_download.add(pkg)
+        
+        print(f"  Found {len(packages_to_download)} packages (including dependencies)")
+        
+        # Download each package
+        print("  Downloading packages...")
+        downloaded = 0
+        skipped = 0
+        failed = []
+        
+        for pkg in sorted(packages_to_download):
+            # Skip virtual packages and packages that start with special chars
+            if pkg.startswith("<") or pkg.startswith("|"):
+                continue
+            
+            # Check if already downloaded
+            existing = list(deb_dir.glob(f"{pkg}_*.deb"))
+            if existing:
+                skipped += 1
+                continue
+            
+            # Download using apt-get download
+            dl_cmd = ["apt-get", "download", pkg]
+            dl_result = subprocess.run(
+                dl_cmd, 
+                capture_output=True, 
+                text=True, 
+                timeout=60,
+                cwd=str(deb_dir)
+            )
+            
+            if dl_result.returncode == 0:
+                downloaded += 1
+            else:
+                # Some packages may be virtual or not available
+                if "has no installation candidate" not in dl_result.stderr:
+                    failed.append(pkg)
+        
+        # Count what we have
+        all_debs = list(deb_dir.glob("*.deb"))
+        total_size = sum(f.stat().st_size for f in all_debs)
+        
+        print(f"\n✓ Downloaded {downloaded} new packages, {skipped} already present")
+        print(f"  Total: {len(all_debs)} .deb files ({total_size / (1024*1024):.1f} MB)")
+        
+        if failed:
+            print(f"  Note: {len(failed)} packages could not be downloaded (may be virtual/meta packages)")
+        
+        # Verify we have the critical packages
+        missing_critical = []
+        for pkg in REQUIRED_DEB_PACKAGES:
+            if not list(deb_dir.glob(f"{pkg}_*.deb")):
+                missing_critical.append(pkg)
+        
+        if missing_critical:
+            print(f"  ⚠ Warning: Could not find .deb files for: {', '.join(missing_critical)}")
+            print("    These may need to be downloaded on a Debian-based system")
+        
+    except subprocess.TimeoutExpired:
+        print("  ✗ Timeout while resolving/downloading packages")
+        raise
+    except Exception as e:
+        print(f"  ✗ Error downloading .deb packages: {e}")
+        raise
+    
+    return deb_dir
+
+
 def create_tarball(output_path: Path):
     """Create compressed tarball of the entire repository with files."""
     print(f"\nCreating tarball: {output_path}")
@@ -338,6 +467,7 @@ def main():
 This script collects all files needed for airgapped deployment:
   1. cm-lite-daemon.zip from BCM
   2. All required pip packages
+  3. All required .deb packages (build-essential, python3-dev, etc.)
 
 The output tarball can be transferred to an airgapped BCM system
 and extracted for use with deploy_bcm_switches.py --airgapped.
@@ -345,6 +475,7 @@ and extracted for use with deploy_bcm_switches.py --airgapped.
 Examples:
   %(prog)s                                    # Create default tarball
   %(prog)s --output /tmp/deploy-package.tar.gz  # Custom output path
+  %(prog)s --skip-debs                        # Skip .deb download (if running on non-Debian)
         """
     )
     
@@ -386,6 +517,20 @@ Examples:
              "Useful when you cannot move the zip file but can copy the text file."
     )
     
+    parser.add_argument(
+        "--skip-debs",
+        action="store_true",
+        help="Skip downloading .deb packages (use if running on a non-Debian system or if debs already present)."
+    )
+    
+    parser.add_argument(
+        "--target-distro",
+        type=str,
+        default="bookworm",
+        help="Target Debian distribution codename (default: bookworm for Debian 12/Cumulus 5.x). "
+             "Use 'bullseye' for Debian 11."
+    )
+    
     args = parser.parse_args()
     
     print("=" * 60)
@@ -408,13 +553,25 @@ Examples:
         sys.exit(1)
     
     try:
-        # Step 1: Determine requirements and download packages (always)
+        # Step 1: Determine requirements and download pip packages
         requirements, req_src = load_requirements(
             requirements_path=args.requirements,
             cm_lite_zip_src=cm_lite_zip_src,
         )
         print(f"\nUsing requirements source: {req_src}")
         download_pip_packages(requirements, python3_version=args.python3_version)
+
+        # Step 2: Download .deb packages for offline apt install
+        if not args.skip_debs:
+            try:
+                download_deb_packages(target_distro=args.target_distro)
+            except Exception as e:
+                print(f"\n⚠ Warning: Could not download .deb packages: {e}")
+                print("  If running on a non-Debian system, use --skip-debs")
+                print("  Debs can be downloaded later on the BCM head node")
+        else:
+            print("\n⚠ Skipping .deb package download (--skip-debs)")
+            print("  deploy_bcm_switches.py will attempt to download debs on the BCM head node")
 
         # Optionally copy cm-lite-daemon.zip into .files (not included in tarball unless requested)
         if args.include_cm_lite_zip:
