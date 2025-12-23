@@ -1261,15 +1261,33 @@ class BCMDeployer:
             return subprocess.run(full, input=f"{self.password}\n",
                                   capture_output=True, text=True, timeout=timeout)
 
+        def _ok(step: str, result: subprocess.CompletedProcess) -> bool:
+            if result.returncode == 0:
+                return True
+            stderr_tail = (result.stderr or "").strip()[-1200:]
+            stdout_tail = (result.stdout or "").strip()[-1200:]
+            print(f"    ✗ Failed during systemd setup: {step}")
+            if stderr_tail:
+                print("      stderr (tail):")
+                for line in stderr_tail.splitlines()[-20:]:
+                    print(f"        {line}")
+            if stdout_tail:
+                print("      stdout (tail):")
+                for line in stdout_tail.splitlines()[-20:]:
+                    print(f"        {line}")
+            return False
+
         # If /opt/cm-lite-daemon isn't present, we can't generate the unit from template.
         if self._run_ssh_command(device["ip"], "test -d /opt/cm-lite-daemon && echo yes") != "yes":
             return False
 
         if self._cm_lite_unit_present(device):
             # Still ensure daemon-reload/enable (optional) so reruns repair "unit exists but not enabled".
-            _sudo("sudo systemctl daemon-reload", timeout=45)
+            if not _ok("systemctl daemon-reload", _sudo("sudo systemctl daemon-reload", timeout=45)):
+                return False
             if enable:
-                _sudo("sudo systemctl enable cm-lite-daemon.service", timeout=45)
+                if not _ok("systemctl enable", _sudo("sudo systemctl enable cm-lite-daemon.service", timeout=45)):
+                    return False
             return True
 
         run_env = f"/usr/sbin/ip vrf exec {self.vrf} " if self.vrf else ""
@@ -1287,7 +1305,8 @@ class BCMDeployer:
             "    $ROOT/etc/cm-lite-daemon.env.in > $ROOT/etc/cm-lite-daemon.env && "
             "chmod 600 $ROOT/etc/cm-lite-daemon.env'"
         )
-        _sudo(env_cmd, timeout=60)
+        if not _ok("generate env file", _sudo(env_cmd, timeout=60)):
+            return False
 
         # Install systemd unit file to /etc/systemd/system (highest precedence).
         unit_cmd = (
@@ -1300,11 +1319,23 @@ class BCMDeployer:
             "    $ROOT/service/systemd > /etc/systemd/system/cm-lite-daemon.service && "
             "chmod 644 /etc/systemd/system/cm-lite-daemon.service'"
         )
-        _sudo(unit_cmd, timeout=60)
+        if not _ok("write unit file", _sudo(unit_cmd, timeout=60)):
+            return False
 
-        _sudo("sudo systemctl daemon-reload", timeout=45)
+        if not _ok("systemctl daemon-reload", _sudo("sudo systemctl daemon-reload", timeout=45)):
+            return False
         if enable:
-            _sudo("sudo systemctl enable cm-lite-daemon.service", timeout=45)
+            if not _ok("systemctl enable", _sudo("sudo systemctl enable cm-lite-daemon.service", timeout=45)):
+                return False
+
+        # Verify unit is actually present now (avoid false positives).
+        if not self._cm_lite_unit_present(device):
+            print("    ✗ systemd unit still not found after install attempt")
+            diag = self._run_ssh_command(device["ip"], "ls -la /etc/systemd/system/cm-lite-daemon.service 2>/dev/null || true")
+            if diag:
+                print(f"      /etc/systemd/system/cm-lite-daemon.service: {diag}")
+            return False
+
         return True
 
     def _ensure_cm_lite_service_running(self, device: Dict) -> bool:
@@ -1321,7 +1352,20 @@ class BCMDeployer:
         if not self._ensure_cm_lite_systemd_unit(device, enable=True):
             return False
 
-        _sudo("sudo systemctl start cm-lite-daemon", timeout=60)
+        start_res = _sudo("sudo systemctl start cm-lite-daemon", timeout=60)
+        if start_res.returncode != 0:
+            stderr_tail = (start_res.stderr or "").strip()[-1200:]
+            stdout_tail = (start_res.stdout or "").strip()[-1200:]
+            print("    ✗ Failed to start cm-lite-daemon")
+            if stderr_tail:
+                print("      stderr (tail):")
+                for line in stderr_tail.splitlines()[-20:]:
+                    print(f"        {line}")
+            if stdout_tail:
+                print("      stdout (tail):")
+                for line in stdout_tail.splitlines()[-20:]:
+                    print(f"        {line}")
+            return False
 
         # Poll a bit; first start can take time.
         max_wait = 45
