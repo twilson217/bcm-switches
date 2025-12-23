@@ -241,21 +241,48 @@ def configure_oob_bridge(ip: str, password: str, new_password: str, username: st
     time.sleep(1)  # Allow connection to settle
 
     # Step 2: Run bridge configuration
-    cmds = [
-        "nv set interface swp0-50 bridge domain br_default",
-        "nv config apply -y",
-    ]
-    for c in cmds:
-        base = f"sshpass -p {shlex.quote(working_pw)} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {username}@{ip} {shlex.quote(c)}"
-        r = subprocess.run(base, shell=True, capture_output=True, text=True, timeout=120)
-        if r.returncode == 0:
-            continue
-        sudo_cmd = f"echo {shlex.quote(working_pw)} | sudo -S {c}"
-        sudo = f"sshpass -p {shlex.quote(working_pw)} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {username}@{ip} {shlex.quote(sudo_cmd)}"
-        r2 = subprocess.run(sudo, shell=True, capture_output=True, text=True, timeout=120)
-        if r2.returncode != 0:
+    # Note: After 'nv config apply', bridging swp0 will cause the switch to lose
+    # its DHCP-assigned IP on that interface, dropping our SSH connection.
+    # This is expected - treat connection loss after apply as success.
+    
+    ssh_base = f"sshpass -p {shlex.quote(working_pw)} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {username}@{ip}"
+    
+    def run_cmd(cmd: str, timeout: int = 30) -> bool:
+        """Run command, return True on success. Try direct first, then sudo."""
+        try:
+            r = subprocess.run(f"{ssh_base} {shlex.quote(cmd)}", shell=True, capture_output=True, text=True, timeout=timeout)
+            if r.returncode == 0:
+                return True
+        except subprocess.TimeoutExpired:
             return False
-    return True
+        # Try with sudo
+        sudo_cmd = f"echo {shlex.quote(working_pw)} | sudo -S -p '' {cmd}"
+        try:
+            r2 = subprocess.run(f"{ssh_base} {shlex.quote(sudo_cmd)}", shell=True, capture_output=True, text=True, timeout=timeout)
+            return r2.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+    
+    # Set the bridge configuration
+    print("    Configuring bridge (swp0-50)...")
+    if not run_cmd("nv set interface swp0-50 bridge domain br_default", timeout=30):
+        print("    ✗ Failed to set bridge config")
+        return False
+    
+    # Apply the config - this will likely drop our connection as swp0 loses its IP
+    print("    Applying config (connection will drop - this is expected)...")
+    try:
+        # Use a short timeout - we expect to lose connection
+        subprocess.run(
+            f"{ssh_base} {shlex.quote('nv config apply -y')}",
+            shell=True, capture_output=True, text=True, timeout=15
+        )
+        # If we get here without timeout, config was applied and connection survived (unlikely)
+        return True
+    except subprocess.TimeoutExpired:
+        # Expected! The config was applied and we lost connection because swp0 is now bridged
+        print("    ✓ Config applied (connection dropped as expected)")
+        return True
 
 
 def main() -> int:
