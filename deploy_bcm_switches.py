@@ -1413,15 +1413,11 @@ class BCMDeployer:
                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                    f"{self.username}@{device['ip']}"]
         
-        # Check what packages are already installed on the switch
-        # Cumulus Linux often has python3-pip and unzip pre-installed
-        installed_check = self._run_ssh_command(device['ip'],
-            "dpkg -l python3-pip unzip 2>/dev/null | grep -c '^ii' || echo 0")
-        try:
-            installed_count = int(installed_check.strip())
-            has_pip_unzip = installed_count >= 2
-        except (ValueError, AttributeError):
-            has_pip_unzip = False
+        # Check what's already installed on the switch.
+        #
+        # NOTE: We no longer require 'unzip' on the switch because we extract cm-lite-daemon on the
+        # BCM head node and rsync the extracted directory.
+        has_pip = (self._run_ssh_command(device['ip'], "python3 -m pip --version >/dev/null 2>&1 && echo yes") == "yes")
         
         # Check if we have cached deb packages (from prep-airgapped.py)
         deb_packages_dir = DEB_PACKAGES_DIR
@@ -1449,13 +1445,14 @@ class BCMDeployer:
                     break
         
         # Determine installation strategy
-        # Priority 1: pip/unzip already installed + all wheels = no apt needed
-        # Priority 2: use cached deb packages (from prep-airgapped.py) 
-        # Priority 3: install from internet
-        
-        if has_pip_unzip and not has_sdists:
-            # Best case: everything we need is already there or in wheel form
-            print(f"    ✓ python3-pip available and wheelhouse is wheels-only, using wheel-only install")
+        # Priority 1: wheel-only install (no sdists) if pip is available
+        # Priority 2: (legacy) cached deb packages, if needed to bootstrap pip
+        # Priority 3: (legacy) install pip from internet
+        #
+        # If sdists are present, offline install becomes fragile; prefer rebuilding the wheelhouse.
+
+        if not has_sdists and has_pip:
+            print(f"    ✓ pip available and wheelhouse is wheels-only, using wheel-only install")
             steps = [
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
@@ -1464,9 +1461,14 @@ class BCMDeployer:
                  f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
                 ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
             ]
+        elif has_sdists:
+            # If this happens, our prep step did not build wheels (or the user provided sdists manually).
+            print(f"    ✗ Source distributions detected in pip_packages_dep; offline install may require compilers.")
+            print(f"      Re-run scripts/prep-airgapped.py (it will build wheels on an internet-connected Cumulus switch)")
+            return False
         elif has_switch_debs:
-            # Use cached deb packages from prep-airgapped.py (airgapped mode)
-            print(f"    ✓ Using cached deb packages (airgapped mode)")
+            # Legacy fallback: if we have cached debs on the switch, attempt to install them (e.g. to bootstrap pip).
+            print(f"    ⚠ pip not available; attempting to use cached deb packages to bootstrap...")
             deb_install_cmd = (
                 f"cd /home/{self.username}/deb_packages && "
                 f"sudo DEBIAN_FRONTEND=noninteractive apt install -y ./*.deb"
@@ -1475,33 +1477,20 @@ class BCMDeployer:
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
                 ("Installing dependencies (from cached packages)...", deb_install_cmd),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
-                ("Installing Python packages (this may take a while)...", 
+                ("Installing Python packages (this may take a while)...",
                  f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
                  f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
                 ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon /home/{self.username}/deb_packages"),
             ]
-        elif has_pip_unzip and has_sdists:
-            # Have pip/unzip but need build tools for sdists - try to install from internet
-            print(f"    ⚠ Source packages detected, attempting to install build tools from internet...")
-            steps = [
-                ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
-                ("Updating package lists...", "sudo apt-get update -q 2>/dev/null || echo 'apt update failed'"),
-                ("Installing build tools...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev 2>/dev/null || echo 'build tools not available, will try wheel-only'"),
-                ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
-                ("Installing Python packages (this may take a while)...", 
-                 f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
-                 f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
-                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
-            ]
         else:
-            # Need to install pip/unzip from internet
-            print(f"    ⚠ Missing python3-pip or unzip, installing from internet...")
+            # Legacy fallback: try to install pip from the internet.
+            print(f"    ⚠ pip not available; attempting to install python3-pip from internet...")
             steps = [
                 ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
                 ("Updating package lists...", "sudo apt-get update -q"),
-                ("Installing dependencies...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev python3-pip unzip"),
+                ("Installing python3-pip...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-pip"),
                 ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
-                ("Installing Python packages (this may take a while)...", 
+                ("Installing Python packages (this may take a while)...",
                  f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
                  f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
                 ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
@@ -1531,11 +1520,11 @@ class BCMDeployer:
                         print(f" skipped ({step_elapsed:.1f}s)")
                         continue
                     print(f" FAILED ({step_elapsed:.1f}s)")
-                    # Extra hint for a common failure mode: unzip missing or zip missing/corrupt.
-                    if "unzip" in cmd:
-                        print("        Hint: 'unzip' failed. This often means:")
-                        print("          - unzip was not installed (cached-deb install may have failed)")
-                        print("          - /home/{u}/cm-lite-daemon.zip is missing or corrupted".format(u=self.username))
+                    # Extra hint for a common failure mode: package bootstrap failed.
+                    if "apt-get install" in cmd or "apt install" in cmd:
+                        print("        Hint: package installation failed. In airgapped mode this usually means:")
+                        print("          - the switch cannot reach its apt repositories, and no compatible cached .deb set was provided")
+                        print("          - the switch has an unexpected apt repo configuration for its Cumulus version")
                     # Surface useful error output. SSH banners/warnings can pollute stderr/stdout,
                     # so print the tail of both to help pinpoint the real failure (pip, sudo, etc.).
                     stderr_tail = (result.stderr or "").strip()[-1200:]
