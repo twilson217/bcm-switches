@@ -1229,15 +1229,165 @@ class BCMDeployer:
         result = self._run_ssh_command(device['ip'], 
             "test -f /opt/cm-lite-daemon/etc/bootstrap.key && echo yes")
         return result == "yes"
+
+    def _cm_lite_unit_present(self, device: Dict) -> bool:
+        """Check if cm-lite-daemon systemd unit exists on the device."""
+        unit_check = self._run_ssh_command(
+            device["ip"],
+            "test -f /etc/systemd/system/cm-lite-daemon.service && echo yes || "
+            "test -f /usr/lib/systemd/system/cm-lite-daemon.service && echo yes || "
+            "test -f /lib/systemd/system/cm-lite-daemon.service && echo yes || echo no",
+        )
+        return unit_check == "yes"
+
+    def _cm_lite_is_active(self, device: Dict) -> bool:
+        """Check if cm-lite-daemon service is active on the device."""
+        state = self._run_ssh_command(device["ip"], "systemctl is-active cm-lite-daemon 2>/dev/null || true")
+        return (state or "").strip() == "active"
+
+    def _ensure_cm_lite_systemd_unit(self, device: Dict, *, enable: bool) -> bool:
+        """
+        Ensure the cm-lite-daemon systemd unit (and env file) are installed on the device.
+
+        We install to /etc/systemd/system for highest precedence because some environments
+        may not have /usr/lib/systemd/system or may not search it as expected.
+        """
+        ssh_base = ["sshpass", "-p", self.password, "ssh",
+                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                    f"{self.username}@{device['ip']}"]
+
+        def _sudo(cmd: str, timeout: int = 45) -> subprocess.CompletedProcess:
+            full = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
+            return subprocess.run(full, input=f"{self.password}\n",
+                                  capture_output=True, text=True, timeout=timeout)
+
+        # If /opt/cm-lite-daemon isn't present, we can't generate the unit from template.
+        if self._run_ssh_command(device["ip"], "test -d /opt/cm-lite-daemon && echo yes") != "yes":
+            return False
+
+        if self._cm_lite_unit_present(device):
+            # Still ensure daemon-reload/enable (optional) so reruns repair "unit exists but not enabled".
+            _sudo("sudo systemctl daemon-reload", timeout=45)
+            if enable:
+                _sudo("sudo systemctl enable cm-lite-daemon.service", timeout=45)
+            return True
+
+        run_env = f"/usr/sbin/ip vrf exec {self.vrf} " if self.vrf else ""
+
+        # Create env file from template.
+        env_cmd = (
+            "sudo sh -lc '"
+            "PY_BIN=$(command -v python3); PY_DIR=$(dirname \"$PY_BIN\"); "
+            "ROOT=/opt/cm-lite-daemon; PIDFILE=/var/run/cm-lite-daemon.pid; "
+            "PATHVAL=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
+            "sed -e \"s#@ROOT@#$ROOT#g\" "
+            "    -e \"s#@PIDFILE@#$PIDFILE#g\" "
+            "    -e \"s#@PYTHON_PATH@#$PY_DIR#g\" "
+            "    -e \"s#@PATH@#$PATHVAL#g\" "
+            "    $ROOT/etc/cm-lite-daemon.env.in > $ROOT/etc/cm-lite-daemon.env && "
+            "chmod 600 $ROOT/etc/cm-lite-daemon.env'"
+        )
+        _sudo(env_cmd, timeout=60)
+
+        # Install systemd unit file to /etc/systemd/system (highest precedence).
+        unit_cmd = (
+            "sudo sh -lc '"
+            "ROOT=/opt/cm-lite-daemon; PIDFILE=/var/run/cm-lite-daemon.pid; "
+            f"RUNENV=\"{run_env}\"; "
+            "sed -e \"s#@ROOT@#$ROOT#g\" "
+            "    -e \"s#@PIDFILE@#$PIDFILE#g\" "
+            "    -e \"s#@RUN_ENV@#$RUNENV#g\" "
+            "    $ROOT/service/systemd > /etc/systemd/system/cm-lite-daemon.service && "
+            "chmod 644 /etc/systemd/system/cm-lite-daemon.service'"
+        )
+        _sudo(unit_cmd, timeout=60)
+
+        _sudo("sudo systemctl daemon-reload", timeout=45)
+        if enable:
+            _sudo("sudo systemctl enable cm-lite-daemon.service", timeout=45)
+        return True
+
+    def _ensure_cm_lite_service_running(self, device: Dict) -> bool:
+        """Ensure unit exists, enabled, and service is running. Returns True if active."""
+        ssh_base = ["sshpass", "-p", self.password, "ssh",
+                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                    f"{self.username}@{device['ip']}"]
+
+        def _sudo(cmd: str, timeout: int = 45) -> subprocess.CompletedProcess:
+            full = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
+            return subprocess.run(full, input=f"{self.password}\n",
+                                  capture_output=True, text=True, timeout=timeout)
+
+        if not self._ensure_cm_lite_systemd_unit(device, enable=True):
+            return False
+
+        _sudo("sudo systemctl start cm-lite-daemon", timeout=60)
+
+        # Poll a bit; first start can take time.
+        max_wait = 45
+        interval = 3
+        waited = 0
+        while waited <= max_wait:
+            if self._cm_lite_is_active(device):
+                return True
+            time.sleep(interval)
+            waited += interval
+
+        # Print debugging
+        status = _sudo("sudo systemctl status cm-lite-daemon --no-pager -l", timeout=45)
+        journal = _sudo("sudo journalctl -u cm-lite-daemon --no-pager -n 200", timeout=45)
+        print("    ✗ cm-lite-daemon is not active")
+        if status.stdout or status.stderr:
+            print("    systemctl status (tail):")
+            out = (status.stdout or "") + ("\n" + status.stderr if status.stderr else "")
+            print(out[-1500:])
+        if journal.stdout:
+            print("    journalctl (tail):")
+            print(journal.stdout[-2000:])
+        return False
     
-    def check_device_in_bcm(self, hostname: str) -> bool:
-        """Check if device already exists in BCM by hostname."""
+    def check_device_in_bcm(self, hostname: str, *, expected_ip: Optional[str] = None,
+                            expected_mac: Optional[str] = None, expected_network: Optional[str] = None) -> bool:
+        """
+        Check if device exists in BCM and (optionally) is configured with expected properties.
+
+        We should NOT skip configuration just because the hostname exists; BCM may contain a stale
+        device entry with 0.0.0.0 or missing network/MAC (common in lab rebuilds).
+        """
         try:
+            # Ensure device exists
             result = subprocess.run(
                 f"{CMSH} -c 'device; use {hostname}; get hostname'",
                 shell=True, capture_output=True, text=True
             )
-            return result.returncode == 0 and hostname in result.stdout
+            if result.returncode != 0 or hostname not in (result.stdout or ""):
+                return False
+
+            # If no expectations were given, existence is enough.
+            if expected_ip is None and expected_mac is None and expected_network is None:
+                return True
+
+            def _get(prop: str) -> str:
+                r = subprocess.run(
+                    f"{CMSH} -c 'device; use {hostname}; get {prop}'",
+                    shell=True, capture_output=True, text=True
+                )
+                return (r.stdout or "").strip()
+
+            if expected_ip is not None:
+                ip_val = _get("ip")
+                if ip_val != expected_ip or ip_val in ("", "0.0.0.0"):
+                    return False
+            if expected_mac is not None:
+                mac_val = _get("mac")
+                if mac_val.lower() != expected_mac.lower() or mac_val in ("", "00:00:00:00:00:00"):
+                    return False
+            if expected_network is not None:
+                net_val = _get("network")
+                if net_val != expected_network or net_val == "":
+                    return False
+
+            return True
         except:
             return False
     
@@ -1258,9 +1408,14 @@ class BCMDeployer:
             print(f"    [DRY RUN] Would add {hostname} to BCM")
             return True
         
-        # Check if device already exists in BCM
-        if skip_if_exists and self.check_device_in_bcm(hostname):
-            print(f"    ✓ Device {hostname} already exists in BCM, skipping add")
+        # Check if device already exists in BCM AND is already configured correctly.
+        if skip_if_exists and self.check_device_in_bcm(
+            hostname,
+            expected_ip=device.get("ip"),
+            expected_mac=device.get("mac"),
+            expected_network=network,
+        ):
+            print(f"    ✓ Device {hostname} already exists in BCM (configured), skipping add")
             return True
         
         # Try to add/update the device
@@ -1404,6 +1559,12 @@ class BCMDeployer:
             check_result = self._run_ssh_command(device['ip'], 
                 "python3 -c 'import websocket' 2>/dev/null && echo ok")
             if check_result == "ok":
+                # If unit/service is missing, don't "skip" — repair it.
+                if not self._cm_lite_unit_present(device):
+                    print(f"    ⚠ cm-lite-daemon installed but systemd unit missing; repairing...")
+                    if not self._ensure_cm_lite_systemd_unit(device, enable=False):
+                        print(f"    ✗ Failed to install systemd unit")
+                        return False
                 print(f"    ✓ cm-lite-daemon already installed on {device['hostname']}, skipping")
                 return True
             else:
@@ -1561,8 +1722,13 @@ class BCMDeployer:
         
         # Check if already registered
         if skip_if_exists and self.check_daemon_registered(device):
-            print(f"    ✓ {device['hostname']} already registered with BCM, skipping")
-            return True
+            # Even if already registered, we still must ensure the systemd unit exists and
+            # the service is running, otherwise BCM will show the switch as DOWN.
+            print(f"    ✓ {device['hostname']} already registered with BCM, checking service...")
+            if self._ensure_cm_lite_service_running(device):
+                print(f"    ✓ Registration complete")
+                return True
+            return False
         
         hostname = device['hostname']
         bcm_master_ip = self.get_bcm_master_ip()
@@ -1633,107 +1799,8 @@ class BCMDeployer:
                     print("    register_node stderr (tail):")
                     print(stderr_tail)
 
-            # Ensure systemd unit + env file are installed.
-            #
-            # cm-lite-daemon's helper may write to /usr/lib/systemd/system which is not present
-            # on some Cumulus/Debian variants (or not searched depending on usr-merge).
-            # We make this robust by installing to /etc/systemd/system if the unit isn't found.
-            #
-            # Also note: we no longer require unzip on the switch because we rsync the extracted
-            # /opt/cm-lite-daemon tree earlier.
-            def _sudo(cmd: str, timeout: int = 45) -> subprocess.CompletedProcess:
-                full = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
-                return subprocess.run(full, input=f"{self.password}\n",
-                                      capture_output=True, text=True, timeout=timeout)
-
-            # If the unit doesn't exist in common locations, create it from the shipped template.
-            unit_check = self._run_ssh_command(
-                device["ip"],
-                "test -f /etc/systemd/system/cm-lite-daemon.service && echo yes || "
-                "test -f /usr/lib/systemd/system/cm-lite-daemon.service && echo yes || "
-                "test -f /lib/systemd/system/cm-lite-daemon.service && echo yes || echo no"
-            )
-            if unit_check != "yes":
-                print("    Installing systemd unit for cm-lite-daemon...")
-                run_env = f"/usr/sbin/ip vrf exec {self.vrf} " if self.vrf else ""
-                # Create env file from template.
-                env_cmd = (
-                    "sudo sh -lc '"
-                    "PY_BIN=$(command -v python3); PY_DIR=$(dirname \"$PY_BIN\"); "
-                    "ROOT=/opt/cm-lite-daemon; PIDFILE=/var/run/cm-lite-daemon.pid; "
-                    "PATHVAL=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
-                    "sed -e \"s#@ROOT@#$ROOT#g\" "
-                    "    -e \"s#@PIDFILE@#$PIDFILE#g\" "
-                    "    -e \"s#@PYTHON_PATH@#$PY_DIR#g\" "
-                    "    -e \"s#@PATH@#$PATHVAL#g\" "
-                    "    $ROOT/etc/cm-lite-daemon.env.in > $ROOT/etc/cm-lite-daemon.env && "
-                    "chmod 600 $ROOT/etc/cm-lite-daemon.env'"
-                )
-                _sudo(env_cmd, timeout=60)
-
-                # Install systemd unit file to /etc/systemd/system (highest precedence).
-                unit_cmd = (
-                    "sudo sh -lc '"
-                    "ROOT=/opt/cm-lite-daemon; PIDFILE=/var/run/cm-lite-daemon.pid; "
-                    f"RUNENV=\"{run_env}\"; "
-                    "sed -e \"s#@ROOT@#$ROOT#g\" "
-                    "    -e \"s#@PIDFILE@#$PIDFILE#g\" "
-                    "    -e \"s#@RUN_ENV@#$RUNENV#g\" "
-                    "    $ROOT/service/systemd > /etc/systemd/system/cm-lite-daemon.service && "
-                    "chmod 644 /etc/systemd/system/cm-lite-daemon.service'"
-                )
-                _sudo(unit_cmd, timeout=60)
-
-                _sudo("sudo systemctl daemon-reload", timeout=45)
-                _sudo("sudo systemctl enable cm-lite-daemon.service", timeout=45)
-            
-            # Start the service
             print(f"    Starting cm-lite-daemon service...")
-            start_cmd = "sudo systemctl start cm-lite-daemon"
-            full_cmd = ssh_base + [start_cmd.replace("sudo ", "sudo -S ", 1)]
-            subprocess.run(full_cmd, input=f"{self.password}\n",
-                         capture_output=True, text=True, timeout=60)
-            
-            # Poll service for a bit: systemd may need time for first start after install/register.
-            print(f"    Verifying service status...")
-            max_wait = 45
-            interval = 3
-            waited = 0
-            last_state = None
-            while waited <= max_wait:
-                verify_cmd = "systemctl is-active cm-lite-daemon"
-                full_cmd = ssh_base + [verify_cmd]
-                result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=30)
-                state = (result.stdout or "").strip()
-                last_state = state
-                if state == "active":
-                    print(f"    ✓ cm-lite-daemon service is running")
-                    return True
-                time.sleep(interval)
-                waited += interval
-
-            print(f"    ✗ Service not running after {max_wait}s: {last_state}")
-
-            status_cmd = "sudo systemctl status cm-lite-daemon --no-pager -l"
-            status_result = _sudo(status_cmd, timeout=45)
-            if status_result.stdout or status_result.stderr:
-                print("    Service status (tail):")
-                out = (status_result.stdout or "") + ("\n" + status_result.stderr if status_result.stderr else "")
-                print(out[-1500:])
-
-            journal_cmd = "sudo journalctl -u cm-lite-daemon --no-pager -n 200"
-            journal_result = _sudo(journal_cmd, timeout=45)
-            if journal_result.stdout:
-                print("    journalctl -u cm-lite-daemon (tail):")
-                print(journal_result.stdout[-2000:])
-
-            log_cmd = "sudo sh -lc 'ls -1 /opt/cm-lite-daemon/log 2>/dev/null | tail -n 20 || true'"
-            log_list = _sudo(log_cmd, timeout=45)
-            if log_list.stdout and log_list.stdout.strip():
-                print("    /opt/cm-lite-daemon/log (listing):")
-                print(log_list.stdout.strip())
-
-            return False
+            return self._ensure_cm_lite_service_running(device)
             
         except Exception as e:
             print(f"    ✗ Registration failed: {e}")
