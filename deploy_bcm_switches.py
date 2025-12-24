@@ -1772,10 +1772,22 @@ class BCMDeployer:
                 ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
             ]
         elif has_sdists:
-            # If this happens, our prep step did not build wheels (or the user provided sdists manually).
-            print(f"    ✗ Source distributions detected in pip_packages_dep; offline install may require compilers.")
-            print(f"      Re-run scripts/prep-airgapped.py (it will build wheels on an internet-connected Cumulus switch)")
-            return False
+            # sdists require a compiler toolchain. If the switch can reach its apt repos, we can
+            # install build tools on the switch and compile from the local sdist cache.
+            #
+            # If apt bootstrap fails (true airgapped), instruct the operator to rebuild the
+            # wheelhouse using prep-airgapped.py (which builds wheels on a Cumulus switch).
+            print(f"    ⚠ Source distributions detected in pip_packages_dep; attempting to install build tools from switch apt repos...")
+            steps = [
+                ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
+                ("Updating package lists...", "sudo apt-get update -q"),
+                ("Installing build tools...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev"),
+                ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
+                ("Installing Python packages (this may take a while)...",
+                 f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
+                 f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
+            ]
         elif has_switch_debs:
             # Legacy fallback: if we have cached debs on the switch, attempt to install them (e.g. to bootstrap pip).
             print(f"    ⚠ pip not available; attempting to use cached deb packages to bootstrap...")
