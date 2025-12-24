@@ -26,11 +26,19 @@ Test 3: Install on Switches Already in BCM (--from-bcm mode)
   - Run deploy with --from-bcm to install cm-lite-daemon
   - Validate deployment
 
+Test 4: ZTP End-to-End Recovery (rebuild switches, keep BCM + staged ZTP)
+  - Assume switches are already in BCM and ZTP is staged
+  - Add a known marker to config (eth0 description: "ZTP Works!")
+  - Rebuild switches in Air (skip BCM cleanup) so they boot via ZTP
+  - Poll ZTP status until complete
+  - Validate: marker present, cm-lite-daemon running, BCM status UP
+
 Usage:
     ./test-loop.py              # Run all tests (1, 2, and 3)
     ./test-loop.py --test1      # Run only Test 1
     ./test-loop.py --test2      # Run only Test 2
     ./test-loop.py --test3      # Run only Test 3
+    ./test-loop.py --test4      # Run only Test 4 (ZTP end-to-end)
     ./test-loop.py --dry-run    # Show what would be done
     ./test-loop.py --no-reset   # Skip switch-only rebuild + BCM cleanup
     ./test-loop.py --verbose    # Show detailed output
@@ -81,6 +89,8 @@ TEST_SWITCHES = ["spine-01", "spine-02", "leaf-01", "leaf-02", "leaf-03", "leaf-
 # Wait times
 DHCP_WAIT_SECONDS = 90  # Wait for switches to get DHCP after reset
 BOOT_STABILIZE_SECONDS = 30  # Extra wait for boot to stabilize
+ZTP_POLL_SECONDS = 30
+ZTP_TIMEOUT_SECONDS = 600  # 10 minutes
 
 # Default test password (can be overridden via --password)
 DEFAULT_TEST_PASSWORD = "Nvidia1234!"
@@ -369,6 +379,33 @@ def sshpass_run(user: str, password: str, ip: str, cmd: str, timeout: int = 60) 
         return res.returncode, res.stdout, res.stderr
     except subprocess.TimeoutExpired:
         return -1, "", f"timeout after {timeout}s"
+
+
+def ssh_try_passwords(user: str, passwords: List[str], ip: str, cmd: str, timeout: int = 60) -> Tuple[int, str, str, str]:
+    """
+    Try multiple passwords in order. Returns (rc, stdout, stderr, password_used).
+    """
+    for pw in passwords:
+        rc, out, err = sshpass_run(user, pw, ip, cmd, timeout=timeout)
+        if rc == 0:
+            return rc, out, err, pw
+    return rc, out, err, passwords[-1] if passwords else ""
+
+
+def parse_ztp_show(output: str) -> Tuple[str, str]:
+    """
+    Parse `nv show system ztp` into (service, status).
+    """
+    service = ""
+    status = ""
+    for line in (output or "").splitlines():
+        m = re.match(r"^\s*service\s+(\S+)\s*$", line)
+        if m:
+            service = m.group(1).strip().lower()
+        m = re.match(r"^\s*status\s+(.+?)\s*$", line)
+        if m:
+            status = m.group(1).strip().lower()
+    return service, status
 
 
 def expect_available() -> bool:
@@ -744,6 +781,44 @@ class TestRunner:
             self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
         return result
 
+    def reset_switches_keep_bcm(self) -> StepResult:
+        """
+        Rebuild test switches in Air but keep BCM configuration/staged ZTP.
+
+        This uses scripts/tests/test-sim-reset.py --skip-bcm.
+        """
+        step_name = "reset-switches-keep-bcm"
+        start = time.time()
+
+        if self.dry_run:
+            return StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: rebuild test switches in Air, skipping BCM cleanup",
+                command="scripts/tests/test-sim-reset.py --skip-bcm",
+            )
+
+        result = run_script(
+            "scripts/tests/test-sim-reset.py",
+            "--skip-bcm",
+            timeout=400,
+            verbose=self.verbose,
+        )
+        if not result.success:
+            return result
+
+        # Wait for switches to boot and get DHCP
+        wait_with_countdown(DHCP_WAIT_SECONDS, "Waiting for switches to get DHCP addresses...")
+        wait_with_countdown(BOOT_STABILIZE_SECONDS, "Waiting for boot stabilization...")
+
+        result.name = step_name
+        result.duration = time.time() - start
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
+        return result
+
     def preflight_oob_bridge_and_wait_for_dhcp(self) -> StepResult:
         """
         Pre-flight network fix for NVIDIA Air topology:
@@ -937,7 +1012,7 @@ class TestRunner:
         return self.run_step(
             "Deploy to BCM",
             "deploy_bcm_switches.py",
-            f"--csv {csv_path} --non-interactive --username cumulus --password {pwd}",
+            f"--csv {csv_path} --non-interactive --username cumulus --password {pwd} --stage-ztp",
             timeout=900  # 15 minutes for full deployment
         )
     
@@ -947,8 +1022,73 @@ class TestRunner:
         return self.run_step(
             "Deploy from BCM (install cm-lite-daemon)",
             "deploy_bcm_switches.py",
-            f"--from-bcm --non-interactive --username cumulus --password {pwd}",
+            f"--from-bcm --non-interactive --username cumulus --password {pwd} --stage-ztp",
             timeout=900  # 15 minutes for full deployment
+        )
+
+    def ztp_preflight_config(self) -> StepResult:
+        """Run ZTP preflight (config-only) to confirm staging artifacts are present."""
+        csv_path = shlex.quote(str(FROM_DHCP_CSV))
+        return self.run_step(
+            "ZTP preflight (config-only)",
+            "scripts/ztp-preflight.py",
+            f"--csv {csv_path} --config-only",
+            timeout=300
+        )
+
+    def enable_cm_lite_daemon_via_ztp(self) -> StepResult:
+        """
+        Ensure BCM is configured to include cm-lite-daemon installation in generated ZTP scripts.
+
+        BCM 11: ztpsettings -> install lite daemon
+        BCM 10: device.hasclientdaemon
+        """
+        step_name = "Enable cm-lite-daemon via ZTP + initialize"
+        start = time.time()
+
+        if self.dry_run:
+            return StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: cmsh set installlitedaemon/hasclientdaemon and run initialize for test switches",
+                command="cmsh device;use <sw>; ...; initialize",
+            )
+
+        bcm_major, bcm_minor = get_bcm_version()
+        logs: List[str] = [f"BCM version: {bcm_major}.{bcm_minor}"]
+
+        ok_all = True
+        for sw in TEST_SWITCHES:
+            if bcm_major >= 11:
+                cmds = [
+                    f"{CMSH} -c \"device; use {sw}; ztpsettings; set installlitedaemon yes; commit\"",
+                    f"{CMSH} -c \"device; use {sw}; initialize\"",
+                ]
+            else:
+                cmds = [
+                    f"{CMSH} -c \"device; use {sw}; set hasclientdaemon yes; commit\"",
+                    f"{CMSH} -c \"device; use {sw}; initialize\"",
+                ]
+
+            for cmd in cmds:
+                rc, out, err = run_cmd(cmd, timeout=120)
+                logs.append(f"$ {cmd}\nrc={rc}\n{(out or '').strip()}\n{(err or '').strip()}")
+                if rc != 0:
+                    # tolerate idempotent "already" / "exists"
+                    if "already" in (err or "").lower() or "exists" in (err or "").lower():
+                        continue
+                    ok_all = False
+
+        duration = time.time() - start
+        return StepResult(
+            name=step_name,
+            success=ok_all,
+            duration=duration,
+            message="Success" if ok_all else "Failed",
+            output="\n\n".join(logs)[-8000:],
+            command="; ".join(["cmsh ..."] * 2),
         )
     
     def add_devices_to_bcm(self) -> StepResult:
@@ -992,6 +1132,255 @@ class TestRunner:
             print(f"    Validation: {passed} passed, {failed} failed")
         
         return result
+
+    def set_eth0_description_marker(self, description: str = "ZTP Works!") -> StepResult:
+        """
+        Add a deterministic marker to the running config on each switch so Test 4 can verify ZTP restored it.
+        """
+        step_name = f"Set eth0 description marker ({description})"
+        start = time.time()
+
+        if self.dry_run:
+            return StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: nv set interface eth0 description + apply on each switch",
+                command="nv set interface eth0 description ...; nv config apply -y",
+            )
+
+        # Use current CSV mapping (generated earlier in the test).
+        try:
+            with open(FROM_DHCP_CSV, "r") as f:
+                rows = list(csv.DictReader(f))
+        except Exception as e:
+            return StepResult(
+                name=step_name,
+                success=False,
+                duration=time.time() - start,
+                message="Failed to read from-dhcp.csv",
+                output=str(e),
+                command=str(FROM_DHCP_CSV),
+            )
+
+        hn_to_ip: Dict[str, str] = {}
+        for r in rows:
+            hn = (r.get("Hostname") or r.get("hostname") or "").strip()
+            ip = (r.get("IP") or r.get("ip") or "").strip()
+            if hn and ip:
+                hn_to_ip[hn] = ip
+
+        logs: List[str] = []
+        ok_all = True
+        for sw in TEST_SWITCHES:
+            ip = hn_to_ip.get(sw, "")
+            if not ip:
+                ok_all = False
+                logs.append(f"{sw}: missing IP in {FROM_DHCP_CSV}")
+                continue
+
+            # Apply marker via NVUE (writes canonical startup.yaml).
+            cmds = [
+                f"nv set interface eth0 description \"{description}\"",
+                "nv config apply -y",
+            ]
+
+            for cmd in cmds:
+                rc, out, err = sshpass_run("cumulus", self.password, ip, cmd, timeout=120)
+                logs.append(f"{sw} ({ip}) $ {cmd}\nrc={rc}\n{(out or '').strip()}\n{(err or '').strip()}")
+                if rc != 0:
+                    # Retry with sudo
+                    sudo_cmd = f"echo {self.password} | sudo -S {cmd}"
+                    rc2, out2, err2 = sshpass_run("cumulus", self.password, ip, sudo_cmd, timeout=120)
+                    logs.append(f"{sw} ({ip}) $ {sudo_cmd}\nrc={rc2}\n{(out2 or '').strip()}\n{(err2 or '').strip()}")
+                    if rc2 != 0:
+                        ok_all = False
+                        break
+
+            # Verify marker landed in startup.yaml
+            verify = f"echo {self.password} | sudo -S grep -q \"description: {description}\" /etc/nvue.d/startup.yaml && echo OK"
+            rc3, out3, err3 = sshpass_run("cumulus", self.password, ip, verify, timeout=60)
+            logs.append(f"{sw} ({ip}) $ verify startup.yaml marker\nrc={rc3}\n{(out3 or '').strip()}\n{(err3 or '').strip()}")
+            if rc3 != 0:
+                ok_all = False
+
+        return StepResult(
+            name=step_name,
+            success=ok_all,
+            duration=time.time() - start,
+            message="Success" if ok_all else "Failed",
+            output="\n\n".join(logs)[-8000:],
+            command="nv set/apply on switches",
+        )
+
+    def wait_for_ztp_complete(self) -> StepResult:
+        """
+        Poll `nv show system ztp` on each switch until:
+          - service == disabled
+          - status == success
+        """
+        step_name = "Wait for ZTP completion (nv show system ztp)"
+        start = time.time()
+
+        if self.dry_run:
+            return StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output=f"Would: poll every {ZTP_POLL_SECONDS}s for up to {ZTP_TIMEOUT_SECONDS}s",
+                command="nv show system ztp",
+            )
+
+        # Refresh CSV after rebuild so we have current IPs.
+        try:
+            with open(FROM_DHCP_CSV, "r") as f:
+                rows = list(csv.DictReader(f))
+        except Exception as e:
+            return StepResult(
+                name=step_name,
+                success=False,
+                duration=time.time() - start,
+                message="Failed to read from-dhcp.csv",
+                output=str(e),
+                command=str(FROM_DHCP_CSV),
+            )
+
+        hn_to_ip: Dict[str, str] = {}
+        for r in rows:
+            hn = (r.get("Hostname") or r.get("hostname") or "").strip()
+            ip = (r.get("IP") or r.get("ip") or "").strip()
+            if hn and ip:
+                hn_to_ip[hn] = ip
+
+        passwords = [self.password, "cumulus"]
+        done: Dict[str, bool] = {sw: False for sw in TEST_SWITCHES}
+        logs: List[str] = []
+
+        deadline = time.time() + ZTP_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            all_done = True
+            for sw in TEST_SWITCHES:
+                if done.get(sw):
+                    continue
+                ip = hn_to_ip.get(sw, "")
+                if not ip:
+                    all_done = False
+                    continue
+
+                rc, out, err, used_pw = ssh_try_passwords("cumulus", passwords, ip, "nv show system ztp", timeout=30)
+                if rc != 0:
+                    all_done = False
+                    continue
+                service, status = parse_ztp_show(out)
+                logs.append(f"{sw} ({ip}) ztp: service={service or '?'} status={status or '?'} (pw={used_pw})")
+                if service == "disabled" and status == "success":
+                    done[sw] = True
+                else:
+                    all_done = False
+
+            if all_done:
+                return StepResult(
+                    name=step_name,
+                    success=True,
+                    duration=time.time() - start,
+                    message="Success",
+                    output="\n".join(logs)[-8000:],
+                    command="nv show system ztp",
+                )
+            time.sleep(ZTP_POLL_SECONDS)
+
+        missing = [sw for sw, ok in done.items() if not ok]
+        logs.append(f"Timed out waiting for: {', '.join(missing)}")
+        return StepResult(
+            name=step_name,
+            success=False,
+            duration=time.time() - start,
+            message="Timed out",
+            output="\n".join(logs)[-8000:],
+            command="nv show system ztp",
+        )
+
+    def validate_ztp_recovery(self, description: str = "ZTP Works!") -> StepResult:
+        """
+        After ZTP completes, validate:
+          1) eth0 description marker is present in startup.yaml
+          2) cm-lite-daemon service is active(running)
+          3) BCM device status is UP
+        """
+        step_name = "Validate ZTP recovery outcomes"
+        start = time.time()
+
+        if self.dry_run:
+            return StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: check startup.yaml marker, systemctl is-active, and cmsh device status",
+                command="ssh + cmsh checks",
+            )
+
+        try:
+            with open(FROM_DHCP_CSV, "r") as f:
+                rows = list(csv.DictReader(f))
+        except Exception as e:
+            return StepResult(
+                name=step_name,
+                success=False,
+                duration=time.time() - start,
+                message="Failed to read from-dhcp.csv",
+                output=str(e),
+                command=str(FROM_DHCP_CSV),
+            )
+
+        hn_to_ip: Dict[str, str] = {}
+        for r in rows:
+            hn = (r.get("Hostname") or r.get("hostname") or "").strip()
+            ip = (r.get("IP") or r.get("ip") or "").strip()
+            if hn and ip:
+                hn_to_ip[hn] = ip
+
+        passwords = [self.password, "cumulus"]
+        logs: List[str] = []
+        ok_all = True
+
+        for sw in TEST_SWITCHES:
+            ip = hn_to_ip.get(sw, "")
+            if not ip:
+                ok_all = False
+                logs.append(f"{sw}: missing IP in {FROM_DHCP_CSV}")
+                continue
+
+            # 1) Marker present
+            marker_cmd = f"echo {self.password} | sudo -S grep -q \"description: {description}\" /etc/nvue.d/startup.yaml && echo OK"
+            rc1, out1, err1, _ = ssh_try_passwords("cumulus", passwords, ip, marker_cmd, timeout=60)
+            logs.append(f"{sw} ({ip}) marker rc={rc1} out={out1.strip()} err={err1.strip()[:200]}")
+            if rc1 != 0:
+                ok_all = False
+
+            # 2) cm-lite-daemon service running
+            svc_cmd = f"echo {self.password} | sudo -S systemctl is-active cm-lite-daemon.service"
+            rc2, out2, err2, _ = ssh_try_passwords("cumulus", passwords, ip, svc_cmd, timeout=60)
+            logs.append(f"{sw} ({ip}) cm-lite-daemon is-active rc={rc2} out={out2.strip()} err={err2.strip()[:200]}")
+            if rc2 != 0 or (out2 or "").strip() != "active":
+                ok_all = False
+
+            # 3) BCM status UP
+            rc3, out3, err3 = run_cmd(f"{CMSH} -c \"device;use {sw};status\"", timeout=30)
+            logs.append(f"BCM {sw} status rc={rc3} out={(out3 or '').strip()} err={(err3 or '').strip()[:200]}")
+            if rc3 != 0 or "UP" not in (out3 or ""):
+                ok_all = False
+
+        return StepResult(
+            name=step_name,
+            success=ok_all,
+            duration=time.time() - start,
+            message="Success" if ok_all else "Failed",
+            output="\n".join(logs)[-8000:],
+            command="marker+service+cmsh status",
+        )
     
     def run_test_1(self, skip_reset: bool = False) -> TestResult:
         """
@@ -1079,9 +1468,21 @@ class TestRunner:
         steps.append(step)
         if not step.success:
             test.success = False
+
+        # Step 5b: Ensure cm-lite-daemon install via ZTP is enabled and initialize regenerates scripts
+        step = self.enable_cm_lite_daemon_via_ztp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
         
         # Step 6: Validate (even if deploy failed, to see what state we're in)
         step = self.validate_deployment()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 6b: ZTP preflight (config-only) to confirm staging happened
+        step = self.ztp_preflight_config()
         steps.append(step)
         if not step.success:
             test.success = False
@@ -1181,6 +1582,18 @@ class TestRunner:
         
         # Step 6: Validate
         step = self.validate_deployment()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 6b: Ensure cm-lite-daemon install via ZTP is enabled and initialize regenerates scripts
+        step = self.enable_cm_lite_daemon_via_ztp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 6c: ZTP preflight (config-only) to confirm staging happened
+        step = self.ztp_preflight_config()
         steps.append(step)
         if not step.success:
             test.success = False
@@ -1294,11 +1707,130 @@ class TestRunner:
         steps.append(step)
         if not step.success:
             test.success = False
+
+        # Step 7b: Ensure cm-lite-daemon install via ZTP is enabled and initialize regenerates scripts
+        step = self.enable_cm_lite_daemon_via_ztp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 7c: ZTP preflight (config-only) to confirm staging happened
+        step = self.ztp_preflight_config()
+        steps.append(step)
+        if not step.success:
+            test.success = False
         
         test.steps = steps
         test.end_time = datetime.now().isoformat()
         test.duration = time.time() - start
         
+        return test
+
+    def run_test_4(self, skip_reset: bool = False) -> TestResult:
+        """
+        Test 4: ZTP End-to-End Recovery
+
+        Assumptions:
+        - Switches are already in BCM
+        - ZTP is already staged
+
+        Steps:
+        1. (Optional) Confirm ZTP staging is present (preflight config-only)
+        2. Ensure cm-lite-daemon install via ZTP is enabled + initialize regenerates scripts
+        3. Add marker to config (eth0 description: "ZTP Works!")
+        4. Rebuild switches in Air (skip BCM cleanup) so they boot via ZTP
+        5. Preflight oob bridge + regenerate DHCP CSV + map hostnames
+        6. Wait for ZTP completion
+        7. Validate marker present, cm-lite-daemon running, BCM status UP
+        """
+        print("\n" + "=" * 70)
+        print("TEST 4: ZTP End-to-End Recovery")
+        print("=" * 70)
+
+        test = TestResult(
+            name="Test 4: ZTP End-to-End Recovery",
+            success=True,
+            start_time=datetime.now().isoformat()
+        )
+        start = time.time()
+        steps: List[StepResult] = []
+
+        if not skip_reset:
+            # We intentionally do NOT clear config.json here because we want to preserve BCM state.
+            pass
+
+        # Step 1: Confirm staging (config-only)
+        step = self.ztp_preflight_config()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 2: Enable lite-daemon via ZTP + initialize
+        step = self.enable_cm_lite_daemon_via_ztp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 3: Add marker to config
+        step = self.set_eth0_description_marker("ZTP Works!")
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 4: Rebuild switches (keep BCM)
+        if not skip_reset:
+            step = self.reset_switches_keep_bcm()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
+        # Step 5: Preflight oob bridge + refresh DHCP CSV and hostnames
+        step = self.preflight_oob_bridge_and_wait_for_dhcp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
+
+        step = self.generate_csv_from_dhcp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
+
+        step = self.map_hostnames()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
+
+        # Step 6: Wait for ZTP complete
+        step = self.wait_for_ztp_complete()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 7: Validate outcomes
+        step = self.validate_ztp_recovery("ZTP Works!")
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        test.steps = steps
+        test.end_time = datetime.now().isoformat()
+        test.duration = time.time() - start
         return test
     
     def print_summary(self):
@@ -1376,6 +1908,12 @@ Prerequisites:
                        help="Run only Test 2 (switch setup first)")
     parser.add_argument("--test3", action="store_true",
                        help="Run only Test 3 (--from-bcm mode)")
+    parser.add_argument("--test4", action="store_true",
+                       help="Run only Test 4 (ZTP end-to-end recovery)")
+    parser.add_argument("--online", action="store_true",
+                       help="Run tests with switch internet access enabled (ip_forward=1)")
+    parser.add_argument("--airgapped", action="store_true",
+                       help="Run tests with switch internet access disabled (ip_forward=0)")
     parser.add_argument("--no-reset", action="store_true",
                        help="Skip switch-only rebuild + BCM device cleanup (use existing test state)")
     parser.add_argument("--stop-on-fail", action="store_true",
@@ -1390,10 +1928,23 @@ Prerequisites:
     args = parser.parse_args()
     
     # Determine which tests to run
-    any_specific = args.test1 or args.test2 or args.test3
+    any_specific = args.test1 or args.test2 or args.test3 or args.test4
     run_test1 = args.test1 or not any_specific
     run_test2 = args.test2 or not any_specific
     run_test3 = args.test3 or not any_specific
+    run_test4 = args.test4 or not any_specific
+
+    if args.online and args.airgapped:
+        print("Error: --online and --airgapped are mutually exclusive")
+        sys.exit(2)
+
+    modes: List[str] = []
+    if args.online:
+        modes = ["online"]
+    elif args.airgapped:
+        modes = ["airgapped"]
+    else:
+        modes = ["online", "airgapped"]
     
     # Password is passed to TestRunner
     test_password = args.password
@@ -1410,7 +1961,10 @@ Prerequisites:
         tests_to_run.append("Test 2")
     if run_test3:
         tests_to_run.append("Test 3")
+    if run_test4:
+        tests_to_run.append("Test 4")
     print(", ".join(tests_to_run))
+    print(f"Modes: {', '.join(modes)} (switch internet via ip_forward)")
     print(f"Skip reset: {args.no_reset}")
     print(f"Dry run: {args.dry_run}")
     
@@ -1439,6 +1993,8 @@ Prerequisites:
             selected.append(("Test 2", runner.run_test_2))
         if run_test3:
             selected.append(("Test 3", runner.run_test_3))
+        if run_test4:
+            selected.append(("Test 4", runner.run_test_4))
 
         # If running multiple tests, we *always* rebuild the test switches + clean BCM before each test to ensure isolation.
         # --no-reset is only respected when running exactly one test.
@@ -1446,13 +2002,29 @@ Prerequisites:
             print("\nNOTE: --no-reset was specified, but multiple tests were selected.")
             print("      For isolation, this run will rebuild test switches + clean BCM between tests (ignoring --no-reset).")
 
-        for name, fn in selected:
-            runner._current_test_name = name
-            skip_reset = args.no_reset and len(selected) == 1
-            result = fn(skip_reset=skip_reset)
-            runner.results.append(result)
-            if args.stop_on_fail and not result.success:
-                print("\nNOTE: --stop-on-fail enabled; stopping after first failure to preserve state for debugging.")
+        stop_now = False
+        for mode in modes:
+            if not args.dry_run:
+                # ip_forward controls whether switches can reach the internet through this system (Air topology).
+                forward = "1" if mode == "online" else "0"
+                rc, out, err = run_cmd(f"sysctl -w net.ipv4.ip_forward={forward}", timeout=10)
+                if rc != 0:
+                    print(f"\nError: failed to set ip_forward={forward}: {err or out}")
+                    sys.exit(1)
+                print(f"\nMode '{mode}': set net.ipv4.ip_forward={forward}")
+
+            for name, fn in selected:
+                runner._current_test_name = f"{mode}:{name}"
+                skip_reset = args.no_reset and len(selected) == 1 and len(modes) == 1
+                result = fn(skip_reset=skip_reset)
+                # Prefix test names with mode for clarity in summary/logs.
+                result.name = f"[{mode}] {result.name}"
+                runner.results.append(result)
+                if args.stop_on_fail and not result.success:
+                    print("\nNOTE: --stop-on-fail enabled; stopping after first failure to preserve state for debugging.")
+                    stop_now = True
+                    break
+            if stop_now:
                 break
 
         # Print summary

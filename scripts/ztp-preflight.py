@@ -322,6 +322,81 @@ def _config_checks(dev: Dict) -> Tuple[bool, List[str], List[str]]:
         else:
             lines.append(_missing("ZTP script contains CMD_NV_CONFIG", "CMD_NV_CONFIG not found in script")[1])
 
+        # --------------------------------------------------------------------
+        # cm-lite-daemon installation via ZTP (BCM 10 vs BCM 11 differs)
+        # --------------------------------------------------------------------
+        bcm_major, bcm_minor = get_bcm_version()
+        lines.append(_check("BCM version detected", True, f"{bcm_major}.{bcm_minor}")[1])
+
+        cmd_vrf = (vars_.get("CMD_VRF") or "").strip()
+        if cmd_vrf:
+            lines.append(_check("ZTP script contains CMD_VRF (required for cm-lite-daemon register)", True, cmd_vrf)[1])
+        else:
+            lines.append(
+                _missing(
+                    "ZTP script contains CMD_VRF (required for cm-lite-daemon register)",
+                    "CMD_VRF not found/empty",
+                )[1]
+            )
+
+        cm_lite = (vars_.get("CM_LITE_DAEMON") or "").strip()
+        expected_cm_lite = "YES" if bcm_major >= 11 else "yes"
+        if cm_lite == expected_cm_lite:
+            lines.append(_check("ZTP script enables cm-lite-daemon install", True, f"CM_LITE_DAEMON='{cm_lite}'")[1])
+        else:
+            lines.append(
+                _missing(
+                    "ZTP script enables cm-lite-daemon install",
+                    f"CM_LITE_DAEMON='{cm_lite or '(missing)'}' (expected '{expected_cm_lite}')",
+                )[1]
+            )
+
+        # BCM-side toggles that control whether CM_LITE_DAEMON vars are injected.
+        if bcm_major >= 11:
+            inst = _cmsh_ztp_get(hostname, "installlitedaemon") or _cmsh_ztp_get(hostname, "install lite daemon")
+            if _is_truthy(inst):
+                lines.append(_check("BCM ztpsettings install lite daemon is enabled", True, inst)[1])
+            else:
+                lines.append(_missing("BCM ztpsettings install lite daemon is enabled", f"current='{inst or '(empty)'}'")[1])
+        else:
+            has_client = _cmsh_get(hostname, "hasclientdaemon")
+            if _is_truthy(has_client):
+                lines.append(_check("BCM device.hasclientdaemon is enabled", True, has_client)[1])
+            else:
+                lines.append(_missing("BCM device.hasclientdaemon is enabled", f"current='{has_client or '(empty)'}'")[1])
+
+        # Verify at least one CM repo/auth URL is present and the GPG URL is present.
+        repo_keys = [k for k in vars_.keys() if k.startswith("CMD_CM_REPO_") and vars_.get(k)]
+        auth_keys = [k for k in vars_.keys() if k.startswith("CMD_CM_AUTH_") and vars_.get(k)]
+        gpg_url = (vars_.get("CMD_CM_GPG") or "").strip()
+
+        lines.append(_check("ZTP script contains CM repo URL(s)", bool(repo_keys), ", ".join(sorted(repo_keys)) or "none")[1]
+                     if repo_keys else _missing("ZTP script contains CM repo URL(s)", "no CMD_CM_REPO_* variables found")[1])
+        lines.append(_check("ZTP script contains CM auth URL(s)", bool(auth_keys), ", ".join(sorted(auth_keys)) or "none")[1]
+                     if auth_keys else _missing("ZTP script contains CM auth URL(s)", "no CMD_CM_AUTH_* variables found")[1])
+        if gpg_url:
+            lines.append(_check("ZTP script contains CM GPG URL", True, gpg_url)[1])
+        else:
+            lines.append(_missing("ZTP script contains CM GPG URL", "CMD_CM_GPG missing/empty")[1])
+
+        # Verify required per-switch artifacts exist under BCM htdocs (served to the switch during ZTP).
+        per_sw = BCM_SWITCH_HTDOCS_DIR / hostname
+        required_files = [
+            ("bootstrap.key", per_sw / "bootstrap.key"),
+            ("bootstrap.pem", per_sw / "bootstrap.pem"),
+            ("cluster.pem", per_sw / "cluster.pem"),
+            ("brightcomputing-archive-cm.gpg", per_sw / "brightcomputing-archive-cm.gpg"),
+        ]
+        for label, path in required_files:
+            if path.exists():
+                lines.append(_check(f"BCM per-switch artifact exists: {label}", True, str(path))[1])
+            else:
+                lines.append(_missing(f"BCM per-switch artifact exists: {label}", str(path))[1])
+
+        # Manual reminders (not BCM-verifiable end-to-end):
+        manual.append("  ⚠️ Manual: ensure the switch can reach the CM repo URL(s) during ZTP (network/DNS/proxy as needed).")
+        manual.append("  ⚠️ Manual: for fully airgapped ZTP, plan an internal mirror or a different cm-lite-daemon install strategy.")
+
     # BCM-managed DHCP checks (assume BCM is the DHCP server for these devices).
     net = _cmsh_get_network(hostname)
     mac = _cmsh_get_mac(hostname)
@@ -388,7 +463,7 @@ def _config_checks(dev: Dict) -> Tuple[bool, List[str], List[str]]:
 
     # Intentionally not listing switch-side/cutover items here (per request: BCM-only checks).
 
-    ok_all = all(not line.startswith("[MISSING]") for line in lines)
+    ok_all = not any(line.startswith("❌") for line in lines)
     return (ok_all, lines, manual)
 
 
@@ -465,7 +540,7 @@ def _image_checks(dev: Dict, image_dir: Optional[Path]) -> Tuple[bool, List[str]
 
     # Intentionally not listing non-verifiable items here (per request: BCM-only checklist output).
 
-    ok_all = all(not line.startswith("[MISSING]") for line in lines)
+    ok_all = not any(line.startswith("❌") for line in lines)
     return (ok_all, lines, manual)
 
 
