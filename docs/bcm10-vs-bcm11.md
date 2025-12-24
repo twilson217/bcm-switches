@@ -96,7 +96,7 @@ BCM 10 shows `ztpsettings` including fields such as:
 
 #### BCM 10 CMDaemon Lite via ZTP (observed behavior on BCM 10.0)
 
-Based on lab observation (see `agent-to-agent/messages.md`), BCM 10 **does not expose** an `installlitedaemon` / `Install lite daemon` setting under `device; use <switch>; ztpsettings`.
+Based on lab observation, BCM 10 **does not expose** an `installlitedaemon` / `Install lite daemon` setting under `device; use <switch>; ztpsettings`.
 
 However, BCM 10’s **ZTP script template already includes** the cm-lite-daemon installation/registration logic, gated by a variable:
 

@@ -42,6 +42,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_DIR = SCRIPT_DIR / ".configs"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CSV_FILE = CONFIG_DIR / "bcm_switches.csv"
+ZTP_CONFIG_FILE = CONFIG_DIR / "ztp-config.json"
 FILES_DIR = SCRIPT_DIR / ".files"
 CM_LITE_ZIP_PATH = Path("/cm/shared/apps/cm-lite-daemon-dist/cm-lite-daemon.zip")
 
@@ -169,6 +170,22 @@ def maybe_delete_config_file(*, non_interactive: bool) -> None:
             print(f"Deleted {CONFIG_FILE}")
         except Exception as e:
             print(f"\nWarning: Failed to delete {CONFIG_FILE}: {e}")
+
+
+def write_ztp_config(*, vrf: str) -> None:
+    """
+    Persist ZTP-related settings across deploy + ztp-staging runs.
+
+    This is intentionally separate from config.json (progress tracking). We only delete config.json
+    at the end of successful runs; ztp-config.json persists and can be overwritten on future runs.
+    """
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"vrf": (vrf or "").strip()}
+        with open(ZTP_CONFIG_FILE, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        print(f"\nWarning: Failed to write {ZTP_CONFIG_FILE}: {e}")
 
 
 def prompt_stage_ztp(*, non_interactive: bool, cli_flag: bool) -> bool:
@@ -3460,6 +3477,7 @@ Notes:
             print(f"VRF configured: {vrf}")
             print("=" * 60)
             print("\nRun without --connectivity-test to proceed with deployment.")
+            write_ztp_config(vrf=vrf)
             sys.exit(0)
     
     # If still not set, prompt in interactive mode; default only in non-interactive mode.
@@ -3473,6 +3491,7 @@ Notes:
         config.save()
     
     print(f"\nUsing VRF: {vrf}")
+    write_ztp_config(vrf=vrf)
     
     # Detect network
     network = config.get('network')
