@@ -358,6 +358,17 @@ def _config_checks(dev: Dict) -> Tuple[bool, List[str], List[str]]:
                 lines.append(_check("BCM ztpsettings install lite daemon is enabled", True, inst)[1])
             else:
                 lines.append(_missing("BCM ztpsettings install lite daemon is enabled", f"current='{inst or '(empty)'}'")[1])
+
+            # BCM 11 still has device.hasclientdaemon; it isn't the ZTP injection toggle on BCM 11,
+            # but it is often desirable for BCM to *expect* the lite daemon after ZTP completes.
+            has_client = _cmsh_get(hostname, "hasclientdaemon")
+            lines.append(
+                _check(
+                    "BCM device.hasclientdaemon is enabled (recommended for monitoring/UP status)",
+                    _is_truthy(has_client),
+                    f"current='{has_client or '(empty)'}'",
+                )[1]
+            )
         else:
             has_client = _cmsh_get(hostname, "hasclientdaemon")
             if _is_truthy(has_client):
