@@ -2671,6 +2671,11 @@ Notes:
     print("=" * 70)
     print("BCM Switch Deployment Tool")
     print("=" * 70)
+
+    # Optional: stage ZTP after a successful deployment.
+    # NOTE: Must be defined for *all* code paths (CSV/from-bcm/resume/etc) since
+    # later finalize logic references it.
+    stage_ztp = False
     
     # Check prerequisites
     check_prerequisites()
@@ -3065,6 +3070,9 @@ Notes:
                 config_password=config.get('password', '') if 'password' in config.config else None,
                 prompt="Enter SSH password: ",
             )
+
+        # Optional: stage ZTP after a successful deployment
+        stage_ztp = prompt_stage_ztp(non_interactive=args.non_interactive, cli_flag=args.stage_ztp)
         
         # Determine network from CSV or detect
         networks_in_csv = set(d['network'] for d in csv_devices if d.get('network'))
