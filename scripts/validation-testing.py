@@ -301,6 +301,36 @@ class BCMSystemValidator:
         
         error_count = len(out.strip().split('\n'))
         lines = [l for l in out.split('\n') if l.strip()]
+
+        # Filter known-benign messages that can occur during ZTP settings preparation on some BCM installs.
+        # Example observed on BCM 11: missing optional /etc/apt/auth.conf.d/cm-nightly.conf
+        benign_patterns = [
+            re.compile(r"ZTPSettings::prepare: failed to copy: /etc/apt/auth\.conf\.d/cm-nightly\.conf", re.IGNORECASE),
+        ]
+        filtered: List[str] = []
+        ignored = 0
+        for l in lines:
+            if any(p.search(l) for p in benign_patterns):
+                ignored += 1
+                continue
+            filtered.append(l)
+
+        # If everything matched a known benign pattern, don't fail the run.
+        if filtered == [] and ignored > 0:
+            deduped = dedupe_lines_with_counts(lines, limit=8)
+            detail_lines = []
+            for cnt, msg in deduped:
+                prefix = f"({cnt}x) " if cnt > 1 else ""
+                detail_lines.append(prefix + msg)
+            return CheckResult(
+                name="BCM syslog errors",
+                passed=True,
+                message=f"No actionable BCM syslog errors (ignored {ignored} known-benign message(s))",
+                details="\n".join(detail_lines) if (self.verbose and detail_lines) else None,
+                severity="warning",
+            )
+
+        lines = filtered
         deduped = dedupe_lines_with_counts(lines, limit=8)
         detail_lines = []
         for cnt, msg in deduped:

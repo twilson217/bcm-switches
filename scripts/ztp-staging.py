@@ -400,9 +400,8 @@ def _inject_cmd_vrf_into_ztp_script(hostname: str, vrf: str) -> None:
     vrf = (vrf or "").strip()
     if not vrf:
         return
-    props = BCMProps()
-    if getattr(props, "bcm_major_version", 0) >= 11:
-        return
+    # BCM 11 scripts also reference CMD_VRF but may not populate it by default.
+    # Injecting here makes ZTP behavior consistent across BCM 10/11.
 
     ztp_script = BCM_SWITCH_HTDOCS_DIR / hostname / "cumulus-ztp.sh"
     if not ztp_script.exists():
@@ -612,7 +611,7 @@ def main() -> int:
             continue
 
         try:
-            # BCM 11: set device.vrf so CMD_VRF is injected into the generated per-switch ZTP script.
+            # BCM 11: set device.vrf before initialize (influences generated artifacts and service env).
             if ztp_vrf:
                 _cmsh_set_vrf(dev["hostname"], ztp_vrf)
             _cmsh_set_file_mode(dev["hostname"])
@@ -621,7 +620,7 @@ def main() -> int:
             _cmsh_initialize(dev["hostname"])
             print("  - BCM: initialize complete")
 
-            # BCM 10: patch generated per-switch script to inject CMD_VRF for cm-lite-daemon registration.
+            # Patch generated per-switch script to inject CMD_VRF for cm-lite-daemon registration.
             if ztp_vrf:
                 _inject_cmd_vrf_into_ztp_script(dev["hostname"], ztp_vrf)
         except Exception as e:
