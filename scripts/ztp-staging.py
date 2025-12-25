@@ -389,6 +389,13 @@ def _cmsh_set_vrf(hostname: str, vrf: str) -> None:
         raise RuntimeError(r.stderr.strip() or r.stdout.strip() or "cmsh set vrf failed")
 
 
+def _cmsh_get_vrf(hostname: str) -> str:
+    r = _run_cmsh(f"device; use {hostname}; get vrf")
+    if r.returncode != 0:
+        return ""
+    return (r.stdout or "").strip()
+
+
 def _inject_cmd_vrf_into_ztp_script(hostname: str, vrf: str) -> None:
     """
     BCM 10 template consumes CMD_VRF, but BCM 10 does not inject it. Patch the generated per-switch
@@ -400,8 +407,11 @@ def _inject_cmd_vrf_into_ztp_script(hostname: str, vrf: str) -> None:
     vrf = (vrf or "").strip()
     if not vrf:
         return
-    # BCM 11 scripts also reference CMD_VRF but may not populate it by default.
-    # Injecting here makes ZTP behavior consistent across BCM 10/11.
+    # BCM 10 does not support device.vrf. The only portable place to encode VRF
+    # is in the generated per-switch ZTP script (CMD_VRF consumed by the template).
+    props = BCMProps()
+    if getattr(props, "bcm_major_version", 0) >= 11:
+        return
 
     ztp_script = BCM_SWITCH_HTDOCS_DIR / hostname / "cumulus-ztp.sh"
     if not ztp_script.exists():
@@ -611,17 +621,23 @@ def main() -> int:
             continue
 
         try:
-            # BCM 11: set device.vrf before initialize (influences generated artifacts and service env).
-            if ztp_vrf:
-                _cmsh_set_vrf(dev["hostname"], ztp_vrf)
-            _cmsh_set_file_mode(dev["hostname"])
             props = BCMProps()
+            # BCM 11: use BCM-native vrf setting so CMD_VRF is generated during initialize.
+            if ztp_vrf and getattr(props, "bcm_major_version", 0) >= 11:
+                before = _cmsh_get_vrf(dev["hostname"])
+                _cmsh_set_vrf(dev["hostname"], ztp_vrf)
+                after = _cmsh_get_vrf(dev["hostname"])
+                if after != ztp_vrf:
+                    print(f"  - WARNING: BCM vrf did not persist (before='{before}', after='{after}', expected='{ztp_vrf}')")
+                else:
+                    print(f"  - BCM: set vrf={after} (commit)")
+            _cmsh_set_file_mode(dev["hostname"])
             print(f"  - BCM: set {props.config_mode}=file, {props.config_file}=startup.yaml")
             _cmsh_initialize(dev["hostname"])
             print("  - BCM: initialize complete")
 
-            # Patch generated per-switch script to inject CMD_VRF for cm-lite-daemon registration.
-            if ztp_vrf:
+            # BCM 10: patch generated per-switch script to inject CMD_VRF for cm-lite-daemon registration.
+            if ztp_vrf and getattr(props, "bcm_major_version", 0) < 11:
                 _inject_cmd_vrf_into_ztp_script(dev["hostname"], ztp_vrf)
         except Exception as e:
             print(f"  - ERROR: BCM config/initialize failed: {e}")

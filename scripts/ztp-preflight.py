@@ -328,16 +328,44 @@ def _config_checks(dev: Dict) -> Tuple[bool, List[str], List[str]]:
         bcm_major, bcm_minor = get_bcm_version()
         lines.append(_check("BCM version detected", True, f"{bcm_major}.{bcm_minor}")[1])
 
+        # VRF handling:
+        # - BCM 11: the "proper" method is to set device.vrf (commit) and then initialize, which should
+        #   cause BCM to emit CMD_VRF into cumulus-ztp.sh.
+        # - BCM 10: no device.vrf; CMD_VRF must be present in the per-switch script (typically via staging-time patch).
         cmd_vrf = (vars_.get("CMD_VRF") or "").strip()
-        if cmd_vrf:
-            lines.append(_check("ZTP script contains CMD_VRF (required for cm-lite-daemon register)", True, cmd_vrf)[1])
+        if bcm_major >= 11:
+            dev_vrf = _norm_cmsh_val(_cmsh_get(hostname, "vrf"))
+            if dev_vrf:
+                lines.append(_check("BCM device.vrf is set", True, f"current='{dev_vrf}'")[1])
+            else:
+                lines.append(
+                    _missing(
+                        "BCM device.vrf is set",
+                        "current='(empty)' (run: cmsh -c \"device; use <sw>; set vrf <vrf>; commit\" then device initialize)",
+                    )[1]
+                )
+
+            if cmd_vrf:
+                ok_v = (not dev_vrf) or (cmd_vrf == dev_vrf)
+                detail = cmd_vrf if ok_v else f"script='{cmd_vrf}', bcm='{dev_vrf}'"
+                lines.append(_check("ZTP script contains CMD_VRF (used for ip vrf exec / daemon register)", ok_v, detail)[1])
+            else:
+                lines.append(
+                    _missing(
+                        "ZTP script contains CMD_VRF (used for ip vrf exec / daemon register)",
+                        "CMD_VRF not found/empty (set device.vrf in BCM and re-initialize)",
+                    )[1]
+                )
         else:
-            lines.append(
-                _missing(
-                    "ZTP script contains CMD_VRF (required for cm-lite-daemon register)",
-                    "CMD_VRF not found/empty",
-                )[1]
-            )
+            if cmd_vrf:
+                lines.append(_check("ZTP script contains CMD_VRF (required for cm-lite-daemon register)", True, cmd_vrf)[1])
+            else:
+                lines.append(
+                    _missing(
+                        "ZTP script contains CMD_VRF (required for cm-lite-daemon register)",
+                        "CMD_VRF not found/empty (re-run ztp-staging; BCM10 cannot set device.vrf)",
+                    )[1]
+                )
 
         cm_lite = (vars_.get("CM_LITE_DAEMON") or "").strip()
         expected_cm_lite = "YES" if bcm_major >= 11 else "yes"
