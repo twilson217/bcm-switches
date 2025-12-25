@@ -26,6 +26,10 @@ import sys
 import time
 from pathlib import Path
 
+# BCM version compatibility (cmsh path)
+sys.path.insert(0, str((Path(__file__).resolve().parent.parent)))  # scripts/
+from bcm_compat import get_cmsh_cmd
+
 """
 Note on dependencies:
 - This script supports `--help` even if optional deps are not installed.
@@ -122,9 +126,10 @@ def get_switches_from_topology():
 
 def get_bcm_devices():
     """Get list of devices currently in BCM."""
+    cmsh = get_cmsh_cmd()
     try:
         result = subprocess.run(
-            ["cmsh", "-c", "device; list"],
+            [cmsh, "-c", "device; list"],
             capture_output=True, text=True, check=True
         )
         
@@ -139,7 +144,7 @@ def get_bcm_devices():
         print(f"Error getting BCM devices: {e}")
         return []
     except FileNotFoundError:
-        print("Error: cmsh not found. This script must run on a BCM system.")
+        print(f"Error: cmsh not found at '{cmsh}'. This script must run on a BCM system.")
         return []
 
 
@@ -152,13 +157,14 @@ def remove_switches_from_bcm(switches_to_remove):
     bcm_devices = get_bcm_devices()
     
     removed = []
+    cmsh = get_cmsh_cmd()
     for switch in switches_to_remove:
         if switch in bcm_devices:
             print(f"  Removing {switch} from BCM...")
             try:
                 # Must close the device before removing it
                 result = subprocess.run(
-                    ["cmsh", "-c", f"device; use {switch}; close; remove; commit"],
+                    [cmsh, "-c", f"device; use {switch}; close; remove; commit"],
                     capture_output=True, text=True
                 )
                 if result.returncode == 0:

@@ -676,7 +676,7 @@ class NetworkDetector:
         """Get available BCM networks using cmsh."""
         try:
             result = subprocess.run(
-                ["cmsh", "-c", "network; list"],
+                [CMSH, "-c", "network; list"],
                 capture_output=True, text=True, check=True
             )
             self.networks = self._parse_network_list(result.stdout)
@@ -700,7 +700,7 @@ class NetworkDetector:
                 print(f"  stderr: {e.stderr}")
             return []
         except FileNotFoundError:
-            print("Error: cmsh command not found. Make sure you're running on a BCM system.")
+            print(f"Error: cmsh command not found at '{CMSH}'. Make sure you're running on a BCM system.")
             return []
     
     def _parse_network_list(self, output: str) -> List[Dict]:
@@ -1066,7 +1066,7 @@ class BCMChecker:
         
         try:
             result = subprocess.run(
-                ["cmsh", "-c", "device; list"],
+                [CMSH, "-c", "device; list"],
                 capture_output=True, text=True, check=True
             )
             self.bcm_devices = self._parse_device_list(result.stdout)
@@ -1188,7 +1188,7 @@ class BCMDeployer:
         
         try:
             result = subprocess.run(
-                ["cmsh", "-c", "device; use master; get ip"],
+                [CMSH, "-c", "device; use master; get ip"],
                 capture_output=True, text=True, check=True
             )
             self.bcm_master_ip = result.stdout.strip()
@@ -2159,8 +2159,9 @@ def check_prerequisites():
         sys.exit(1)
     
     # Check for cmsh
-    if not shutil.which("cmsh"):
-        print("Error: cmsh not found. This script must run on a BCM system.")
+    # Prefer bcm_compat's full-path cmsh detection (BCM commonly exposes cmsh via modules, not PATH).
+    if not (Path(CMSH).exists() or shutil.which(CMSH)):
+        print(f"Error: cmsh not found at '{CMSH}'. This script must run on a BCM system.")
         sys.exit(1)
     
     # Check for cm-lite-daemon.zip source
@@ -2509,7 +2510,7 @@ def get_bcm_switches() -> List[Dict]:
     """
     try:
         result = subprocess.run(
-            ["cmsh", "-c", "device;list -t switch"],
+            [CMSH, "-c", "device;list -t switch"],
             capture_output=True, text=True, check=True
         )
         return parse_bcm_switch_list(result.stdout)
@@ -2517,7 +2518,7 @@ def get_bcm_switches() -> List[Dict]:
         print(f"Error querying BCM switches: {e}")
         return []
     except FileNotFoundError:
-        print("Error: cmsh command not found.")
+        print(f"Error: cmsh command not found at '{CMSH}'.")
         return []
 
 

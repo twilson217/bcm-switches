@@ -20,6 +20,9 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# BCM version compatibility (cmsh path)
+from bcm_compat import get_cmsh_cmd
+
 # Constants
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_DIR = SCRIPT_DIR.parent
@@ -99,12 +102,13 @@ class NetworkMapper:
     
     def __init__(self):
         self.networks = []
+        self._cmsh = get_cmsh_cmd()
     
     def detect_networks(self) -> bool:
         """Get available BCM networks using cmsh."""
         try:
             result = subprocess.run(
-                ["cmsh", "-c", "network; list"],
+                [self._cmsh, "-c", "network; list"],
                 capture_output=True, text=True, check=True
             )
             self.networks = self._parse_network_list(result.stdout)
@@ -113,7 +117,7 @@ class NetworkMapper:
             print(f"Error detecting networks: {e}")
             return False
         except FileNotFoundError:
-            print("Error: cmsh command not found. Make sure you're running on a BCM system.")
+            print(f"Error: cmsh command not found at '{self._cmsh}'. Make sure you're running on a BCM system.")
             return False
     
     def _parse_network_list(self, output: str) -> List[Dict]:
