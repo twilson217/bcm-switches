@@ -3172,6 +3172,9 @@ Notes:
                 detected_vrf = detect_switch_vrf(username, password, csv_devices)
             vrf = choose_vrf_interactive(configured_vrf=configured_vrf, detected_vrf=detected_vrf)
         config.set('vrf', vrf)
+        if not args.dry_run:
+            # Persist ZTP-related settings (e.g., VRF) for ztp-staging.py.
+            write_ztp_config(vrf=vrf)
         
         # Set devices directly (skip discovery phase)
         config.progress['devices'] = csv_devices

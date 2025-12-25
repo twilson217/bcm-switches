@@ -407,7 +407,13 @@ class BCMDeviceValidator:
         )
     
     def check_cumulus_mode(self) -> CheckResult:
-        """Check if config mode is set to MANUAL (BCM 10: cumulusmode, BCM 11: nvconfigurationmode)."""
+        """
+        Check BCM config mode.
+
+        Historically this validation expected MANUAL (monitoring-only).
+        When ZTP staging is enabled, it is valid/expected for BCM to be in FILE mode
+        (pointing at startup.yaml) while still having ZTP run-on-boot disabled.
+        """
         props = BCMProps()
         rc, out, err = run_cmd(
             f"{CMSH} -c 'device; use {self.hostname}; get {props.config_mode}' 2>/dev/null"
@@ -420,6 +426,28 @@ class BCMDeviceValidator:
                 passed=True,
                 message=f"{props.config_mode} is MANUAL (monitoring-only)"
             )
+
+        if 'FILE' in mode:
+            # If staging ZTP, we expect FILE mode + startup.yaml.
+            rc2, out2, err2 = run_cmd(
+                f"{CMSH} -c 'device; use {self.hostname}; get {props.config_file}' 2>/dev/null"
+            )
+            cfg_file = (out2.strip() or "").lower()
+            if "startup.yaml" in cfg_file:
+                return CheckResult(
+                    name="Config mode",
+                    passed=True,
+                    message=f"{props.config_mode} is FILE (ZTP staged: {props.config_file}={cfg_file})",
+                    severity="warning",
+                )
+            return CheckResult(
+                name="Config mode",
+                passed=False,
+                message=f"{props.config_mode} is FILE but {props.config_file} is '{cfg_file}' (expected startup.yaml)",
+                details="If you staged ZTP, ensure config file is startup.yaml; otherwise use monitoring-only mode (MANUAL).",
+                severity="warning",
+            )
+
         return CheckResult(
             name="Config mode",
             passed=False,
