@@ -1272,9 +1272,11 @@ class BCMDeployer:
                     "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                     f"{self.username}@{device['ip']}"]
 
+        # Ensure entrypoint is executable; sudo can otherwise report "command not found".
+        # Use an absolute path to avoid cwd assumptions.
         cmd = (
-            f"cd /opt/cm-lite-daemon && "
-            f"sudo ./register_node --host {bcm_master_ip} --disable-cert-check --vrf {self.vrf}"
+            "sudo chmod 755 /opt/cm-lite-daemon/register_node 2>/dev/null || true; "
+            f"sudo /opt/cm-lite-daemon/register_node --host {bcm_master_ip} --disable-cert-check --vrf {self.vrf}"
         )
         full_cmd = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
         result = subprocess.run(full_cmd, input=f"{self.password}\n",
@@ -1968,8 +1970,11 @@ class BCMDeployer:
             
             # Register with BCM
             print(f"    Registering with BCM...")
-            register_cmd = (f"cd /opt/cm-lite-daemon && sudo ./register_node "
-                          f"--host {bcm_master_ip} --disable-cert-check --vrf {self.vrf}")
+            # Ensure entrypoint is executable; use absolute path to avoid cwd assumptions.
+            register_cmd = (
+                "sudo chmod 755 /opt/cm-lite-daemon/register_node 2>/dev/null || true; "
+                f"sudo /opt/cm-lite-daemon/register_node --host {bcm_master_ip} --disable-cert-check --vrf {self.vrf}"
+            )
             full_cmd = ssh_base + [register_cmd.replace("sudo ", "sudo -S ", 1)]
             result = subprocess.run(full_cmd, input=f"{self.password}\n",
                          capture_output=True, text=True, timeout=120)
