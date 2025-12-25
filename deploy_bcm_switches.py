@@ -22,6 +22,7 @@ import getpass
 import ipaddress
 import json
 import os
+import shlex
 import re
 import shutil
 import subprocess
