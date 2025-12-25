@@ -76,6 +76,7 @@ REPO_DIR = SCRIPT_DIR.parent.parent
 SCRIPTS_DIR = REPO_DIR / "scripts"
 CONFIG_DIR = REPO_DIR / ".configs"
 LOGS_DIR = REPO_DIR / ".logs"
+FILES_DIR = REPO_DIR / ".files"
 TOPOLOGY_FILE = SCRIPT_DIR / "sample-configs" / "test-topology.json"
 DHCP_LEASES_FILE = Path("/var/lib/dhcpd/dhcpd.leases")
 VENV_PYTHON = SCRIPT_DIR / ".venv" / "bin" / "python"
@@ -246,6 +247,22 @@ def clear_config():
         except:
             pass
     return True
+
+
+def clear_files_dir() -> bool:
+    """
+    Clear the .files/ cache directory.
+
+    This matters for test isolation: deploy_bcm_switches.py changes behavior based on whether
+    cached artifacts are present in .files/ (pip wheelhouse, deb_packages, extracted cm-lite-daemon).
+    """
+    if not FILES_DIR.exists():
+        return True
+    try:
+        shutil.rmtree(FILES_DIR)
+        return True
+    except Exception:
+        return False
 
 
 def get_validation_summary(output: str) -> Tuple[int, int]:
@@ -1914,6 +1931,8 @@ Prerequisites:
                        help="Run tests with switch internet access enabled (ip_forward=1)")
     parser.add_argument("--airgapped", action="store_true",
                        help="Run tests with switch internet access disabled (ip_forward=0)")
+    parser.add_argument("--keep-files", action="store_true",
+                       help="Do not delete .files between online/airgapped mode runs (faster, but less isolated)")
     parser.add_argument("--no-reset", action="store_true",
                        help="Skip switch-only rebuild + BCM device cleanup (use existing test state)")
     parser.add_argument("--stop-on-fail", action="store_true",
@@ -2012,6 +2031,15 @@ Prerequisites:
                     print(f"\nError: failed to set ip_forward={forward}: {err or out}")
                     sys.exit(1)
                 print(f"\nMode '{mode}': set net.ipv4.ip_forward={forward}")
+
+                # Ensure mode isolation: clear cached artifacts so deploy behavior isn't influenced
+                # by whatever the previous mode downloaded/prepared.
+                if not args.keep_files and len(modes) > 1:
+                    print("Mode isolation: clearing .files/ cache...")
+                    if not clear_files_dir():
+                        print("Error: failed to delete .files/ (check permissions)")
+                        sys.exit(1)
+                    print("Mode isolation: .files/ cleared")
 
             for name, fn in selected:
                 runner._current_test_name = f"{mode}:{name}"
