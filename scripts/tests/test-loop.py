@@ -785,7 +785,11 @@ class TestRunner:
             timeout=400,  # 6+ minutes for rebuild
             verbose=self.verbose
         )
-        
+
+        # Always log the step, even on failure/timeout, so test-loop runs are debuggable.
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
+
         if not result.success:
             return result
         
@@ -794,8 +798,6 @@ class TestRunner:
         wait_with_countdown(BOOT_STABILIZE_SECONDS, "Waiting for boot stabilization...")
         
         result.duration = time.time() - start
-        if self.logger is not None:
-            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
         return result
 
     def reset_switches_keep_bcm(self) -> StepResult:
@@ -823,6 +825,8 @@ class TestRunner:
             timeout=400,
             verbose=self.verbose,
         )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
         if not result.success:
             return result
 
@@ -832,8 +836,6 @@ class TestRunner:
 
         result.name = step_name
         result.duration = time.time() - start
-        if self.logger is not None:
-            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
         return result
 
     def preflight_oob_bridge_and_wait_for_dhcp(self) -> StepResult:
@@ -1064,7 +1066,7 @@ class TestRunner:
         start = time.time()
 
         if self.dry_run:
-            return StepResult(
+            step = StepResult(
                 name=step_name,
                 success=True,
                 duration=0,
@@ -1072,6 +1074,9 @@ class TestRunner:
                 output="Would: cmsh set installlitedaemon/hasclientdaemon and run initialize for test switches",
                 command="cmsh device;use <sw>; ...; initialize",
             )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
 
         bcm_major, bcm_minor = get_bcm_version()
         logs: List[str] = [f"BCM version: {bcm_major}.{bcm_minor}"]
@@ -1099,7 +1104,7 @@ class TestRunner:
                     ok_all = False
 
         duration = time.time() - start
-        return StepResult(
+        step = StepResult(
             name=step_name,
             success=ok_all,
             duration=duration,
@@ -1107,6 +1112,9 @@ class TestRunner:
             output="\n\n".join(logs)[-8000:],
             command="; ".join(["cmsh ..."] * 2),
         )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
     
     def add_devices_to_bcm(self) -> StepResult:
         """Add devices to BCM without installing cm-lite-daemon."""
@@ -1158,7 +1166,7 @@ class TestRunner:
         start = time.time()
 
         if self.dry_run:
-            return StepResult(
+            step = StepResult(
                 name=step_name,
                 success=True,
                 duration=0,
@@ -1166,13 +1174,16 @@ class TestRunner:
                 output="Would: nv set interface eth0 description + apply on each switch",
                 command="nv set interface eth0 description ...; nv config apply -y",
             )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
 
         # Use current CSV mapping (generated earlier in the test).
         try:
             with open(FROM_DHCP_CSV, "r") as f:
                 rows = list(csv.DictReader(f))
         except Exception as e:
-            return StepResult(
+            step = StepResult(
                 name=step_name,
                 success=False,
                 duration=time.time() - start,
@@ -1180,6 +1191,9 @@ class TestRunner:
                 output=str(e),
                 command=str(FROM_DHCP_CSV),
             )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
 
         hn_to_ip: Dict[str, str] = {}
         for r in rows:
@@ -1222,7 +1236,7 @@ class TestRunner:
             if rc3 != 0:
                 ok_all = False
 
-        return StepResult(
+        step = StepResult(
             name=step_name,
             success=ok_all,
             duration=time.time() - start,
@@ -1230,6 +1244,9 @@ class TestRunner:
             output="\n\n".join(logs)[-8000:],
             command="nv set/apply on switches",
         )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
 
     def wait_for_ztp_complete(self) -> StepResult:
         """
@@ -1241,7 +1258,7 @@ class TestRunner:
         start = time.time()
 
         if self.dry_run:
-            return StepResult(
+            step = StepResult(
                 name=step_name,
                 success=True,
                 duration=0,
@@ -1249,13 +1266,16 @@ class TestRunner:
                 output=f"Would: poll every {ZTP_POLL_SECONDS}s for up to {ZTP_TIMEOUT_SECONDS}s",
                 command="nv show system ztp",
             )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
 
         # Refresh CSV after rebuild so we have current IPs.
         try:
             with open(FROM_DHCP_CSV, "r") as f:
                 rows = list(csv.DictReader(f))
         except Exception as e:
-            return StepResult(
+            step = StepResult(
                 name=step_name,
                 success=False,
                 duration=time.time() - start,
@@ -1263,6 +1283,9 @@ class TestRunner:
                 output=str(e),
                 command=str(FROM_DHCP_CSV),
             )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
 
         hn_to_ip: Dict[str, str] = {}
         for r in rows:
@@ -1298,7 +1321,7 @@ class TestRunner:
                     all_done = False
 
             if all_done:
-                return StepResult(
+                step = StepResult(
                     name=step_name,
                     success=True,
                     duration=time.time() - start,
@@ -1306,11 +1329,14 @@ class TestRunner:
                     output="\n".join(logs)[-8000:],
                     command="nv show system ztp",
                 )
+                if self.logger is not None:
+                    self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+                return step
             time.sleep(ZTP_POLL_SECONDS)
 
         missing = [sw for sw, ok in done.items() if not ok]
         logs.append(f"Timed out waiting for: {', '.join(missing)}")
-        return StepResult(
+        step = StepResult(
             name=step_name,
             success=False,
             duration=time.time() - start,
@@ -1318,6 +1344,9 @@ class TestRunner:
             output="\n".join(logs)[-8000:],
             command="nv show system ztp",
         )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
 
     def validate_ztp_recovery(self, description: str = "ZTP Works!") -> StepResult:
         """
@@ -1330,7 +1359,7 @@ class TestRunner:
         start = time.time()
 
         if self.dry_run:
-            return StepResult(
+            step = StepResult(
                 name=step_name,
                 success=True,
                 duration=0,
@@ -1338,12 +1367,15 @@ class TestRunner:
                 output="Would: check startup.yaml marker, systemctl is-active, and cmsh device status",
                 command="ssh + cmsh checks",
             )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
 
         try:
             with open(FROM_DHCP_CSV, "r") as f:
                 rows = list(csv.DictReader(f))
         except Exception as e:
-            return StepResult(
+            step = StepResult(
                 name=step_name,
                 success=False,
                 duration=time.time() - start,
@@ -1351,6 +1383,9 @@ class TestRunner:
                 output=str(e),
                 command=str(FROM_DHCP_CSV),
             )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
 
         hn_to_ip: Dict[str, str] = {}
         for r in rows:
