@@ -34,12 +34,32 @@ from pathlib import Path
 import getpass
 import shlex
 from typing import Dict, List, Optional, Tuple
+import os
+import time
+from contextlib import suppress
 
 # BCM version compatibility
 from bcm_compat import BCMProps, get_bcm_version, get_cmsh_cmd
 
 # cmsh command - use full path to avoid dependency on 'module load cmsh'
 CMSH = get_cmsh_cmd()
+
+# region agent log
+def _dbg(hypothesis_id: str, location: str, message: str, data: Dict):
+    # NOTE: do NOT log secrets (passwords/tokens). Keep payloads small.
+    payload = {
+        "sessionId": "debug-session",
+        "runId": os.getenv("DEBUG_RUN_ID", ""),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    with suppress(Exception):
+        with open("/root/CUMULUS_in_BCM/.cursor/debug.log", "a") as f:
+            f.write(json.dumps(payload) + "\n")
+# endregion
 
 # ============================================================================
 # Configuration
@@ -206,6 +226,9 @@ def read_csv_file(csv_path: Path) -> List[Dict]:
                     'hostname': row.get('Hostname') or row.get('hostname', ''),
                     'ip': row.get('IP') or row.get('ip', ''),
                     'mac': (row.get('MAC') or row.get('mac', '')).upper(),
+                    # BCM 11 uses device->interfaces for management IP (device.ip may be read-only).
+                    # We accept/ignore this field here; it may be useful for other tooling.
+                    'interface': row.get('Interface') or row.get('interface', '') or '',
                 }
                 if device['ip']:
                     devices.append(device)
@@ -1039,7 +1062,6 @@ Examples:
     
     args = parser.parse_args()
     
-    import time
     start_time = time.time()
     
     # Get password (prefer CLI, then repo config, else prompt/error)
@@ -1057,15 +1079,18 @@ Examples:
     
     # Determine switches to validate
     switches = []
+    source = "unknown"
     
     if args.switch:
         switches = [{'ip': args.switch, 'hostname': '', 'mac': ''}]
+        source = "switch-arg"
     elif args.csv:
         csv_path = Path(args.csv)
         if not csv_path.exists():
             print(f"Error: CSV file not found: {csv_path}")
             sys.exit(1)
         switches = read_csv_file(csv_path)
+        source = "csv"
     else:
         # Try to get switches from BCM
         rc, out, err = run_cmd(f"{CMSH} -c 'device; list' 2>/dev/null")
@@ -1082,6 +1107,18 @@ Examples:
                             'ip': ip,
                             'mac': mac
                         })
+        source = "bcm"
+
+    _dbg(
+        "H2",
+        "scripts/validation-testing.py:main",
+        "Selected switches for validation",
+        {
+            "source": source,
+            "count": len(switches),
+            "count_ip_0": sum(1 for s in switches if (s.get("ip") or "").strip() == "0.0.0.0"),
+        },
+    )
     
     if not switches and not args.bcm_only:
         print("No switches found to validate.")

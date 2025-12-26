@@ -14,9 +14,14 @@ Generate a CSV file from DHCP leases for switch discovery.
 # Output: .configs/from-dhcp.csv
 ```
 
+The generated CSV includes:
+- `Hostname`, `IP`, `MAC`, `Network`
+- `Interface` (**new**) - management interface name (default `eth0`). **Required on BCM 11** because `device.ip` is read-only and IP is set under `device -> interfaces`.
+
 **Options:**
 - `--output FILE` - Custom output path
 - `--filter VENDOR` - Filter by vendor class
+- `--interface IFNAME` - Interface name to write in the CSV (default: `eth0`)
 
 ### `change-switch-defaults.py`
 Change default password, hostname, and/or ZTP settings on Cumulus switches.

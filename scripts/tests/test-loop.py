@@ -59,6 +59,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from contextlib import suppress
 
 # BCM version compatibility
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -96,6 +97,22 @@ ZTP_TIMEOUT_SECONDS = 600  # 10 minutes
 # Default test password (can be overridden via --password)
 DEFAULT_TEST_PASSWORD = "Nvidia1234!"
 
+# region agent log
+def _dbg(hypothesis_id: str, location: str, message: str, data: Dict):
+    # NOTE: do NOT log secrets (passwords/tokens). Keep payloads small.
+    payload = {
+        "sessionId": "debug-session",
+        "runId": os.getenv("DEBUG_RUN_ID", ""),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    with suppress(Exception):
+        with open("/root/CUMULUS_in_BCM/.cursor/debug.log", "a") as f:
+            f.write(json.dumps(payload) + "\n")
+# endregion
 
 # ============================================================================
 # Data Classes
@@ -576,18 +593,36 @@ def add_devices_to_bcm_only(csv_path: Path, username: str, password: str) -> boo
             ip = device.get('IP') or device.get('ip', '')
             mac = device.get('MAC') or device.get('mac', '')
             network = device.get('Network') or device.get('network', 'internalnet')
+            ifname = (device.get('Interface') or device.get('interface', '') or 'eth0').strip() or 'eth0'
             
             if not hostname or not ip:
                 continue
+
+            _dbg(
+                "H3",
+                "scripts/tests/test-loop.py:add_devices_to_bcm_only",
+                "Adding device via cmsh (pre)",
+                {"hostname": hostname, "ip": ip, "network": network, "ifname": ifname, "has_mac": bool(mac)},
+            )
             
             # Add device to BCM using cmsh
-            cmds = [
-                f"{CMSH} -c 'device; add switch {hostname}; commit'",
-                f"{CMSH} -c \"device; use {hostname}; set ip {ip}; set mac {mac}; set network {network}; set hasclientdaemon yes; commit\"",
-                f"{CMSH} -c \"device; use {hostname}; accesssettings; set username {username}; set password {password}; set -e {BCMProps().access_force_param} yes; commit\"",
+            props = BCMProps()
+            cmds = [f"{CMSH} -c 'device; add switch {hostname}; commit'"]
+            if props.major >= 11:
+                # BCM 11: device.ip is read-only; set IP under device->interfaces.
+                cmds.extend([
+                    f"{CMSH} -c \"device; use {hostname}; set mac {mac}; set network {network}; set hasclientdaemon yes; commit\"",
+                    f"{CMSH} -c \"device; use {hostname}; interfaces; add physical {ifname} {ip} {network}; commit\"",
+                ])
+            else:
+                cmds.append(
+                    f"{CMSH} -c \"device; use {hostname}; set ip {ip}; set mac {mac}; set network {network}; set hasclientdaemon yes; commit\""
+                )
+            cmds.extend([
+                f"{CMSH} -c \"device; use {hostname}; accesssettings; set username {username}; set password {password}; set -e {props.access_force_param} yes; commit\"",
                 f"{CMSH} -c \"device; use {hostname}; ztpsettings; set enableapi yes; commit\"",
                 f"{CMSH} -c \"device; use {hostname}; initialize\"",
-            ]
+            ])
             for cmd in cmds:
                 res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
                 if res.returncode != 0:
@@ -595,10 +630,55 @@ def add_devices_to_bcm_only(csv_path: Path, username: str, password: str) -> boo
                     # cmsh sometimes returns non-zero for idempotent operations like 'already exists'
                     if 'already' in stderr.lower() or 'exists' in stderr.lower():
                         continue
+                    _dbg(
+                        "H3",
+                        "scripts/tests/test-loop.py:add_devices_to_bcm_only",
+                        "cmsh command failed",
+                        {"hostname": hostname, "ip": ip, "rc": res.returncode, "stderr_head": stderr[:160]},
+                    )
                     print(f"    cmsh failed for {hostname} ({ip}): {cmd}")
                     if stderr:
                         print(f"      stderr: {stderr[:300]}")
                     return False
+
+            # Post-check: confirm BCM has non-empty ip/network after our commits.
+            # (No secrets; used to distinguish code issues vs BCM/lab behavior.)
+            try:
+                # BCM 11 may report 0.0.0.0 at device.ip; check interface IP too.
+                ip_get = subprocess.run(
+                    f"{CMSH} -c 'device; use {hostname}; get ip' 2>/dev/null",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                )
+                if_ip_get = subprocess.run(
+                    f"{CMSH} -c 'device; use {hostname}; interfaces; use {ifname}; get ip' 2>/dev/null",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                )
+                net_get = subprocess.run(
+                    f"{CMSH} -c 'device; use {hostname}; get network' 2>/dev/null",
+                    shell=True, capture_output=True, text=True
+                )
+                _dbg(
+                    "H4",
+                    "scripts/tests/test-loop.py:add_devices_to_bcm_only",
+                    "Added device via cmsh (post)",
+                    {
+                        "hostname": hostname,
+                        "expected_ip": ip,
+                        "bcm_ip": (ip_get.stdout or "").strip(),
+                        "bcm_ifname": ifname,
+                        "bcm_if_ip": (if_ip_get.stdout or "").strip(),
+                        "bcm_network": (net_get.stdout or "").strip(),
+                        "get_ip_rc": ip_get.returncode,
+                        "get_if_ip_rc": if_ip_get.returncode,
+                        "get_net_rc": net_get.returncode,
+                    },
+                )
+            except Exception:
+                pass
         
         return True
     except Exception as e:
@@ -1046,6 +1126,13 @@ class TestRunner:
     
     def deploy_switches(self) -> StepResult:
         """Deploy switches to BCM using --csv with --non-interactive."""
+        # In airgapped mode, we explicitly prepare the .files/ cache first by temporarily
+        # enabling IP forwarding so a prep switch (leaf-01) can reach the internet, then
+        # disabling forwarding before running the deployment.
+        if getattr(self, "_current_mode", "") == "airgapped":
+            prep = self.prep_airgapped_on_leaf_01()
+            if not prep.success:
+                return prep
         csv_path = shlex.quote(str(FROM_DHCP_CSV))
         pwd = shlex.quote(self.password)
         return self.run_step(
@@ -1057,6 +1144,11 @@ class TestRunner:
     
     def deploy_from_bcm(self) -> StepResult:
         """Deploy using --from-bcm mode (install on existing BCM devices)."""
+        # Same airgapped prep logic as deploy_switches().
+        if getattr(self, "_current_mode", "") == "airgapped":
+            prep = self.prep_airgapped_on_leaf_01()
+            if not prep.success:
+                return prep
         pwd = shlex.quote(self.password)
         return self.run_step(
             "Deploy from BCM (install cm-lite-daemon)",
@@ -1064,6 +1156,116 @@ class TestRunner:
             f"--from-bcm --non-interactive --username cumulus --password {pwd} --stage-ztp",
             timeout=900  # 15 minutes for full deployment
         )
+
+    def _get_leaf_01_ip_from_csv(self) -> Optional[str]:
+        """Return leaf-01 IP from the current FROM_DHCP_CSV mapping."""
+        try:
+            with open(FROM_DHCP_CSV, "r") as f:
+                rows = list(csv.DictReader(f))
+            for r in rows:
+                hn = (r.get("Hostname") or r.get("hostname") or "").strip()
+                ip = (r.get("IP") or r.get("ip") or "").strip()
+                if hn == "leaf-01" and ip:
+                    return ip
+        except Exception:
+            pass
+        return None
+
+    def prep_airgapped_on_leaf_01(self) -> StepResult:
+        """
+        Airgapped prep flow:
+        - Temporarily set ip_forward=1 so leaf-01 can download packages from the internet
+        - Run scripts/prep-airgapped.py against leaf-01 to populate local .files/
+        - Set ip_forward=0 to simulate airgapped switches for deployment
+        """
+        step_name = "Airgapped prep (prep-airgapped.py on leaf-01)"
+        print(f"\n  Step: {step_name}")
+        start = time.time()
+
+        if self.dry_run:
+            step = StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: sysctl ip_forward=1; run scripts/prep-airgapped.py --switch <leaf-01>; sysctl ip_forward=0",
+                command="sysctl -w net.ipv4.ip_forward=1; python3 scripts/prep-airgapped.py ...; sysctl -w net.ipv4.ip_forward=0",
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        leaf_ip = self._get_leaf_01_ip_from_csv()
+        if not leaf_ip:
+            step = StepResult(
+                name=step_name,
+                success=False,
+                duration=time.time() - start,
+                message="Failed (leaf-01 IP not found in from-dhcp.csv)",
+                output=f"Expected a row with Hostname=leaf-01 and a non-empty IP in {FROM_DHCP_CSV}",
+                command=str(FROM_DHCP_CSV),
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        # Use a temp tarball path to avoid accumulating artifacts in the repo.
+        tar_path = Path("/tmp") / f"prep-airgapped-{uuid.uuid4().hex}.tar.gz"
+        logs: List[str] = []
+
+        def _set_forward(val: int) -> Tuple[bool, str]:
+            rc, out, err = run_cmd(f"sysctl -w net.ipv4.ip_forward={val}", timeout=10)
+            msg = f"$ sysctl -w net.ipv4.ip_forward={val}\nrc={rc}\n{(out or '').strip()}\n{(err or '').strip()}"
+            return rc == 0, msg
+
+        ok, msg = _set_forward(1)
+        logs.append(msg)
+        if not ok:
+            step = StepResult(
+                name=step_name,
+                success=False,
+                duration=time.time() - start,
+                message="Failed (could not enable ip_forward=1 for prep)",
+                output="\n\n".join(logs)[-8000:],
+                command="sysctl -w net.ipv4.ip_forward=1",
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        try:
+            pwd = shlex.quote(self.password)
+            args = (
+                f"--non-interactive --switch {leaf_ip} --username cumulus --password {pwd} "
+                f"--output {shlex.quote(str(tar_path))}"
+            )
+            prep_res = run_script("scripts/prep-airgapped.py", args, timeout=1800, verbose=self.verbose)
+            logs.append(f"$ {prep_res.command}\nrc={'0' if prep_res.success else 'nonzero'}\n{(prep_res.output or '').strip()}")
+            ok_prep = prep_res.success
+        finally:
+            ok2, msg2 = _set_forward(0)
+            logs.append(msg2)
+            # Best-effort cleanup of tarball
+            try:
+                if tar_path.exists():
+                    tar_path.unlink()
+            except Exception:
+                pass
+
+        duration = time.time() - start
+        step = StepResult(
+            name=step_name,
+            success=ok_prep,
+            duration=duration,
+            message="Success" if ok_prep else "Failed (prep-airgapped.py failed)",
+            output="\n\n".join(logs)[-8000:],
+            command=f"prep-airgapped.py --switch {leaf_ip}",
+        )
+        status = "✓" if step.success else "✗"
+        print(f"    {status} {step.message} ({step.duration:.1f}s)")
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
 
     def ztp_preflight_config(self) -> StepResult:
         """Run ZTP preflight (config-only) to confirm staging artifacts are present."""
@@ -1163,6 +1365,12 @@ class TestRunner:
     def validate_deployment(self) -> StepResult:
         """Run validation testing."""
         pwd = shlex.quote(self.password)
+        _dbg(
+            "H1",
+            "scripts/tests/test-loop.py:validate_deployment",
+            "Starting validation-testing.py",
+            {"timeout_sec": int(getattr(self, "validation_timeout", 0)), "verbose": True},
+        )
         result = self.run_step(
             "Validate deployment",
             "scripts/validation-testing.py",
@@ -1170,6 +1378,12 @@ class TestRunner:
             # in the step log even if test-loop itself is not running with --verbose.
             f"--password {pwd} --verbose",
             timeout=int(self.validation_timeout)
+        )
+        _dbg(
+            "H1",
+            "scripts/tests/test-loop.py:validate_deployment",
+            "Finished validation-testing.py",
+            {"success": result.success, "duration_sec": result.duration, "message": result.message},
         )
         
         if not self.dry_run:
@@ -1888,6 +2102,19 @@ class TestRunner:
             test.duration = time.time() - start
             return test
 
+        # Airgapped mode: explicitly exercise the ".files/" creation path even though Test 4
+        # primarily validates ZTP recovery. This matches the intended airgapped workflow:
+        # temporarily allow internet for prep, then disable it for the remainder of the test.
+        if getattr(self, "_current_mode", "") == "airgapped":
+            step = self.prep_airgapped_on_leaf_01()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
         # Step 2: Confirm staging (config-only)
         step = self.ztp_preflight_config()
         steps.append(step)
@@ -2055,7 +2282,7 @@ Prerequisites:
     parser.add_argument("--airgapped", action="store_true",
                        help="Run tests with switch internet access disabled (ip_forward=0)")
     parser.add_argument("--keep-files", action="store_true",
-                       help="Do not delete .files between online/airgapped mode runs (faster, but less isolated)")
+                       help="Do not delete .files between/around tests (faster, but less isolated)")
     parser.add_argument("--no-reset", action="store_true",
                        help="Skip switch-only rebuild + BCM device cleanup (use existing test state)")
     parser.add_argument("--stop-on-fail", action="store_true",
@@ -2111,6 +2338,18 @@ Prerequisites:
     print(f"Modes: {', '.join(modes)} (switch internet via ip_forward)")
     print(f"Skip reset: {args.no_reset}")
     print(f"Dry run: {args.dry_run}")
+    _dbg(
+        "H1",
+        "scripts/tests/test-loop.py:main",
+        "Parsed args",
+        {
+            "tests": {"t1": run_test1, "t2": run_test2, "t3": run_test3, "t4": run_test4},
+            "modes": modes,
+            "no_reset": bool(args.no_reset),
+            "stop_on_fail": bool(args.stop_on_fail),
+            "validation_timeout": int(args.validation_timeout),
+        },
+    )
     
     # Check prerequisites
     if not args.dry_run:
@@ -2173,22 +2412,32 @@ Prerequisites:
                     sys.exit(1)
                 print(f"\nMode '{mode}': set net.ipv4.ip_forward={forward}")
 
-                # Ensure mode isolation: clear cached artifacts so deploy behavior isn't influenced
-                # by whatever the previous mode downloaded/prepared.
-                if not args.keep_files and len(modes) > 1:
-                    print("Mode isolation: clearing .files/ cache...")
+            for name, fn in selected:
+                runner._current_mode = mode
+                runner._current_test_name = f"{mode}:{name}"
+                skip_reset = args.no_reset and len(selected) == 1 and len(modes) == 1
+
+                # Test isolation: always start with a clean .files/ so we exercise cache creation,
+                # and always delete it after each test so artifacts never leak across tests.
+                if not args.dry_run and not args.keep_files:
+                    print("\nTest isolation: clearing .files/ cache (pre-test)...")
                     if not clear_files_dir():
                         print("Error: failed to delete .files/ (check permissions)")
                         sys.exit(1)
-                    print("Mode isolation: .files/ cleared")
+                    print("Test isolation: .files/ cleared (pre-test)")
 
-            for name, fn in selected:
-                runner._current_test_name = f"{mode}:{name}"
-                skip_reset = args.no_reset and len(selected) == 1 and len(modes) == 1
                 result = fn(skip_reset=skip_reset)
                 # Prefix test names with mode for clarity in summary/logs.
                 result.name = f"[{mode}] {result.name}"
                 runner.results.append(result)
+
+                if not args.dry_run and not args.keep_files:
+                    print("\nTest isolation: clearing .files/ cache (post-test)...")
+                    if not clear_files_dir():
+                        print("Error: failed to delete .files/ (check permissions)")
+                        sys.exit(1)
+                    print("Test isolation: .files/ cleared (post-test)")
+
                 if args.stop_on_fail and not result.success:
                     print("\nNOTE: --stop-on-fail enabled; stopping after first failure to preserve state for debugging.")
                     stop_now = True

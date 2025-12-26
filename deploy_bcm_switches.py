@@ -1511,8 +1511,15 @@ class BCMDeployer:
             print(journal.stdout[-2000:])
         return False
     
-    def check_device_in_bcm(self, hostname: str, *, expected_ip: Optional[str] = None,
-                            expected_mac: Optional[str] = None, expected_network: Optional[str] = None) -> bool:
+    def check_device_in_bcm(
+        self,
+        hostname: str,
+        *,
+        expected_ip: Optional[str] = None,
+        expected_mac: Optional[str] = None,
+        expected_network: Optional[str] = None,
+        expected_interface: Optional[str] = None,
+    ) -> bool:
         """
         Check if device exists in BCM and (optionally) is configured with expected properties.
 
@@ -1539,10 +1546,32 @@ class BCMDeployer:
                 )
                 return (r.stdout or "").strip()
 
+            def _get_interface_ip(ifname: str) -> str:
+                # BCM 11: device.ip is read-only; the IP is modeled under device->interfaces.
+                r = subprocess.run(
+                    f"{CMSH} -c 'device; use {hostname}; interfaces; use {ifname}; get ip'",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return (r.stdout or "").strip()
+
             if expected_ip is not None:
-                ip_val = _get("ip")
-                if ip_val != expected_ip or ip_val in ("", "0.0.0.0"):
-                    return False
+                props = BCMProps()
+                if props.major >= 11 and expected_interface:
+                    dev_ip = _get("ip")
+                    if_ip = _get_interface_ip(expected_interface)
+                    # Accept either device.ip or interface ip matching the expected IP.
+                    # (Some BCM builds may reflect interface IP up to device.ip with a delay.)
+                    ok = (dev_ip == expected_ip and dev_ip not in ("", "0.0.0.0")) or (
+                        if_ip == expected_ip and if_ip not in ("", "0.0.0.0")
+                    )
+                    if not ok:
+                        return False
+                else:
+                    ip_val = _get("ip")
+                    if ip_val != expected_ip or ip_val in ("", "0.0.0.0"):
+                        return False
             if expected_mac is not None:
                 mac_val = _get("mac")
                 if mac_val.lower() != expected_mac.lower() or mac_val in ("", "00:00:00:00:00:00"):
@@ -1579,22 +1608,52 @@ class BCMDeployer:
             expected_ip=device.get("ip"),
             expected_mac=device.get("mac"),
             expected_network=network,
+            expected_interface=(device.get("interface") or "eth0"),
         ):
             print(f"    ✓ Device {hostname} already exists in BCM (configured), skipping add")
             return True
         
         # Try to add/update the device
         props = BCMProps()
-        access_force = props.access_force_param  # BCM10: force, BCM11: "update in ztp"
-        commands = [
+        access_force = props.access_force_param  # BCM10: force, BCM11: updateinztp
+        ifname = (device.get("interface") or "eth0").strip() or "eth0"
+
+        commands: List[Tuple[str, str]] = [
             (f"{CMSH} -c 'device; add switch {hostname}; commit'", "Adding device"),
-            (f"{CMSH} -c 'device; use {hostname}; set ip {device['ip']}; set mac {device['mac']}; "
-             f"set network {network}; set hasclientdaemon yes; commit'", "Setting properties"),
-            (f"{CMSH} -c 'device; use {hostname}; accesssettings; set username {self.username}; "
-             f"set password {self.password}; set -e \"{access_force}\" true; commit'", "Setting access"),
-            (f"{CMSH} -c 'device; use {hostname}; ztpsettings; set enableapi yes; commit'", "Setting ZTP"),
-            (f"{CMSH} -c 'device; use {hostname}; initialize'", "Initializing")
         ]
+
+        if props.major >= 11:
+            # BCM 11: device.ip is read-only; set IP via the interface object.
+            commands.extend([
+                (
+                    f"{CMSH} -c 'device; use {hostname}; set mac {device['mac']}; "
+                    f"set network {network}; set hasclientdaemon yes; commit'",
+                    "Setting properties",
+                ),
+                (
+                    f"{CMSH} -c 'device; use {hostname}; interfaces; add physical {ifname} {device['ip']} {network}; commit'",
+                    f"Adding interface {ifname} with IP",
+                ),
+            ])
+        else:
+            # BCM 10: device.ip is writable.
+            commands.append(
+                (
+                    f"{CMSH} -c 'device; use {hostname}; set ip {device['ip']}; set mac {device['mac']}; "
+                    f"set network {network}; set hasclientdaemon yes; commit'",
+                    "Setting properties",
+                )
+            )
+
+        commands.extend([
+            (
+                f"{CMSH} -c 'device; use {hostname}; accesssettings; set username {self.username}; "
+                f"set password {self.password}; set -e \"{access_force}\" true; commit'",
+                "Setting access",
+            ),
+            (f"{CMSH} -c 'device; use {hostname}; ztpsettings; set enableapi yes; commit'", "Setting ZTP"),
+            (f"{CMSH} -c 'device; use {hostname}; initialize'", "Initializing"),
+        ])
         
         for cmd, description in commands:
             try:
@@ -2060,21 +2119,24 @@ def configure_monitoring_only_mode(devices: List[Dict], dry_run: bool = False) -
 def write_csv(devices: List[Dict], network: str):
     """Write devices to CSV file."""
     with open(CSV_FILE, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['Hostname', 'IP', 'MAC', 'Network'])
+        writer = csv.DictWriter(f, fieldnames=['Hostname', 'IP', 'MAC', 'Network', 'Interface'])
         writer.writeheader()
         for device in devices:
             writer.writerow({
                 'Hostname': device['hostname'],
                 'IP': device['ip'],
                 'MAC': device['mac'],
-                'Network': network
+                'Network': network,
+                # BCM 11 requires an interface name to set IPs (device.ip is read-only).
+                # In our test topology this is always eth0.
+                'Interface': device.get('interface') or 'eth0',
             })
     print(f"\nGenerated {CSV_FILE} with {len(devices)} devices.")
 
 def read_devices_from_csv(csv_path: Path) -> List[Dict]:
     """Read devices from a CSV file.
     
-    Expected columns: Hostname, IP, MAC, Network
+    Expected columns: Hostname, IP, MAC, Network, Interface (Interface required for BCM 11)
     """
     if not csv_path.exists():
         print(f"Error: CSV file not found: {csv_path}")
@@ -2097,7 +2159,8 @@ def read_devices_from_csv(csv_path: Path) -> List[Dict]:
                 'hostname': device.get('hostname', ''),
                 'ip': device['ip'],
                 'mac': device.get('mac', '').upper() if device.get('mac') else '',
-                'network': device.get('network', '')
+                'network': device.get('network', ''),
+                'interface': device.get('interface', '') or device.get('ifname', '') or '',
             })
     
     return devices

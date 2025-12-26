@@ -204,6 +204,13 @@ Examples:
                        help="Filter leases by vendor-class (e.g., 'cumulus')")
     parser.add_argument("--no-network-map", action="store_true",
                        help="Skip network mapping (leave Network column empty)")
+    parser.add_argument(
+        "--interface",
+        type=str,
+        default="eth0",
+        help="Management interface name to include in CSV (default: eth0). "
+             "BCM 11 uses this to add the switch IP under device->interfaces.",
+    )
     
     args = parser.parse_args()
     
@@ -251,7 +258,8 @@ Examples:
             'Hostname': lease['hostname'],
             'IP': lease['ip'],
             'MAC': lease['mac'],
-            'Network': network
+            'Network': network,
+            'Interface': (args.interface or "eth0"),
         })
     
     # Sort by IP address
@@ -262,7 +270,7 @@ Examples:
     
     # Write CSV
     with open(args.output, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['Hostname', 'IP', 'MAC', 'Network'])
+        writer = csv.DictWriter(f, fieldnames=['Hostname', 'IP', 'MAC', 'Network', 'Interface'])
         writer.writeheader()
         writer.writerows(output_data)
     

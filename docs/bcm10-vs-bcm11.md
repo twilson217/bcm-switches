@@ -13,6 +13,7 @@ This document summarizes **documented** differences between NVIDIA Base Command 
 
 - **BCM 11 renames Cumulus configuration mode controls** from `cumulusmode/cumulusfile` to `nvconfigurationmode/nvconfigurationfile` (and renames the related submode from `cumulus` to `nvconfiguration`).
 - **BCM 10 access settings include a `force` parameter** used in examples for Cumulus switch access configuration; **BCM 11 replaces that “override/force” concept with `Update in ztp` and `Update in NV` toggles** (documented for password update flows).
+- **BCM 11 makes `device.ip` read-only** for switches in our lab: you must add/configure an interface under `device -> interfaces` (e.g., `add physical eth0 <ip> <network>`) for BCM to associate an IP to the device.
 - **BCM 11 expands `ztpsettings`** to include new parameters/submodes like **`JSON template`**, **`Install lite daemon`**, and additional hooks (pre/post-install scripts, firmware, PTM topology file, etc.).
 - **BCM 11 upgrade manual explicitly warns** that **mixing BCM 10 and BCM 11 `cm-lite-daemon` deployments is not supported** during/after a 10→11 upgrade.
 
@@ -69,6 +70,35 @@ BCM 11 also documents configuring the username/password in `accesssettings`, but
 
 - If tooling relies on the BCM 10 `accesssettings.force` knob, BCM 11 may not have it (or it may have a different model).
 - BCM 11 introduces a second “update path” (NV vs ZTP) that could affect how/when credentials are pushed to switches.
+
+---
+
+### 2.5) Device management IP (device.ip vs device.interfaces)
+
+#### BCM 10 observed behavior
+
+In our BCM 10 lab, `device.ip` is writable and used by examples:
+
+- `cmsh -c "device; use leaf-01; set ip <ip>; commit"`
+
+#### BCM 11 observed behavior
+
+In our BCM 11 lab, `device.ip` is **read-only**:
+
+- `cmsh -c "device; use leaf-01; set ip <ip>"` → `Readonly properties cannot be set`
+
+Instead, configure the management IP under the interface object (example uses `eth0`):
+
+- `cmsh -c "device; use leaf-01; interfaces; add physical eth0 <ip> <network>; commit"`
+
+> Note: BCM may warn if you set a static IP inside a network’s DHCP dynamic range.
+
+#### Compatibility implications (for our automation + CSV)
+
+- Our CSV-driven flows must provide an interface name for BCM 11. We standardize on `eth0` for our test topology.
+- Scripts should branch:
+  - BCM 10: `device; set ip ...`
+  - BCM 11: `device; interfaces; add physical <ifname> <ip> <network>; commit`
 
 ---
 
@@ -242,6 +272,9 @@ While this is not Cumulus-specific, it’s strong evidence that BCM 11 broadened
 - **Access settings**
   - BCM 10: includes `force` in documented examples/flow
   - BCM 11: includes `Update in ztp` and `Update in NV`
+- **Device management IP modeling**
+  - BCM 10: `device.ip` is writable (examples use `device; set ip ...`)
+  - BCM 11: `device.ip` can be read-only; set IP under `device; interfaces; add physical <ifname> <ip> <network>; commit`
 - **ZTP settings surface**
   - BCM 11 adds `JSON template`, `Install lite daemon`, and additional hook submodes (pre/post-install, firmware, PTM topology)
 - **Upgrade consideration**
