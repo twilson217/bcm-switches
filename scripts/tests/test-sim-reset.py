@@ -388,6 +388,54 @@ def rebuild_switches_in_air(client: AirClient, sim_id: str, switches: list):
     return False
 
 
+def air_health_check(client: AirClient, sim_id: str, switches: list) -> bool:
+    """
+    Fast validation that NVIDIA Air API is usable for this simulation.
+
+    This is intended to catch cases where the simulation may appear "not loaded" in the UI
+    (or the API is otherwise unhealthy) even if the underlying simulation is actually running.
+
+    Checks (no side effects):
+    - Can fetch the simulation object
+    - Can list nodes for the simulation
+    - Expected switch node names are present in the returned node list
+    """
+    print("\nNVIDIA Air health-check (no side effects)")
+    try:
+        sim = client.get_simulation(sim_id)
+        title = sim.get("title") or sim.get("name") or sim_id
+        state = sim.get("state", "unknown")
+        print(f"  ✓ Simulation reachable: {title} (state={state})")
+    except Exception as e:
+        print(f"  ✗ Failed to fetch simulation {sim_id}: {e}")
+        return False
+
+    try:
+        nodes_data = client.get_simulation_nodes(sim_id)
+        if isinstance(nodes_data, dict):
+            nodes = nodes_data.get("results", [])
+        else:
+            nodes = nodes_data
+        print(f"  ✓ Nodes endpoint OK: {len(nodes)} nodes returned")
+    except Exception as e:
+        print(f"  ✗ Failed to list simulation nodes: {e}")
+        return False
+
+    names = {n.get("name", "") for n in nodes if isinstance(n, dict)}
+    missing = [sw for sw in switches if sw not in names]
+    if missing:
+        print("  ✗ Expected switches not found in simulation nodes list:")
+        for sw in missing:
+            print(f"    - {sw}")
+        sample = sorted([n for n in names if n])[:25]
+        if sample:
+            print(f"  Sample node names: {', '.join(sample)}")
+        return False
+
+    print("  ✓ Expected switch nodes are present")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Reset test simulation for automated testing",
@@ -418,6 +466,8 @@ Examples:
                        help="Skip NVIDIA Air rebuild")
     parser.add_argument("--list", action="store_true",
                        help="List available NVIDIA Air simulations and exit")
+    parser.add_argument("--health-check", action="store_true",
+                       help="Validate NVIDIA Air API + simulation access (no side effects) and exit")
     parser.add_argument("--debug", action="store_true",
                        help="Show debug information")
     sim_group = parser.add_mutually_exclusive_group()
@@ -475,6 +525,8 @@ Examples:
         sys.exit(0)
     
     # For non-list operations, require simulation name/ID (CLI args override .env)
+    # Health-check also requires a simulation selection.
+    # For non-list operations, require simulation name/ID (CLI args override .env)
     eff_sim_name, eff_sim_id = _effective_simulation_from_args_env(args, env)
     if not eff_sim_name and not eff_sim_id:
         print(f"\nMissing SIMULATION_NAME or SIMULATION_ID in {ENV_FILE}")
@@ -500,6 +552,31 @@ Examples:
     # Get switches from topology
     switches = get_switches_from_topology()
     print(f"\nSwitches to manage: {', '.join(switches)}")
+
+    # Handle --health-check (no BCM cleanup, no rebuild; just validate API + simulation access)
+    if args.health_check:
+        api_url = env.get('AIR_API_URL', 'https://air.nvidia.com')
+        print(f"\nConnecting to {api_url}...")
+        client = AirClient(api_url, env['AIR_USERNAME'], env['AIR_API_TOKEN'])
+        try:
+            client.login()
+            print("  ✓ Logged in successfully")
+        except Exception as e:
+            print(f"  ✗ Login failed: {e}")
+            sys.exit(1)
+
+        # Resolve simulation ID if only a name is provided
+        sim_name, sim_id = _effective_simulation_from_args_env(args, env)
+        if sim_name and not sim_id:
+            sim = client.find_simulation_by_name(sim_name)
+            if sim:
+                sim_id = sim.get("id")
+        if not sim_id:
+            print("  ✗ Could not resolve simulation ID (check SIMULATION_ID or SIMULATION_NAME)")
+            sys.exit(1)
+
+        ok = air_health_check(client, sim_id, switches)
+        sys.exit(0 if ok else 1)
     
     # Step 1: BCM cleanup
     if not args.skip_bcm:

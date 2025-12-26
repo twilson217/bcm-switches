@@ -429,6 +429,10 @@ def expect_available() -> bool:
     return shutil.which("expect") is not None
 
 
+def sshpass_available() -> bool:
+    return shutil.which("sshpass") is not None
+
+
 def expect_handle_forced_password_change(ip: str, old_password: str, new_password: str,
                                         user: str = "cumulus", timeout: int = 60) -> Tuple[bool, str]:
     """
@@ -760,6 +764,20 @@ class TestRunner:
             self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
 
         return result
+
+    def air_health_check(self) -> StepResult:
+        """
+        Fast validation that NVIDIA Air API + simulation are accessible.
+
+        This catches cases where the sim may appear "not loaded" in the UI (or API is unhealthy)
+        even if SSH to nodes still works. Without this, resets can hang until timeout and mask root cause.
+        """
+        return self.run_step(
+            "NVIDIA Air health-check (API + simulation access)",
+            "scripts/tests/test-sim-reset.py",
+            "--health-check",
+            timeout=90,
+        )
     
     def reset_simulation(self) -> StepResult:
         """
@@ -1466,6 +1484,15 @@ class TestRunner:
         
         # Step 1: Rebuild test switches + BCM cleanup
         if not skip_reset:
+            step = self.air_health_check()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
             step = self.reset_simulation()
             steps.append(step)
             if not step.success:
@@ -1577,6 +1604,15 @@ class TestRunner:
         
         # Step 1: Rebuild test switches + BCM cleanup
         if not skip_reset:
+            step = self.air_health_check()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
             step = self.reset_simulation()
             steps.append(step)
             if not step.success:
@@ -1689,6 +1725,15 @@ class TestRunner:
         
         # Step 1: Rebuild test switches + BCM cleanup
         if not skip_reset:
+            step = self.air_health_check()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
             step = self.reset_simulation()
             steps.append(step)
             if not step.success:
@@ -1811,36 +1856,9 @@ class TestRunner:
             # We intentionally do NOT clear config.json here because we want to preserve BCM state.
             pass
 
-        # Step 1: Confirm staging (config-only)
-        step = self.ztp_preflight_config()
-        steps.append(step)
-        if not step.success:
-            test.success = False
-
-        # Step 2: Enable lite-daemon via ZTP + initialize
-        step = self.enable_cm_lite_daemon_via_ztp()
-        steps.append(step)
-        if not step.success:
-            test.success = False
-
-        # Step 3: Add marker to config
-        step = self.set_eth0_description_marker("ZTP Works!")
-        steps.append(step)
-        if not step.success:
-            test.success = False
-
-        # Step 4: Rebuild switches (keep BCM)
-        if not skip_reset:
-            step = self.reset_switches_keep_bcm()
-            steps.append(step)
-            if not step.success:
-                test.success = False
-                test.steps = steps
-                test.end_time = datetime.now().isoformat()
-                test.duration = time.time() - start
-                return test
-
-        # Step 5: Preflight oob bridge + refresh DHCP CSV and hostnames
+        # Step 1: Preflight oob bridge + refresh DHCP CSV and hostnames
+        # We do this BEFORE attempting any step that depends on from-dhcp.csv (marker, preflight config-only),
+        # so Test 4 can run standalone and doesn't fail with "Failed to read from-dhcp.csv" as a secondary symptom.
         step = self.preflight_oob_bridge_and_wait_for_dhcp()
         steps.append(step)
         if not step.success:
@@ -1868,13 +1886,81 @@ class TestRunner:
             test.duration = time.time() - start
             return test
 
-        # Step 6: Wait for ZTP complete
+        # Step 2: Confirm staging (config-only)
+        step = self.ztp_preflight_config()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 3: Enable lite-daemon via ZTP + initialize
+        step = self.enable_cm_lite_daemon_via_ztp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 4: Add marker to config
+        step = self.set_eth0_description_marker("ZTP Works!")
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 5: Rebuild switches (keep BCM)
+        if not skip_reset:
+            step = self.air_health_check()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
+            step = self.reset_switches_keep_bcm()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
+        # Step 6: Preflight oob bridge + refresh DHCP CSV and hostnames AFTER rebuild
+        # (IP leases can change after rebuild)
+        if not skip_reset:
+            step = self.preflight_oob_bridge_and_wait_for_dhcp()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
+            step = self.generate_csv_from_dhcp()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
+            step = self.map_hostnames()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
+        # Step 7: Wait for ZTP complete
         step = self.wait_for_ztp_complete()
         steps.append(step)
         if not step.success:
             test.success = False
 
-        # Step 7: Validate outcomes
+        # Step 8: Validate outcomes
         step = self.validate_ztp_recovery("ZTP Works!")
         steps.append(step)
         if not step.success:
@@ -2029,6 +2115,14 @@ Prerequisites:
             print(f"\nError: {env_file} not found")
             print("Please copy sample-configs/sample.env to .env and configure it.")
             sys.exit(1)
+        if not sshpass_available():
+            print("\nError: required tool 'sshpass' was not found in PATH.")
+            print("test-loop uses sshpass for non-interactive SSH to switches.")
+            sys.exit(1)
+        if not expect_available():
+            # Not always required, but extremely helpful when devices force a password change.
+            print("\nWarning: 'expect' was not found in PATH.")
+            print("Some NVIDIA Air topologies may require expect to handle forced password changes on first login.")
     
     # Logging
     logger = RunLogger(enabled=not args.dry_run)
@@ -2064,6 +2158,8 @@ Prerequisites:
                 rc, out, err = run_cmd(f"sysctl -w net.ipv4.ip_forward={forward}", timeout=10)
                 if rc != 0:
                     print(f"\nError: failed to set ip_forward={forward}: {err or out}")
+                    if os.geteuid() != 0:
+                        print("Hint: run test-loop as root (or via sudo) so it can change sysctl settings.")
                     sys.exit(1)
                 print(f"\nMode '{mode}': set net.ipv4.ip_forward={forward}")
 
