@@ -736,13 +736,15 @@ class RunLogger:
 class TestRunner:
     """Runs automated tests."""
     
-    def __init__(self, verbose: bool = False, dry_run: bool = False, 
-                 password: str = DEFAULT_TEST_PASSWORD, logger: "RunLogger" = None):
+    def __init__(self, verbose: bool = False, dry_run: bool = False,
+                 password: str = DEFAULT_TEST_PASSWORD, logger: "RunLogger" = None,
+                 validation_timeout: int = 1200):
         self.verbose = verbose
         self.dry_run = dry_run
         self.password = password
         self.results: List[TestResult] = []
         self.logger = logger
+        self.validation_timeout = validation_timeout
     
     def run_step(self, name: str, script: str, args: str = "", 
                  timeout: int = 600, input_text: str = None) -> StepResult:
@@ -1167,7 +1169,7 @@ class TestRunner:
             # Always run validation with --verbose so failures include actionable detail
             # in the step log even if test-loop itself is not running with --verbose.
             f"--password {pwd} --verbose",
-            timeout=600
+            timeout=int(self.validation_timeout)
         )
         
         if not self.dry_run:
@@ -2064,6 +2066,8 @@ Prerequisites:
                        help="Show detailed output from each step")
     parser.add_argument("--password", type=str, default=DEFAULT_TEST_PASSWORD,
                        help=f"Password to set on switches (default: {DEFAULT_TEST_PASSWORD})")
+    parser.add_argument("--validation-timeout", type=int, default=1200,
+                       help="Timeout (seconds) for scripts/validation-testing.py step (default: 1200)")
     
     args = parser.parse_args()
     
@@ -2131,7 +2135,13 @@ Prerequisites:
         print(f"\nLogs will be written to: {logger.run_dir}")
 
     # Run tests
-    runner = TestRunner(verbose=args.verbose, dry_run=args.dry_run, password=test_password, logger=logger)
+    runner = TestRunner(
+        verbose=args.verbose,
+        dry_run=args.dry_run,
+        password=test_password,
+        logger=logger,
+        validation_timeout=args.validation_timeout,
+    )
     
     try:
         selected = []

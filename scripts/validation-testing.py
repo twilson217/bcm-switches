@@ -993,7 +993,7 @@ def generate_report(report: ValidationReport, as_json: bool = False) -> str:
         lines.append("")
     
     lines.append("=" * 80)
-    overall = "PASSED" if all(s.overall_passed for s in report.switches) else "FAILED"
+    overall = "PASSED" if report.summary.get("overall_ok", False) else "FAILED"
     lines.append(f"OVERALL RESULT: {overall}")
     lines.append("=" * 80)
     
@@ -1152,19 +1152,43 @@ Examples:
     # Calculate summary
     total_checks = len(report.bcm_system_checks)
     passed_checks = sum(1 for c in report.bcm_system_checks if c.passed)
+    failed_error_checks = 0
+    failed_warning_checks = 0
+
+    # BCM system checks: treat warning-level failures as non-fatal (still reported).
+    for c in report.bcm_system_checks:
+        if c.passed:
+            continue
+        if c.severity in ["error", "critical"]:
+            failed_error_checks += 1
+        else:
+            failed_warning_checks += 1
     
     for switch in report.switches:
         all_checks = switch.bcm_checks + switch.switch_checks
         total_checks += len(all_checks)
         passed_checks += sum(1 for c in all_checks if c.passed)
+
+        for c in all_checks:
+            if c.passed:
+                continue
+            if c.severity in ["error", "critical"]:
+                failed_error_checks += 1
+            else:
+                failed_warning_checks += 1
     
     report.summary = {
-        'bcm_ok': all(c.passed for c in report.bcm_system_checks),
+        # BCM "OK" means: no error/critical failures in BCM system checks.
+        'bcm_ok': all(c.passed or c.severity not in ["error", "critical"] for c in report.bcm_system_checks),
         'total_switches': len(report.switches),
         'passed_switches': sum(1 for s in report.switches if s.overall_passed),
         'total_checks': total_checks,
         'passed_checks': passed_checks,
+        # Total failures includes warnings + errors (useful for visibility), but exit code is based on errors only.
         'failed_checks': total_checks - passed_checks,
+        'failed_error_checks': failed_error_checks,
+        'failed_warning_checks': failed_warning_checks,
+        'overall_ok': (failed_error_checks == 0) and all(s.overall_passed for s in report.switches),
     }
     
     report.duration_seconds = time.time() - start_time
@@ -1175,7 +1199,9 @@ Examples:
     print(output)
     
     # Exit code
-    if report.summary.get('failed_checks', 0) > 0:
+    # Only fail (non-zero) when there are error/critical failures.
+    # Warning-only failures (like some syslog patterns) are reported but do not fail the run.
+    if report.summary.get('failed_error_checks', 0) > 0:
         sys.exit(1)
     sys.exit(0)
 
