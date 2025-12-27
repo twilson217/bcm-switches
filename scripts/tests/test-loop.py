@@ -1394,9 +1394,13 @@ class TestRunner:
 
     def set_eth0_description_marker(self, description: str = "ZTP Works!") -> StepResult:
         """
-        Add a deterministic marker to the running config on each switch so Test 4 can verify ZTP restored it.
+        Add a deterministic marker to the BCM-staged startup.yaml (NOT the running switch config).
+
+        Rationale (Test 4): we want to prove ZTP restored config from BCM. If we set the marker
+        on the switch first, seeing it later doesn't prove anything. Instead, we patch the
+        staged file under BCM htdocs so the marker only appears on the switch if ZTP worked.
         """
-        step_name = f"Set eth0 description marker ({description})"
+        step_name = f"Set BCM-staged eth0 description marker ({description})"
         start = time.time()
 
         if self.dry_run:
@@ -1405,70 +1409,72 @@ class TestRunner:
                 success=True,
                 duration=0,
                 message="[DRY RUN] Skipped",
-                output="Would: nv set interface eth0 description + apply on each switch",
-                command="nv set interface eth0 description ...; nv config apply -y",
+                output="Would: patch BCM htdocs staged startup.yaml to include eth0 description marker",
+                command="/cm/local/apps/cmd/etc/htdocs/switch/<sw>/startup.yaml",
             )
             if self.logger is not None:
                 self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
             return step
-
-        # Use current CSV mapping (generated earlier in the test).
-        try:
-            with open(FROM_DHCP_CSV, "r") as f:
-                rows = list(csv.DictReader(f))
-        except Exception as e:
-            step = StepResult(
-                name=step_name,
-                success=False,
-                duration=time.time() - start,
-                message="Failed to read from-dhcp.csv",
-                output=str(e),
-                command=str(FROM_DHCP_CSV),
-            )
-            if self.logger is not None:
-                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
-            return step
-
-        hn_to_ip: Dict[str, str] = {}
-        for r in rows:
-            hn = (r.get("Hostname") or r.get("hostname") or "").strip()
-            ip = (r.get("IP") or r.get("ip") or "").strip()
-            if hn and ip:
-                hn_to_ip[hn] = ip
 
         logs: List[str] = []
         ok_all = True
+        base_dir = Path("/cm/local/apps/cmd/etc/htdocs/switch")
         for sw in TEST_SWITCHES:
-            ip = hn_to_ip.get(sw, "")
-            if not ip:
+            p = base_dir / sw / "startup.yaml"
+            if not p.exists():
                 ok_all = False
-                logs.append(f"{sw}: missing IP in {FROM_DHCP_CSV}")
+                logs.append(f"{sw}: missing staged file: {p}")
+                continue
+            try:
+                lines = p.read_text(errors="replace").splitlines()
+            except Exception as e:
+                ok_all = False
+                logs.append(f"{sw}: failed to read {p}: {e}")
                 continue
 
-            # Apply marker via NVUE (writes canonical startup.yaml).
-            cmds = [
-                f"nv set interface eth0 description \"{description}\"",
-                "nv config apply -y",
-            ]
-
-            for cmd in cmds:
-                rc, out, err = sshpass_run("cumulus", self.password, ip, cmd, timeout=120)
-                logs.append(f"{sw} ({ip}) $ {cmd}\nrc={rc}\n{(out or '').strip()}\n{(err or '').strip()}")
-                if rc != 0:
-                    # Retry with sudo
-                    sudo_cmd = f"echo {self.password} | sudo -S {cmd}"
-                    rc2, out2, err2 = sshpass_run("cumulus", self.password, ip, sudo_cmd, timeout=120)
-                    logs.append(f"{sw} ({ip}) $ {sudo_cmd}\nrc={rc2}\n{(out2 or '').strip()}\n{(err2 or '').strip()}")
-                    if rc2 != 0:
-                        ok_all = False
-                        break
-
-            # Verify marker landed in startup.yaml
-            verify = f"echo {self.password} | sudo -S grep -q \"description: {description}\" /etc/nvue.d/startup.yaml && echo OK"
-            rc3, out3, err3 = sshpass_run("cumulus", self.password, ip, verify, timeout=60)
-            logs.append(f"{sw} ({ip}) $ verify startup.yaml marker\nrc={rc3}\n{(out3 or '').strip()}\n{(err3 or '').strip()}")
-            if rc3 != 0:
+            # Find eth0 block and set/replace the 'description:' line.
+            eth0_idx = None
+            for i, line in enumerate(lines):
+                if re.match(r"^\s*eth0:\s*$", line):
+                    eth0_idx = i
+                    break
+            if eth0_idx is None:
                 ok_all = False
+                logs.append(f"{sw}: could not find 'eth0:' in {p} (cannot inject marker)")
+                continue
+
+            eth0_indent = len(lines[eth0_idx]) - len(lines[eth0_idx].lstrip(" "))
+            child_indent = eth0_indent + 2
+            child_prefix = " " * child_indent
+
+            # Determine eth0 block end (next line with indent <= eth0_indent, excluding blank lines).
+            end = len(lines)
+            for j in range(eth0_idx + 1, len(lines)):
+                s = lines[j]
+                if not s.strip():
+                    continue
+                ind = len(s) - len(s.lstrip(" "))
+                if ind <= eth0_indent:
+                    end = j
+                    break
+
+            desc_line = f"{child_prefix}description: {description}"
+            replaced = False
+            for j in range(eth0_idx + 1, end):
+                if lines[j].startswith(child_prefix + "description:"):
+                    lines[j] = desc_line
+                    replaced = True
+                    break
+            if not replaced:
+                # Insert immediately after eth0: so it's clearly within the eth0 block.
+                lines.insert(eth0_idx + 1, desc_line)
+
+            try:
+                p.write_text("\n".join(lines) + "\n")
+                logs.append(f"{sw}: updated {p} ({'replaced' if replaced else 'inserted'})")
+            except Exception as e:
+                ok_all = False
+                logs.append(f"{sw}: failed to write {p}: {e}")
 
         step = StepResult(
             name=step_name,
@@ -1476,7 +1482,7 @@ class TestRunner:
             duration=time.time() - start,
             message="Success" if ok_all else "Failed",
             output="\n\n".join(logs)[-8000:],
-            command="nv set/apply on switches",
+            command="patch BCM staged startup.yaml",
         )
         if self.logger is not None:
             self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
@@ -1659,7 +1665,7 @@ class TestRunner:
             if rc3 != 0 or "UP" not in (out3 or ""):
                 ok_all = False
 
-        return StepResult(
+        step = StepResult(
             name=step_name,
             success=ok_all,
             duration=time.time() - start,
@@ -1667,6 +1673,10 @@ class TestRunner:
             output="\n".join(logs)[-8000:],
             command="marker+service+cmsh status",
         )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
+
     
     def run_test_1(self, skip_reset: bool = False) -> TestResult:
         """
