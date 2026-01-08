@@ -14,9 +14,14 @@ Generate a CSV file from DHCP leases for switch discovery.
 # Output: .configs/from-dhcp.csv
 ```
 
+The generated CSV includes:
+- `Hostname`, `IP`, `MAC`, `Network`
+- `Interface` (**new**) - management interface name (default `eth0`). **Required on BCM 11** because `device.ip` is read-only and IP is set under `device -> interfaces`.
+
 **Options:**
 - `--output FILE` - Custom output path
 - `--filter VENDOR` - Filter by vendor class
+- `--interface IFNAME` - Interface name to write in the CSV (default: `eth0`)
 
 ### `change-switch-defaults.py`
 Change default password, hostname, and/or ZTP settings on Cumulus switches.
@@ -148,7 +153,7 @@ Comprehensive validation of BCM switch deployment. Checks both BCM-side and swit
 *Per-Switch BCM Checks:*
 - Device exists in BCM
 - Device status (UP vs INSTALLER_UNREACHABLE)
-- `cumulusmode` set to MANUAL (monitoring-only)
+- Config mode set to MANUAL (BCM 10: `cumulusmode`, BCM 11: `nvconfigurationmode`)
 - ZTP "run on each boot" disabled
 - `hasclientdaemon` set
 - Network assignment
@@ -185,3 +190,54 @@ Comprehensive validation of BCM switch deployment. Checks both BCM-side and swit
 Scripts in `tests/` directory interact with the NVIDIA Air API and require additional Python packages.
 
 See [tests/README.md](tests/README.md) for setup instructions.
+
+---
+
+## ZTP Staging / Preflight (brownfield DR/RMA)
+
+These scripts prepare BCM-side artifacts for future ZTP use **without enabling ZTP automatically**.
+
+### `ztp-staging.py`
+Stages ZTP configuration artifacts from each switch’s current running config by copying:
+- `/etc/nvue.d/startup.yaml` (from the switch)
+to:
+- `/cm/local/apps/cmd/etc/htdocs/switch/<switch>/startup.yaml` (on BCM)
+
+It also sets in BCM:
+- Config mode = file (BCM 10: `cumulusmode`, BCM 11: `nvconfigurationmode`)
+- Config file = startup.yaml (BCM 10: `cumulusfile`, BCM 11: `nvconfigurationfile`)
+and runs:
+- `cmsh -c "device; use <switch>; initialize"`
+
+**Config-only staging (default):**
+
+```bash
+./scripts/ztp-staging.py --from-bcm
+```
+
+**Optional image staging:** By default BCM serves images under the HTTP path `.../switch/image/<filename>` (note: `image` is singular on BCM 10.x/11.x we’ve checked). If you enable image staging, `ztp-staging.py` copies the selected `cumulus-*.bin` into:
+- `/cm/local/apps/cmd/etc/htdocs/switch/image/`
+and sets `ztpsettings image` to the filename (while keeping `checkimageonboot=no`).
+
+### `ztp-preflight.py`
+Prints a BCM-sourced ZTP readiness **checklist** before you manually enable ZTP.
+
+It prints every check it performs, plus explicit **manual TODO steps** (like DHCP option config and switch-side ZTP enable/disable confirmation).
+
+By default it runs both config and image checks:
+
+```bash
+./scripts/ztp-preflight.py
+```
+
+**Only config checks:**
+
+```bash
+./scripts/ztp-preflight.py --config-only
+```
+
+**Only image checks:**
+
+```bash
+./scripts/ztp-preflight.py --image-only
+```

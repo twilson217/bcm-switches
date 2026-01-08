@@ -34,6 +34,32 @@ from pathlib import Path
 import getpass
 import shlex
 from typing import Dict, List, Optional, Tuple
+import os
+import time
+from contextlib import suppress
+
+# BCM version compatibility
+from bcm_compat import BCMProps, get_bcm_version, get_cmsh_cmd
+
+# cmsh command - use full path to avoid dependency on 'module load cmsh'
+CMSH = get_cmsh_cmd()
+
+# region agent log
+def _dbg(hypothesis_id: str, location: str, message: str, data: Dict):
+    # NOTE: do NOT log secrets (passwords/tokens). Keep payloads small.
+    payload = {
+        "sessionId": "debug-session",
+        "runId": os.getenv("DEBUG_RUN_ID", ""),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    with suppress(Exception):
+        with open("/root/CUMULUS_in_BCM/.cursor/debug.log", "a") as f:
+            f.write(json.dumps(payload) + "\n")
+# endregion
 
 # ============================================================================
 # Configuration
@@ -200,6 +226,9 @@ def read_csv_file(csv_path: Path) -> List[Dict]:
                     'hostname': row.get('Hostname') or row.get('hostname', ''),
                     'ip': row.get('IP') or row.get('ip', ''),
                     'mac': (row.get('MAC') or row.get('mac', '')).upper(),
+                    # BCM 11 uses device->interfaces for management IP (device.ip may be read-only).
+                    # We accept/ignore this field here; it may be useful for other tooling.
+                    'interface': row.get('Interface') or row.get('interface', '') or '',
                 }
                 if device['ip']:
                     devices.append(device)
@@ -295,6 +324,36 @@ class BCMSystemValidator:
         
         error_count = len(out.strip().split('\n'))
         lines = [l for l in out.split('\n') if l.strip()]
+
+        # Filter known-benign messages that can occur during ZTP settings preparation on some BCM installs.
+        # Example observed on BCM 11: missing optional /etc/apt/auth.conf.d/cm-nightly.conf
+        benign_patterns = [
+            re.compile(r"ZTPSettings::prepare: failed to copy: /etc/apt/auth\.conf\.d/cm-nightly\.conf", re.IGNORECASE),
+        ]
+        filtered: List[str] = []
+        ignored = 0
+        for l in lines:
+            if any(p.search(l) for p in benign_patterns):
+                ignored += 1
+                continue
+            filtered.append(l)
+
+        # If everything matched a known benign pattern, don't fail the run.
+        if filtered == [] and ignored > 0:
+            deduped = dedupe_lines_with_counts(lines, limit=8)
+            detail_lines = []
+            for cnt, msg in deduped:
+                prefix = f"({cnt}x) " if cnt > 1 else ""
+                detail_lines.append(prefix + msg)
+            return CheckResult(
+                name="BCM syslog errors",
+                passed=True,
+                message=f"No actionable BCM syslog errors (ignored {ignored} known-benign message(s))",
+                details="\n".join(detail_lines) if (self.verbose and detail_lines) else None,
+                severity="warning",
+            )
+
+        lines = filtered
         deduped = dedupe_lines_with_counts(lines, limit=8)
         detail_lines = []
         for cnt, msg in deduped:
@@ -334,7 +393,7 @@ class BCMDeviceValidator:
     def _load_device_info(self):
         """Load device info from BCM."""
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; show' 2>/dev/null"
+            f"{CMSH} -c 'device; use {self.hostname}; show' 2>/dev/null"
         )
         if rc == 0:
             for line in out.split('\n'):
@@ -348,7 +407,7 @@ class BCMDeviceValidator:
     def check_device_exists(self) -> CheckResult:
         """Check if device exists in BCM."""
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; get hostname' 2>/dev/null"
+            f"{CMSH} -c 'device; use {self.hostname}; get hostname' 2>/dev/null"
         )
         if self.hostname in out:
             return CheckResult(
@@ -366,7 +425,7 @@ class BCMDeviceValidator:
     def check_device_status(self) -> CheckResult:
         """Check device status in BCM."""
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; get status' 2>/dev/null"
+            f"{CMSH} -c 'device; use {self.hostname}; get status' 2>/dev/null"
         )
         status = out.strip()
         
@@ -401,22 +460,51 @@ class BCMDeviceValidator:
         )
     
     def check_cumulus_mode(self) -> CheckResult:
-        """Check if cumulusmode is set to MANUAL."""
+        """
+        Check BCM config mode.
+
+        Historically this validation expected MANUAL (monitoring-only).
+        When ZTP staging is enabled, it is valid/expected for BCM to be in FILE mode
+        (pointing at startup.yaml) while still having ZTP run-on-boot disabled.
+        """
+        props = BCMProps()
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; get cumulusmode' 2>/dev/null"
+            f"{CMSH} -c 'device; use {self.hostname}; get {props.config_mode}' 2>/dev/null"
         )
         mode = out.strip().upper()
         
         if 'MANUAL' in mode:
             return CheckResult(
-                name="Cumulus mode",
+                name="Config mode",
                 passed=True,
-                message="cumulusmode is MANUAL (monitoring-only)"
+                message=f"{props.config_mode} is MANUAL (monitoring-only)"
             )
+
+        if 'FILE' in mode:
+            # If staging ZTP, we expect FILE mode + startup.yaml.
+            rc2, out2, err2 = run_cmd(
+                f"{CMSH} -c 'device; use {self.hostname}; get {props.config_file}' 2>/dev/null"
+            )
+            cfg_file = (out2.strip() or "").lower()
+            if "startup.yaml" in cfg_file:
+                return CheckResult(
+                    name="Config mode",
+                    passed=True,
+                    message=f"{props.config_mode} is FILE (ZTP staged: {props.config_file}={cfg_file})",
+                    severity="warning",
+                )
+            return CheckResult(
+                name="Config mode",
+                passed=False,
+                message=f"{props.config_mode} is FILE but {props.config_file} is '{cfg_file}' (expected startup.yaml)",
+                details="If you staged ZTP, ensure config file is startup.yaml; otherwise use monitoring-only mode (MANUAL).",
+                severity="warning",
+            )
+
         return CheckResult(
-            name="Cumulus mode",
+            name="Config mode",
             passed=False,
-            message=f"cumulusmode is {mode}, expected MANUAL",
+            message=f"{props.config_mode} is {mode}, expected MANUAL",
             details="Run deploy script to set monitoring-only mode",
             severity="warning"
         )
@@ -424,7 +512,7 @@ class BCMDeviceValidator:
     def check_ztp_disabled(self) -> CheckResult:
         """Check if ZTP 'run on each boot' is disabled in BCM."""
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; ztpsettings; "
+            f"{CMSH} -c 'device; use {self.hostname}; ztpsettings; "
             f"get runztponeachboot' 2>/dev/null"
         )
         
@@ -445,7 +533,7 @@ class BCMDeviceValidator:
     def check_has_client_daemon(self) -> CheckResult:
         """Check if hasclientdaemon is set."""
         rc, out, err = run_cmd(
-            f"cmsh -c 'device; use {self.hostname}; get hasclientdaemon' 2>/dev/null"
+            f"{CMSH} -c 'device; use {self.hostname}; get hasclientdaemon' 2>/dev/null"
         )
         
         if 'yes' in out.lower():
@@ -928,7 +1016,7 @@ def generate_report(report: ValidationReport, as_json: bool = False) -> str:
         lines.append("")
     
     lines.append("=" * 80)
-    overall = "PASSED" if all(s.overall_passed for s in report.switches) else "FAILED"
+    overall = "PASSED" if report.summary.get("overall_ok", False) else "FAILED"
     lines.append(f"OVERALL RESULT: {overall}")
     lines.append("=" * 80)
     
@@ -974,7 +1062,6 @@ Examples:
     
     args = parser.parse_args()
     
-    import time
     start_time = time.time()
     
     # Get password (prefer CLI, then repo config, else prompt/error)
@@ -992,18 +1079,21 @@ Examples:
     
     # Determine switches to validate
     switches = []
+    source = "unknown"
     
     if args.switch:
         switches = [{'ip': args.switch, 'hostname': '', 'mac': ''}]
+        source = "switch-arg"
     elif args.csv:
         csv_path = Path(args.csv)
         if not csv_path.exists():
             print(f"Error: CSV file not found: {csv_path}")
             sys.exit(1)
         switches = read_csv_file(csv_path)
+        source = "csv"
     else:
         # Try to get switches from BCM
-        rc, out, err = run_cmd("cmsh -c 'device; list' 2>/dev/null")
+        rc, out, err = run_cmd(f"{CMSH} -c 'device; list' 2>/dev/null")
         if rc == 0:
             for line in out.split('\n'):
                 if 'Switch' in line:
@@ -1017,6 +1107,18 @@ Examples:
                             'ip': ip,
                             'mac': mac
                         })
+        source = "bcm"
+
+    _dbg(
+        "H2",
+        "scripts/validation-testing.py:main",
+        "Selected switches for validation",
+        {
+            "source": source,
+            "count": len(switches),
+            "count_ip_0": sum(1 for s in switches if (s.get("ip") or "").strip() == "0.0.0.0"),
+        },
+    )
     
     if not switches and not args.bcm_only:
         print("No switches found to validate.")
@@ -1087,19 +1189,43 @@ Examples:
     # Calculate summary
     total_checks = len(report.bcm_system_checks)
     passed_checks = sum(1 for c in report.bcm_system_checks if c.passed)
+    failed_error_checks = 0
+    failed_warning_checks = 0
+
+    # BCM system checks: treat warning-level failures as non-fatal (still reported).
+    for c in report.bcm_system_checks:
+        if c.passed:
+            continue
+        if c.severity in ["error", "critical"]:
+            failed_error_checks += 1
+        else:
+            failed_warning_checks += 1
     
     for switch in report.switches:
         all_checks = switch.bcm_checks + switch.switch_checks
         total_checks += len(all_checks)
         passed_checks += sum(1 for c in all_checks if c.passed)
+
+        for c in all_checks:
+            if c.passed:
+                continue
+            if c.severity in ["error", "critical"]:
+                failed_error_checks += 1
+            else:
+                failed_warning_checks += 1
     
     report.summary = {
-        'bcm_ok': all(c.passed for c in report.bcm_system_checks),
+        # BCM "OK" means: no error/critical failures in BCM system checks.
+        'bcm_ok': all(c.passed or c.severity not in ["error", "critical"] for c in report.bcm_system_checks),
         'total_switches': len(report.switches),
         'passed_switches': sum(1 for s in report.switches if s.overall_passed),
         'total_checks': total_checks,
         'passed_checks': passed_checks,
+        # Total failures includes warnings + errors (useful for visibility), but exit code is based on errors only.
         'failed_checks': total_checks - passed_checks,
+        'failed_error_checks': failed_error_checks,
+        'failed_warning_checks': failed_warning_checks,
+        'overall_ok': (failed_error_checks == 0) and all(s.overall_passed for s in report.switches),
     }
     
     report.duration_seconds = time.time() - start_time
@@ -1110,7 +1236,9 @@ Examples:
     print(output)
     
     # Exit code
-    if report.summary.get('failed_checks', 0) > 0:
+    # Only fail (non-zero) when there are error/critical failures.
+    # Warning-only failures (like some syslog patterns) are reported but do not fail the run.
+    if report.summary.get('failed_error_checks', 0) > 0:
         sys.exit(1)
     sys.exit(0)
 

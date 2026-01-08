@@ -59,7 +59,14 @@ cmsh
 device
 add switch leaf-01
 use leaf-01
-set ip 192.168.200.163
+
+# BCM 10.x: device.ip is writable
+# set ip 192.168.200.163
+#
+# BCM 11.x: device.ip is read-only; set the IP under the interface object (example uses eth0)
+# interfaces
+# add physical eth0 192.168.200.163 internalnet
+# exit
 set mac 44:38:39:00:01:10
 set network internalnet
 set hasclientdaemon yes
@@ -68,7 +75,10 @@ set hasclientdaemon yes
 accesssettings
 set username cumulus
 set password '<SWITCH_PASSWORD>'
-set -e force true
+#
+# Choose one depending on BCM major:
+# BCM 10.x: set -e force true
+# BCM 11.x: set -e updateinztp true
 commit
 
 # Optional: set monitoring-only intent (recommended for safety)

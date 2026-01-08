@@ -171,7 +171,7 @@ expect {{
         exp_continue
     }}
     "Current password:" {{
-        send "{DEFAULT_PASSWORD}\\r"
+        send "{initial_password}\\r"
         exp_continue
     }}
     "New password:" {{
@@ -196,7 +196,7 @@ expect {{
         }}
     }}
     -re "password:" {{
-        send "{DEFAULT_PASSWORD}\\r"
+        send "{initial_password}\\r"
         exp_continue
     }}
     "Permission denied" {{
@@ -221,9 +221,22 @@ expect {{
                 working_password = new_password
                 print(f"    ✓ Password changed")
             elif "AUTH_FAILED" in proc.stdout:
-                # Password might already be changed
-                print(f"    ⚠ Auth failed with default password (may already be changed)")
-                working_password = new_password  # Assume it was changed before
+                # Password might already be changed. Verify by trying to log in with the new password.
+                print(f"    ⚠ Auth failed with current password (may already be changed)")
+                ssh_opts = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+                verify_cmd = (
+                    f"sshpass -p {shlex.quote(new_password)} ssh {ssh_opts} "
+                    f"{DEFAULT_USERNAME}@{ip} 'echo OK'"
+                )
+                v = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True, timeout=20)
+                if v.returncode == 0 and "OK" in (v.stdout or ""):
+                    result['password_changed'] = True
+                    working_password = new_password
+                    print(f"    ✓ Password already set (verified with new password)")
+                else:
+                    result['error'] = "Auth failed with both current and new password"
+                    print(f"    ✗ Password auth failed (current + new)")
+                    return result
             else:
                 result['error'] = f"Password change failed: {proc.stdout[-200:]}"
                 print(f"    ✗ Password change failed")

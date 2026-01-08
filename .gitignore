@@ -2,6 +2,7 @@
 .configs/
 .docs/
 
+
 # Local logs
 .logs/
 
@@ -34,4 +35,3 @@ build/
 # OS
 .DS_Store
 Thumbs.db
-

@@ -4,7 +4,7 @@ Automated deployment of Cumulus switches to NVIDIA Base Command Manager (BCM) wi
 
 ## Support note
 
-This repository has been **tested on BCM 10.x only**. BCM 11.x support will come in a future iteration.
+This repository has been **tested on BCM 10.x and BCM 11.x**.
 
 ## Disclaimer
 
@@ -38,6 +38,15 @@ That's it! The script will guide you through the entire process:
 - **Smart Caching**: Downloads dependencies once, reuses for all switches
 - **Fully Airgapped Support**: Package everything for isolated networks
 
+## ZTP staging / preflight (brownfield DR/RMA)
+
+This repo now supports a staging workflow for customers who have existing BCM installations but want to **prepare** ZTP artifacts (for DR, switch RMA, or a planned maintenance window) **without enabling ZTP automatically**.
+
+- **Stage config**: `./scripts/ztp-staging.py` pulls `/etc/nvue.d/startup.yaml` from each switch and stages it under BCM htdocs, then sets `cumulusmode=file` + `cumulusfile=startup.yaml` and runs `initialize`.
+- **Optional image staging**: if desired, stage a `cumulus-*.bin` into BCM’s served image directory and set `ztpsettings image` (but keep `checkimageonboot=no` as a manual enable step).
+- **Preflight checks**: `./scripts/ztp-preflight.py` validates readiness before you manually enable ZTP.
+
+**BCM image directory note:** On BCM 10.x/11.x systems we checked, images are served under `/cm/local/apps/cmd/etc/htdocs/switch/image/` (singular) and the ZTP script uses the URL path `/switch/image/<filename>`. Some documentation mentions `images/` (plural); the staging logic checks for both.
 ## Usage
 
 ### Normal Deployment
@@ -51,6 +60,17 @@ python3 deploy_bcm_switches.py --resume
 
 # Preview what would happen without making changes
 python3 deploy_bcm_switches.py --dry-run
+```
+
+### Optional: stage ZTP after deploy
+
+At the end of a successful deployment, `deploy_bcm_switches.py` can hand off to `scripts/ztp-staging.py` to stage ZTP artifacts for future use.
+
+In interactive mode it will prompt you.
+
+In non-interactive mode you can use:
+```bash
+python3 deploy_bcm_switches.py --csv FILE --non-interactive --username cumulus --password PWD --stage-ztp
 ```
 
 ### How File Caching Works

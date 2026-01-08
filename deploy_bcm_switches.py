@@ -22,6 +22,7 @@ import getpass
 import ipaddress
 import json
 import os
+import shlex
 import re
 import shutil
 import subprocess
@@ -32,14 +33,32 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Add scripts directory to path for bcm_compat import
+sys.path.insert(0, str(Path(__file__).parent / "scripts"))
+from bcm_compat import BCMProps, get_bcm_version, get_cmsh_cmd
+
 
 # Constants
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_DIR = SCRIPT_DIR / ".configs"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CSV_FILE = CONFIG_DIR / "bcm_switches.csv"
+ZTP_CONFIG_FILE = CONFIG_DIR / "ztp-config.json"
 FILES_DIR = SCRIPT_DIR / ".files"
 CM_LITE_ZIP_PATH = Path("/cm/shared/apps/cm-lite-daemon-dist/cm-lite-daemon.zip")
+
+# Debian packages required for cm-lite-daemon installation
+# These are needed to build Python packages with native extensions
+REQUIRED_DEB_PACKAGES = [
+    "build-essential",
+    "python3-dev",
+    "python3-pip",
+    "unzip",
+]
+DEB_PACKAGES_DIR = FILES_DIR / "deb_packages"
+
+# cmsh command - use full path to avoid dependency on 'module load cmsh'
+CMSH = get_cmsh_cmd()
 
 # Password handling:
 # - Never persist real passwords in .configs/config.json (store a placeholder instead)
@@ -152,6 +171,63 @@ def maybe_delete_config_file(*, non_interactive: bool) -> None:
             print(f"Deleted {CONFIG_FILE}")
         except Exception as e:
             print(f"\nWarning: Failed to delete {CONFIG_FILE}: {e}")
+
+
+def write_ztp_config(*, vrf: str) -> None:
+    """
+    Persist ZTP-related settings across deploy + ztp-staging runs.
+
+    This is intentionally separate from config.json (progress tracking). We only delete config.json
+    at the end of successful runs; ztp-config.json persists and can be overwritten on future runs.
+    """
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"vrf": (vrf or "").strip()}
+        with open(ZTP_CONFIG_FILE, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        print(f"\nWarning: Failed to write {ZTP_CONFIG_FILE}: {e}")
+
+
+def prompt_stage_ztp(*, non_interactive: bool, cli_flag: bool) -> bool:
+    """
+    Decide whether to run ZTP staging after a successful deploy.
+
+    - Non-interactive: controlled by --stage-ztp.
+    - Interactive: prompt (default: no).
+    """
+    if non_interactive:
+        return bool(cli_flag)
+    resp = input(
+        "\nWould you like to stage ZTP (config/image prep for future DR/RMA) after deployment? (y/n) [y]: "
+    ).strip().lower()
+    # Default is now "yes" - only explicit "n" or "no" opts out
+    return resp not in ["n", "no"]
+
+
+def write_ztp_staging_csv(devices: List[Dict], path: Path) -> None:
+    """Write a minimal Hostname/IP CSV suitable for scripts/ztp-staging.py."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["Hostname", "IP"])
+        writer.writeheader()
+        for d in devices:
+            writer.writerow({"Hostname": d.get("hostname", ""), "IP": d.get("ip", "")})
+
+
+def run_ztp_staging(*, csv_path: Path, username: str, non_interactive: bool) -> int:
+    """
+    Invoke scripts/ztp-staging.py as a subprocess.
+
+    Password is expected to be present in the environment (BCM_SWITCH_SSH_PASSWORD)
+    from deploy's credential resolution.
+    """
+    staging_script = SCRIPT_DIR / "scripts" / "ztp-staging.py"
+    cmd = [sys.executable, str(staging_script), "--csv", str(csv_path), "--username", username]
+    if non_interactive:
+        cmd.append("--non-interactive")
+    r = subprocess.run(cmd, text=True)
+    return r.returncode
 
 # Default progress structure
 DEFAULT_PROGRESS = {
@@ -601,7 +677,7 @@ class NetworkDetector:
         """Get available BCM networks using cmsh."""
         try:
             result = subprocess.run(
-                ["cmsh", "-c", "network; list"],
+                [CMSH, "-c", "network; list"],
                 capture_output=True, text=True, check=True
             )
             self.networks = self._parse_network_list(result.stdout)
@@ -625,7 +701,7 @@ class NetworkDetector:
                 print(f"  stderr: {e.stderr}")
             return []
         except FileNotFoundError:
-            print("Error: cmsh command not found. Make sure you're running on a BCM system.")
+            print(f"Error: cmsh command not found at '{CMSH}'. Make sure you're running on a BCM system.")
             return []
     
     def _parse_network_list(self, output: str) -> List[Dict]:
@@ -991,7 +1067,7 @@ class BCMChecker:
         
         try:
             result = subprocess.run(
-                ["cmsh", "-c", "device; list"],
+                [CMSH, "-c", "device; list"],
                 capture_output=True, text=True, check=True
             )
             self.bcm_devices = self._parse_device_list(result.stdout)
@@ -1113,7 +1189,7 @@ class BCMDeployer:
         
         try:
             result = subprocess.run(
-                ["cmsh", "-c", "device; use master; get ip"],
+                [CMSH, "-c", "device; use master; get ip"],
                 capture_output=True, text=True, check=True
             )
             self.bcm_master_ip = result.stdout.strip()
@@ -1133,34 +1209,379 @@ class BCMDeployer:
         except:
             pass
         return None
+
+    @staticmethod
+    def _stdout_has_token(output: Optional[str], token: str) -> bool:
+        """
+        Return True if stdout contains a line that exactly matches token.
+
+        Some Cumulus environments print extra informational text on non-interactive SSH
+        (e.g. last reboot cause), which can pollute stdout and break strict equality checks.
+        """
+        if not output:
+            return False
+        return any(line.strip() == token for line in output.splitlines())
     
     def check_daemon_installed(self, device: Dict) -> bool:
         """Check if cm-lite-daemon is already installed on the device."""
         result = self._run_ssh_command(device['ip'], "test -d /opt/cm-lite-daemon && echo yes")
-        return result == "yes"
+        return self._stdout_has_token(result, "yes")
     
     def check_transfer_complete(self, device: Dict) -> bool:
         """Check if all required files have been transferred to the device."""
-        # Check for both cm-lite-daemon.zip and pip_packages_dep directory
-        result = self._run_ssh_command(device['ip'], 
+        # Validate payload, not just existence:
+        # - cm-lite-daemon directory exists (we extract on BCM and rsync the directory so switches don't need unzip)
+        # - pip dir exists and has at least 1 file
+        # - if we have cached debs locally, require deb_packages on the switch too
+        has_cached_debs = DEB_PACKAGES_DIR.exists() and len(list(DEB_PACKAGES_DIR.glob("*.deb"))) >= 5
+
+        base_checks = (
+            f"test -d /home/{self.username}/cm-lite-daemon && "
+            f"test -f /home/{self.username}/cm-lite-daemon/requirements.txt && "
             f"test -d /home/{self.username}/pip_packages_dep && "
-            f"test -f /home/{self.username}/cm-lite-daemon.zip && echo yes")
-        return result == "yes"
+            f"ls /home/{self.username}/pip_packages_dep/* >/dev/null 2>&1"
+        )
+        if has_cached_debs:
+            cmd = (
+                f"{base_checks} && "
+                f"test -d /home/{self.username}/deb_packages && "
+                f"ls /home/{self.username}/deb_packages/*.deb >/dev/null 2>&1 && "
+                f"echo yes"
+            )
+        else:
+            cmd = f"{base_checks} && echo yes"
+
+        result = self._run_ssh_command(device['ip'], cmd)
+        return self._stdout_has_token(result, "yes")
     
     def check_daemon_registered(self, device: Dict) -> bool:
         """Check if device is already registered with BCM (has certificates)."""
-        result = self._run_ssh_command(device['ip'], 
-            "test -f /opt/cm-lite-daemon/etc/bootstrap.key && echo yes")
-        return result == "yes"
+        # bootstrap.* just means we copied bootstrap files; it does NOT mean the node completed
+        # registration. A successful register_node run should produce cert.key + cert.pem.
+        result = self._run_ssh_command(
+            device["ip"],
+            "test -f /opt/cm-lite-daemon/etc/cert.key -a -f /opt/cm-lite-daemon/etc/cert.pem && echo yes",
+        )
+        return self._stdout_has_token(result, "yes")
+
+    def _run_register_node(self, device: Dict) -> bool:
+        """Run register_node on the switch to (re)register and refresh certs."""
+        hostname = device.get("hostname", device.get("ip", "unknown"))
+        bcm_master_ip = self.get_bcm_master_ip()
+
+        ssh_base = ["sshpass", "-p", self.password, "ssh",
+                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                    f"{self.username}@{device['ip']}"]
+
+        # Use a SINGLE sudo -S so we never hit "sudo requires a tty" / missing-password prompts.
+        # Also use absolute paths to avoid cwd assumptions.
+        inner = (
+            "chmod 755 /opt/cm-lite-daemon/register_node 2>/dev/null || true; "
+            f"/opt/cm-lite-daemon/register_node --host {bcm_master_ip} --disable-cert-check --vrf {self.vrf}"
+        )
+        cmd = f"sudo -S bash -c {shlex.quote(inner)}"
+        full_cmd = ssh_base + [cmd]
+        result = subprocess.run(full_cmd, input=f"{self.password}\n",
+                                capture_output=True, text=True, timeout=180)
+        if result.returncode == 0:
+            return True
+
+        print(f"    ✗ register_node failed on {hostname}")
+        stderr_tail = (result.stderr or "").strip()[-1500:]
+        stdout_tail = (result.stdout or "").strip()[-1500:]
+        if stdout_tail:
+            print("    register_node stdout (tail):")
+            print(stdout_tail)
+        if stderr_tail:
+            print("    register_node stderr (tail):")
+            print(stderr_tail)
+        return False
+
+    def _cm_lite_unit_present(self, device: Dict) -> bool:
+        """Check if cm-lite-daemon systemd unit exists on the device."""
+        unit_check = self._run_ssh_command(
+            device["ip"],
+            'for p in /etc/systemd/system/cm-lite-daemon.service /usr/lib/systemd/system/cm-lite-daemon.service '
+            '/lib/systemd/system/cm-lite-daemon.service; do [ -f "$p" ] && echo yes && exit 0; done; echo no',
+        )
+        return self._stdout_has_token(unit_check, "yes")
+
+    def _cm_lite_is_active(self, device: Dict) -> bool:
+        """Check if cm-lite-daemon service is active on the device."""
+        state = self._run_ssh_command(device["ip"], "systemctl is-active cm-lite-daemon 2>/dev/null || true")
+        return self._stdout_has_token(state, "active")
+
+    def _cm_lite_systemctl_show(self, device: Dict) -> Dict[str, str]:
+        """
+        Get key systemd properties for cm-lite-daemon as a dict.
+
+        Uses `systemctl show` (not `status`) so we can reliably parse state even when
+        SSH prints extra banner/MOTD output.
+        """
+        keys = ["ActiveState", "SubState", "Result", "ExecMainStatus", "NRestarts", "MainPID"]
+        cmd = "systemctl show cm-lite-daemon " + " ".join(f"-p {k}" for k in keys) + " 2>/dev/null || true"
+        out = self._run_ssh_command(device["ip"], cmd) or ""
+        props: Dict[str, str] = {}
+        for line in out.splitlines():
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k in keys:
+                props[k] = v.strip()
+        return props
+
+    def _ensure_cm_lite_systemd_unit(self, device: Dict, *, enable: bool) -> bool:
+        """
+        Ensure the cm-lite-daemon systemd unit (and env file) are installed on the device.
+
+        We install to /etc/systemd/system for highest precedence because some environments
+        may not have /usr/lib/systemd/system or may not search it as expected.
+        """
+        ssh_base = ["sshpass", "-p", self.password, "ssh",
+                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                    f"{self.username}@{device['ip']}"]
+
+        def _sudo(cmd: str, timeout: int = 45) -> subprocess.CompletedProcess:
+            full = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
+            return subprocess.run(full, input=f"{self.password}\n",
+                                  capture_output=True, text=True, timeout=timeout)
+
+        def _ok(step: str, result: subprocess.CompletedProcess) -> bool:
+            if result.returncode == 0:
+                return True
+            stderr_tail = (result.stderr or "").strip()[-1200:]
+            stdout_tail = (result.stdout or "").strip()[-1200:]
+            print(f"    ✗ Failed during systemd setup: {step}")
+            if stderr_tail:
+                print("      stderr (tail):")
+                for line in stderr_tail.splitlines()[-20:]:
+                    print(f"        {line}")
+            if stdout_tail:
+                print("      stdout (tail):")
+                for line in stdout_tail.splitlines()[-20:]:
+                    print(f"        {line}")
+            return False
+
+        # If /opt/cm-lite-daemon isn't present, we can't generate the unit from template.
+        if not self._stdout_has_token(self._run_ssh_command(device["ip"], "test -d /opt/cm-lite-daemon && echo yes"), "yes"):
+            return False
+
+        if self._cm_lite_unit_present(device):
+            # Still ensure daemon-reload/enable (optional) so reruns repair "unit exists but not enabled".
+            if not _ok("systemctl daemon-reload", _sudo("sudo systemctl daemon-reload", timeout=45)):
+                return False
+            if enable:
+                if not _ok("systemctl enable", _sudo("sudo systemctl enable cm-lite-daemon.service", timeout=45)):
+                    return False
+            return True
+
+        run_env = f"/usr/sbin/ip vrf exec {self.vrf} " if self.vrf else ""
+
+        # Create env file from template.
+        env_cmd = (
+            "sudo bash -c '"
+            "PY_BIN=$(command -v python3); PY_DIR=$(dirname \"$PY_BIN\"); "
+            "ROOT=/opt/cm-lite-daemon; PIDFILE=/var/run/cm-lite-daemon.pid; "
+            "PATHVAL=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
+            "sed -e \"s#@ROOT@#$ROOT#g\" "
+            "    -e \"s#@PIDFILE@#$PIDFILE#g\" "
+            "    -e \"s#@PYTHON_PATH@#$PY_DIR#g\" "
+            "    -e \"s#@PATH@#$PATHVAL#g\" "
+            "    $ROOT/etc/cm-lite-daemon.env.in > $ROOT/etc/cm-lite-daemon.env && "
+            "chmod 600 $ROOT/etc/cm-lite-daemon.env'"
+        )
+        if not _ok("generate env file", _sudo(env_cmd, timeout=60)):
+            return False
+
+        # Install systemd unit file to /etc/systemd/system (highest precedence).
+        unit_cmd = (
+            "sudo bash -c '"
+            "ROOT=/opt/cm-lite-daemon; PIDFILE=/var/run/cm-lite-daemon.pid; "
+            f"RUNENV=\"{run_env}\"; "
+            "sed -e \"s#@ROOT@#$ROOT#g\" "
+            "    -e \"s#@PIDFILE@#$PIDFILE#g\" "
+            "    -e \"s#@RUN_ENV@#$RUNENV#g\" "
+            "    $ROOT/service/systemd > /etc/systemd/system/cm-lite-daemon.service && "
+            "chmod 644 /etc/systemd/system/cm-lite-daemon.service'"
+        )
+        if not _ok("write unit file", _sudo(unit_cmd, timeout=60)):
+            return False
+
+        if not _ok("systemctl daemon-reload", _sudo("sudo systemctl daemon-reload", timeout=45)):
+            return False
+        if enable:
+            if not _ok("systemctl enable", _sudo("sudo systemctl enable cm-lite-daemon.service", timeout=45)):
+                return False
+
+        # Verify unit is actually present now (avoid false positives).
+        if not self._cm_lite_unit_present(device):
+            print("    ✗ systemd unit still not found after install attempt")
+            diag = self._run_ssh_command(device["ip"], "ls -la /etc/systemd/system/cm-lite-daemon.service 2>/dev/null || true")
+            if diag:
+                print(f"      /etc/systemd/system/cm-lite-daemon.service: {diag}")
+            return False
+
+        return True
+
+    def _ensure_cm_lite_service_running(self, device: Dict) -> bool:
+        """Ensure unit exists, enabled, and service is running. Returns True if active."""
+        ssh_base = ["sshpass", "-p", self.password, "ssh",
+                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                    f"{self.username}@{device['ip']}"]
+
+        def _sudo(cmd: str, timeout: int = 45) -> subprocess.CompletedProcess:
+            full = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
+            return subprocess.run(full, input=f"{self.password}\n",
+                                  capture_output=True, text=True, timeout=timeout)
+
+        if not self._ensure_cm_lite_systemd_unit(device, enable=True):
+            return False
+
+        # Ensure entrypoint is executable (defensive repair for older transfers/extractions).
+        _sudo(
+            "sudo chmod 755 "
+            "/opt/cm-lite-daemon/cm-lite-daemon "
+            "/opt/cm-lite-daemon/cm-lite-daemon_ctl "
+            "/opt/cm-lite-daemon/register_node "
+            "/opt/cm-lite-daemon/unregister_node "
+            "/opt/cm-lite-daemon/request_certificate "
+            "/opt/cm-lite-daemon/connection_test "
+            "/opt/cm-lite-daemon/install-required-pip-packages "
+            "2>/dev/null || true",
+            timeout=45,
+        )
+
+        start_res = _sudo("sudo systemctl start cm-lite-daemon", timeout=60)
+        if start_res.returncode != 0:
+            stderr_tail = (start_res.stderr or "").strip()[-1200:]
+            stdout_tail = (start_res.stdout or "").strip()[-1200:]
+            print("    ✗ Failed to start cm-lite-daemon")
+            if stderr_tail:
+                print("      stderr (tail):")
+                for line in stderr_tail.splitlines()[-20:]:
+                    print(f"        {line}")
+            if stdout_tail:
+                print("      stdout (tail):")
+                for line in stdout_tail.splitlines()[-20:]:
+                    print(f"        {line}")
+            return False
+
+        # Poll a bit; first start can take time. Require a *stable* running state
+        # (not a transient "active" between auto-restart cycles).
+        max_wait = 60
+        interval = 3
+        stable_required = 2  # consecutive "running" observations
+        stable = 0
+        waited = 0
+        last_props: Dict[str, str] = {}
+        while waited <= max_wait:
+            props = self._cm_lite_systemctl_show(device)
+            last_props = props
+            active = props.get("ActiveState")
+            sub = props.get("SubState")
+            result = props.get("Result")
+            exec_status = props.get("ExecMainStatus")
+
+            is_running = (active == "active" and sub == "running")
+            is_ok = (exec_status in (None, "", "0")) and (result in (None, "", "success"))
+
+            if is_running and is_ok:
+                stable += 1
+                if stable >= stable_required:
+                    return True
+            else:
+                stable = 0
+
+            time.sleep(interval)
+            waited += interval
+
+        # Print debugging
+        if last_props:
+            print(f"    systemd state: {last_props}")
+        status = _sudo("sudo systemctl status cm-lite-daemon --no-pager -l", timeout=45)
+        journal = _sudo("sudo journalctl -u cm-lite-daemon --no-pager -n 200", timeout=45)
+        print("    ✗ cm-lite-daemon is not active")
+        if status.stdout or status.stderr:
+            print("    systemctl status (tail):")
+            out = (status.stdout or "") + ("\n" + status.stderr if status.stderr else "")
+            print(out[-1500:])
+        if journal.stdout:
+            print("    journalctl (tail):")
+            print(journal.stdout[-2000:])
+        return False
     
-    def check_device_in_bcm(self, hostname: str) -> bool:
-        """Check if device already exists in BCM by hostname."""
+    def check_device_in_bcm(
+        self,
+        hostname: str,
+        *,
+        expected_ip: Optional[str] = None,
+        expected_mac: Optional[str] = None,
+        expected_network: Optional[str] = None,
+        expected_interface: Optional[str] = None,
+    ) -> bool:
+        """
+        Check if device exists in BCM and (optionally) is configured with expected properties.
+
+        We should NOT skip configuration just because the hostname exists; BCM may contain a stale
+        device entry with 0.0.0.0 or missing network/MAC (common in lab rebuilds).
+        """
         try:
+            # Ensure device exists
             result = subprocess.run(
-                f"cmsh -c 'device; use {hostname}; get hostname'",
+                f"{CMSH} -c 'device; use {hostname}; get hostname'",
                 shell=True, capture_output=True, text=True
             )
-            return result.returncode == 0 and hostname in result.stdout
+            if result.returncode != 0 or hostname not in (result.stdout or ""):
+                return False
+
+            # If no expectations were given, existence is enough.
+            if expected_ip is None and expected_mac is None and expected_network is None:
+                return True
+
+            def _get(prop: str) -> str:
+                r = subprocess.run(
+                    f"{CMSH} -c 'device; use {hostname}; get {prop}'",
+                    shell=True, capture_output=True, text=True
+                )
+                return (r.stdout or "").strip()
+
+            def _get_interface_ip(ifname: str) -> str:
+                # BCM 11: device.ip is read-only; the IP is modeled under device->interfaces.
+                r = subprocess.run(
+                    f"{CMSH} -c 'device; use {hostname}; interfaces; use {ifname}; get ip'",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return (r.stdout or "").strip()
+
+            if expected_ip is not None:
+                props = BCMProps()
+                if props.major >= 11 and expected_interface:
+                    dev_ip = _get("ip")
+                    if_ip = _get_interface_ip(expected_interface)
+                    # Accept either device.ip or interface ip matching the expected IP.
+                    # (Some BCM builds may reflect interface IP up to device.ip with a delay.)
+                    ok = (dev_ip == expected_ip and dev_ip not in ("", "0.0.0.0")) or (
+                        if_ip == expected_ip and if_ip not in ("", "0.0.0.0")
+                    )
+                    if not ok:
+                        return False
+                else:
+                    ip_val = _get("ip")
+                    if ip_val != expected_ip or ip_val in ("", "0.0.0.0"):
+                        return False
+            if expected_mac is not None:
+                mac_val = _get("mac")
+                if mac_val.lower() != expected_mac.lower() or mac_val in ("", "00:00:00:00:00:00"):
+                    return False
+            if expected_network is not None:
+                net_val = _get("network")
+                if net_val != expected_network or net_val == "":
+                    return False
+
+            return True
         except:
             return False
     
@@ -1181,21 +1602,58 @@ class BCMDeployer:
             print(f"    [DRY RUN] Would add {hostname} to BCM")
             return True
         
-        # Check if device already exists in BCM
-        if skip_if_exists and self.check_device_in_bcm(hostname):
-            print(f"    ✓ Device {hostname} already exists in BCM, skipping add")
+        # Check if device already exists in BCM AND is already configured correctly.
+        if skip_if_exists and self.check_device_in_bcm(
+            hostname,
+            expected_ip=device.get("ip"),
+            expected_mac=device.get("mac"),
+            expected_network=network,
+            expected_interface=(device.get("interface") or "eth0"),
+        ):
+            print(f"    ✓ Device {hostname} already exists in BCM (configured), skipping add")
             return True
         
         # Try to add/update the device
-        commands = [
-            (f"cmsh -c 'device; add switch {hostname}; commit'", "Adding device"),
-            (f"cmsh -c 'device; use {hostname}; set ip {device['ip']}; set mac {device['mac']}; "
-             f"set network {network}; set hasclientdaemon yes; commit'", "Setting properties"),
-            (f"cmsh -c 'device; use {hostname}; accesssettings; set username {self.username}; "
-             f"set password {self.password}; set -e force true; commit'", "Setting access"),
-            (f"cmsh -c 'device; use {hostname}; ztpsettings; set enableapi yes; commit'", "Setting ZTP"),
-            (f"cmsh -c 'device; use {hostname}; initialize'", "Initializing")
+        props = BCMProps()
+        access_force = props.access_force_param  # BCM10: force, BCM11: updateinztp
+        ifname = (device.get("interface") or "eth0").strip() or "eth0"
+
+        commands: List[Tuple[str, str]] = [
+            (f"{CMSH} -c 'device; add switch {hostname}; commit'", "Adding device"),
         ]
+
+        if props.major >= 11:
+            # BCM 11: device.ip is read-only; set IP via the interface object.
+            commands.extend([
+                (
+                    f"{CMSH} -c 'device; use {hostname}; set mac {device['mac']}; "
+                    f"set network {network}; set hasclientdaemon yes; commit'",
+                    "Setting properties",
+                ),
+                (
+                    f"{CMSH} -c 'device; use {hostname}; interfaces; add physical {ifname} {device['ip']} {network}; commit'",
+                    f"Adding interface {ifname} with IP",
+                ),
+            ])
+        else:
+            # BCM 10: device.ip is writable.
+            commands.append(
+                (
+                    f"{CMSH} -c 'device; use {hostname}; set ip {device['ip']}; set mac {device['mac']}; "
+                    f"set network {network}; set hasclientdaemon yes; commit'",
+                    "Setting properties",
+                )
+            )
+
+        commands.extend([
+            (
+                f"{CMSH} -c 'device; use {hostname}; accesssettings; set username {self.username}; "
+                f"set password {self.password}; set -e \"{access_force}\" true; commit'",
+                "Setting access",
+            ),
+            (f"{CMSH} -c 'device; use {hostname}; ztpsettings; set enableapi yes; commit'", "Setting ZTP"),
+            (f"{CMSH} -c 'device; use {hostname}; initialize'", "Initializing"),
+        ])
         
         for cmd, description in commands:
             try:
@@ -1230,10 +1688,16 @@ class BCMDeployer:
         
         # Always use local files from .files/ directory (ensure_local_files() prepares them)
         local_zip = FILES_DIR / "cm-lite-daemon.zip"
+        local_dir = FILES_DIR / "cm-lite-daemon"
         pip_packages_dir = FILES_DIR / "pip_packages_dep"
         
         if not local_zip.exists():
             print(f"    ✗ cm-lite-daemon.zip not found in {FILES_DIR}")
+            print(f"      Run ensure_local_files() first or check your setup")
+            return False
+
+        if not local_dir.exists() or not (local_dir / "requirements.txt").exists():
+            print(f"    ✗ Extracted cm-lite-daemon/ not found in {FILES_DIR}")
             print(f"      Run ensure_local_files() first or check your setup")
             return False
         
@@ -1279,8 +1743,10 @@ class BCMDeployer:
                         return True
                 return False
             
-            if not run_rsync(str(local_zip), target, "Transferring cm-lite-daemon.zip"):
-                print(f"    ✗ Failed to transfer cm-lite-daemon.zip")
+            # Transfer extracted daemon directory so the switch doesn't need unzip
+            daemon_target = f"{self.username}@{device['ip']}:/home/{self.username}/cm-lite-daemon/"
+            if not run_rsync(str(local_dir) + "/", daemon_target, "Transferring cm-lite-daemon/ directory"):
+                print(f"    ✗ Failed to transfer cm-lite-daemon directory")
                 return False
             
             # pip packages need to go to pip_packages_dep/ subdirectory
@@ -1288,6 +1754,16 @@ class BCMDeployer:
             if not run_rsync(str(pip_packages_dir) + "/", pip_target, "Transferring pip packages"):
                 print(f"    ✗ Failed to transfer pip_packages_dep")
                 return False
+            
+            # Transfer deb packages for offline apt installation
+            deb_packages_dir = FILES_DIR / "deb_packages"
+            if deb_packages_dir.exists() and list(deb_packages_dir.glob("*.deb")):
+                deb_target = f"{self.username}@{device['ip']}:/home/{self.username}/deb_packages/"
+                if not run_rsync(str(deb_packages_dir) + "/", deb_target, "Transferring deb packages"):
+                    print(f"    ⚠ Failed to transfer deb_packages (will try apt-get install)")
+                    # Not a fatal error - we can fall back to apt-get install from internet
+            else:
+                print(f"    ⚠ No .deb packages cached - will use apt-get install from internet")
             
             return True
             
@@ -1308,7 +1784,13 @@ class BCMDeployer:
             # Verify Python deps are installed by checking if we can import a key module
             check_result = self._run_ssh_command(device['ip'], 
                 "python3 -c 'import websocket' 2>/dev/null && echo ok")
-            if check_result == "ok":
+            if self._stdout_has_token(check_result, "ok"):
+                # If unit/service is missing, don't "skip" — repair it.
+                if not self._cm_lite_unit_present(device):
+                    print(f"    ⚠ cm-lite-daemon installed but systemd unit missing; repairing...")
+                    if not self._ensure_cm_lite_systemd_unit(device, enable=True):
+                        print(f"    ✗ Failed to install systemd unit")
+                        return False
                 print(f"    ✓ cm-lite-daemon already installed on {device['hostname']}, skipping")
                 return True
             else:
@@ -1318,19 +1800,103 @@ class BCMDeployer:
                    "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                    f"{self.username}@{device['ip']}"]
         
-        # Commands with descriptions for progress feedback
-        # Note: Using apt-get instead of apt for stable CLI interface in scripts
-        steps = [
-            ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
-            ("Updating package lists...", "sudo apt-get update -q"),
-            ("Installing build dependencies...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev python3-pip unzip"),
-            ("Extracting cm-lite-daemon...", f"cd /home/{self.username} && unzip -o cm-lite-daemon.zip"),
-            ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
-            ("Installing Python packages (this may take a while)...", 
-             f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
-             f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
-            ("Cleaning up...", f"rm -f /home/{self.username}/cm-lite-daemon.zip"),
-        ]
+        # Check what's already installed on the switch.
+        #
+        # NOTE: We no longer require 'unzip' on the switch because we extract cm-lite-daemon on the
+        # BCM head node and rsync the extracted directory.
+        has_pip = self._stdout_has_token(
+            self._run_ssh_command(device['ip'], "python3 -m pip --version >/dev/null 2>&1 && echo yes"),
+            "yes",
+        )
+        
+        # Check if we have cached deb packages (from prep-airgapped.py)
+        deb_packages_dir = DEB_PACKAGES_DIR
+        has_cached_debs = deb_packages_dir.exists() and len(list(deb_packages_dir.glob("*.deb"))) >= 5
+        
+        # Check if we have cached deb packages on the switch (transferred earlier)
+        has_switch_debs = False
+        if has_cached_debs:
+            deb_check = self._run_ssh_command(device['ip'],
+                f"ls /home/{self.username}/deb_packages/*.deb 2>/dev/null | wc -l")
+            try:
+                has_switch_debs = int(deb_check.strip()) >= 5
+            except (ValueError, AttributeError):
+                pass
+        
+        # Check if we have any sdist (source) packages that would need compilation
+        # If all packages are wheels (.whl), we don't need build-essential
+        pip_packages_dir = FILES_DIR / "pip_packages_dep"
+        has_sdists = False
+        if pip_packages_dir.exists():
+            sdist_extensions = ['.tar.gz', '.tar.bz2', '.zip']
+            for f in pip_packages_dir.iterdir():
+                if any(f.name.endswith(ext) for ext in sdist_extensions) and not f.name.endswith('.whl'):
+                    has_sdists = True
+                    break
+        
+        # Determine installation strategy
+        # Priority 1: wheel-only install (no sdists) if pip is available
+        # Priority 2: (legacy) cached deb packages, if needed to bootstrap pip
+        # Priority 3: (legacy) install pip from internet
+        #
+        # If sdists are present, offline install becomes fragile; prefer rebuilding the wheelhouse.
+
+        if not has_sdists and has_pip:
+            print(f"    ✓ pip available and wheelhouse is wheels-only, using wheel-only install")
+            steps = [
+                ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
+                ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
+                ("Installing Python packages (this may take a while)...", 
+                 f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
+                 f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
+            ]
+        elif has_sdists:
+            # sdists require a compiler toolchain. If the switch can reach its apt repos, we can
+            # install build tools on the switch and compile from the local sdist cache.
+            #
+            # If apt bootstrap fails (true airgapped), instruct the operator to rebuild the
+            # wheelhouse using prep-airgapped.py (which builds wheels on a Cumulus switch).
+            print(f"    ⚠ Source distributions detected in pip_packages_dep; attempting to install build tools from switch apt repos...")
+            steps = [
+                ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
+                ("Updating package lists...", "sudo apt-get update -q"),
+                ("Installing build tools...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q build-essential python3-dev"),
+                ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
+                ("Installing Python packages (this may take a while)...",
+                 f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
+                 f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
+            ]
+        elif has_switch_debs:
+            # Legacy fallback: if we have cached debs on the switch, attempt to install them (e.g. to bootstrap pip).
+            print(f"    ⚠ pip not available; attempting to use cached deb packages to bootstrap...")
+            deb_install_cmd = (
+                f"cd /home/{self.username}/deb_packages && "
+                f"sudo DEBIAN_FRONTEND=noninteractive apt install -y ./*.deb"
+            )
+            steps = [
+                ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
+                ("Installing dependencies (from cached packages)...", deb_install_cmd),
+                ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
+                ("Installing Python packages (this may take a while)...",
+                 f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
+                 f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon /home/{self.username}/deb_packages"),
+            ]
+        else:
+            # Legacy fallback: try to install pip from the internet.
+            print(f"    ⚠ pip not available; attempting to install python3-pip from internet...")
+            steps = [
+                ("Killing stale apt processes...", "sudo killall apt apt-get 2>/dev/null; sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null; sleep 2; echo done"),
+                ("Updating package lists...", "sudo apt-get update -q"),
+                ("Installing python3-pip...", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-pip"),
+                ("Copying to /opt/...", f"sudo cp -r /home/{self.username}/cm-lite-daemon /opt/"),
+                ("Installing Python packages (this may take a while)...",
+                 f"cd /opt/cm-lite-daemon && sudo pip3 install --break-system-packages --no-index "
+                 f"--find-links /home/{self.username}/pip_packages_dep -r requirements.txt"),
+                ("Cleaning up...", f"rm -rf /home/{self.username}/cm-lite-daemon"),
+            ]
         
         total_steps = len(steps)
         overall_start = time.time()
@@ -1351,11 +1917,16 @@ class BCMDeployer:
                 step_elapsed = time.time() - step_start
                 
                 if result.returncode != 0 and "already" not in result.stderr.lower():
-                    # Some non-critical errors are OK
-                    if "unzip" in cmd or "rm " in cmd:
+                    # Only cleanup commands (rm) are non-critical
+                    if cmd.startswith("rm ") or "rm -f" in cmd:
                         print(f" skipped ({step_elapsed:.1f}s)")
                         continue
                     print(f" FAILED ({step_elapsed:.1f}s)")
+                    # Extra hint for a common failure mode: package bootstrap failed.
+                    if "apt-get install" in cmd or "apt install" in cmd:
+                        print("        Hint: package installation failed. In airgapped mode this usually means:")
+                        print("          - the switch cannot reach its apt repositories, and no compatible cached .deb set was provided")
+                        print("          - the switch has an unexpected apt repo configuration for its Cumulus version")
                     # Surface useful error output. SSH banners/warnings can pollute stderr/stdout,
                     # so print the tail of both to help pinpoint the real failure (pip, sudo, etc.).
                     stderr_tail = (result.stderr or "").strip()[-1200:]
@@ -1392,8 +1963,22 @@ class BCMDeployer:
         
         # Check if already registered
         if skip_if_exists and self.check_daemon_registered(device):
-            print(f"    ✓ {device['hostname']} already registered with BCM, skipping")
-            return True
+            # Even if already registered, we still must ensure the systemd unit exists and
+            # the service is running, otherwise BCM will show the switch as DOWN.
+            print(f"    ✓ {device['hostname']} already registered with BCM, checking service...")
+            if self._ensure_cm_lite_service_running(device):
+                print(f"    ✓ Registration complete")
+                return True
+
+            # If the service is crash-looping, (re)run register_node to refresh certs/config,
+            # then try starting again.
+            print(f"    ⚠ Service not healthy; re-running register_node to repair...")
+            if not self._run_register_node(device):
+                return False
+            if self._ensure_cm_lite_service_running(device):
+                print(f"    ✓ Registration complete")
+                return True
+            return False
         
         hostname = device['hostname']
         bcm_master_ip = self.get_bcm_master_ip()
@@ -1446,67 +2031,29 @@ class BCMDeployer:
             
             # Register with BCM
             print(f"    Registering with BCM...")
-            register_cmd = (f"cd /opt/cm-lite-daemon && sudo ./register_node "
-                          f"--host {bcm_master_ip} --disable-cert-check --vrf {self.vrf}")
-            full_cmd = ssh_base + [register_cmd.replace("sudo ", "sudo -S ", 1)]
+            inner = (
+                "chmod 755 /opt/cm-lite-daemon/register_node 2>/dev/null || true; "
+                f"/opt/cm-lite-daemon/register_node --host {bcm_master_ip} --disable-cert-check --vrf {self.vrf}"
+            )
+            register_cmd = f"sudo -S bash -c {shlex.quote(inner)}"
+            full_cmd = ssh_base + [register_cmd]
             result = subprocess.run(full_cmd, input=f"{self.password}\n",
                          capture_output=True, text=True, timeout=120)
             
             if result.returncode != 0:
-                print(f"    ⚠ Registration command returned non-zero, checking service...")
-            
-            # Start the service
+                print(f"    ⚠ Registration command returned non-zero; continuing with service installation checks...")
+                # Surface useful register_node output (often indicates why service wasn't installed)
+                stderr_tail = (result.stderr or "").strip()[-1500:]
+                stdout_tail = (result.stdout or "").strip()[-1500:]
+                if stdout_tail:
+                    print("    register_node stdout (tail):")
+                    print(stdout_tail)
+                if stderr_tail:
+                    print("    register_node stderr (tail):")
+                    print(stderr_tail)
+
             print(f"    Starting cm-lite-daemon service...")
-            start_cmd = "sudo systemctl start cm-lite-daemon"
-            full_cmd = ssh_base + [start_cmd.replace("sudo ", "sudo -S ", 1)]
-            subprocess.run(full_cmd, input=f"{self.password}\n",
-                         capture_output=True, text=True, timeout=60)
-            
-            # Poll service for a bit: systemd may need time for first start after install/register.
-            print(f"    Verifying service status...")
-            max_wait = 45
-            interval = 3
-            waited = 0
-            last_state = None
-            while waited <= max_wait:
-                verify_cmd = "systemctl is-active cm-lite-daemon"
-                full_cmd = ssh_base + [verify_cmd]
-                result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=30)
-                state = (result.stdout or "").strip()
-                last_state = state
-                if state == "active":
-                    print(f"    ✓ cm-lite-daemon service is running")
-                    return True
-                time.sleep(interval)
-                waited += interval
-
-            print(f"    ✗ Service not running after {max_wait}s: {last_state}")
-
-            # Pull diagnostics to make failures actionable.
-            def _sudo(cmd: str, timeout: int = 45) -> subprocess.CompletedProcess:
-                full = ssh_base + [cmd.replace("sudo ", "sudo -S ", 1)]
-                return subprocess.run(full, input=f"{self.password}\n",
-                                      capture_output=True, text=True, timeout=timeout)
-
-            status_cmd = "sudo systemctl status cm-lite-daemon --no-pager -l"
-            status_result = _sudo(status_cmd, timeout=45)
-            if status_result.stdout:
-                print("    Service status (tail):")
-                print(status_result.stdout[-1500:])
-
-            journal_cmd = "sudo journalctl -u cm-lite-daemon --no-pager -n 200"
-            journal_result = _sudo(journal_cmd, timeout=45)
-            if journal_result.stdout:
-                print("    journalctl -u cm-lite-daemon (tail):")
-                print(journal_result.stdout[-2000:])
-
-            log_cmd = "sudo sh -lc 'ls -1 /opt/cm-lite-daemon/log 2>/dev/null | tail -n 20 || true'"
-            log_list = _sudo(log_cmd, timeout=45)
-            if log_list.stdout and log_list.stdout.strip():
-                print("    /opt/cm-lite-daemon/log (listing):")
-                print(log_list.stdout.strip())
-
-            return False
+            return self._ensure_cm_lite_service_running(device)
             
         except Exception as e:
             print(f"    ✗ Registration failed: {e}")
@@ -1517,19 +2064,24 @@ def configure_monitoring_only_mode(devices: List[Dict], dry_run: bool = False) -
     """Configure switches for monitoring-only mode in BCM.
     
     This sets:
-    1. cumulusmode = manual (BCM won't push config to switches)
+    1. cumulusmode/nvconfigurationmode = manual (BCM won't push config to switches)
     2. runztponeachboot = no (ZTP won't run on every boot)
     
     The result is non-disruptive monitoring:
     - cm-lite-daemon provides metrics to BCM
     - BCM doesn't change anything on the switches
     - ZTP config remains in BCM for future disaster recovery use
+    
+    Note: BCM 10 uses cumulusmode, BCM 11 uses nvconfigurationmode
     """
     if not devices:
         return True
     
+    # BCM 10 uses cumulusmode, BCM 11 uses nvconfigurationmode
+    props = BCMProps()
+    
     print("\nConfiguring switches for monitoring-only mode...")
-    print("  - Setting cumulusmode to 'manual' (no auto-config push)")
+    print(f"  - Setting {props.config_mode} to 'manual' (no auto-config push)")
     print("  - Disabling 'run ZTP on each boot' (no boot-time provisioning)")
     
     if dry_run:
@@ -1541,10 +2093,10 @@ def configure_monitoring_only_mode(devices: List[Dict], dry_run: bool = False) -
     success_count = 0
     for hostname in hostnames:
         try:
-            # Set cumulusmode to manual AND disable ZTP run on each boot
+            # Set config mode to manual AND disable ZTP run on each boot
             # Using a single cmsh command for efficiency
-            cmd = (f"cmsh -c \"device; use {hostname}; "
-                   f"set cumulusmode manual; "
+            cmd = (f"{CMSH} -c \"device; use {hostname}; "
+                   f"set {props.config_mode} manual; "
                    f"ztpsettings; set runztponeachboot no; "
                    f"exit; commit\"")
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
@@ -1567,21 +2119,24 @@ def configure_monitoring_only_mode(devices: List[Dict], dry_run: bool = False) -
 def write_csv(devices: List[Dict], network: str):
     """Write devices to CSV file."""
     with open(CSV_FILE, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['Hostname', 'IP', 'MAC', 'Network'])
+        writer = csv.DictWriter(f, fieldnames=['Hostname', 'IP', 'MAC', 'Network', 'Interface'])
         writer.writeheader()
         for device in devices:
             writer.writerow({
                 'Hostname': device['hostname'],
                 'IP': device['ip'],
                 'MAC': device['mac'],
-                'Network': network
+                'Network': network,
+                # BCM 11 requires an interface name to set IPs (device.ip is read-only).
+                # In our test topology this is always eth0.
+                'Interface': device.get('interface') or 'eth0',
             })
     print(f"\nGenerated {CSV_FILE} with {len(devices)} devices.")
 
 def read_devices_from_csv(csv_path: Path) -> List[Dict]:
     """Read devices from a CSV file.
     
-    Expected columns: Hostname, IP, MAC, Network
+    Expected columns: Hostname, IP, MAC, Network, Interface (Interface required for BCM 11)
     """
     if not csv_path.exists():
         print(f"Error: CSV file not found: {csv_path}")
@@ -1604,7 +2159,8 @@ def read_devices_from_csv(csv_path: Path) -> List[Dict]:
                 'hostname': device.get('hostname', ''),
                 'ip': device['ip'],
                 'mac': device.get('mac', '').upper() if device.get('mac') else '',
-                'network': device.get('network', '')
+                'network': device.get('network', ''),
+                'interface': device.get('interface', '') or device.get('ifname', '') or '',
             })
     
     return devices
@@ -1668,8 +2224,9 @@ def check_prerequisites():
         sys.exit(1)
     
     # Check for cmsh
-    if not shutil.which("cmsh"):
-        print("Error: cmsh not found. This script must run on a BCM system.")
+    # Prefer bcm_compat's full-path cmsh detection (BCM commonly exposes cmsh via modules, not PATH).
+    if not (Path(CMSH).exists() or shutil.which(CMSH)):
+        print(f"Error: cmsh not found at '{CMSH}'. This script must run on a BCM system.")
         sys.exit(1)
     
     # Check for cm-lite-daemon.zip source
@@ -1727,6 +2284,7 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
     FILES_DIR.mkdir(parents=True, exist_ok=True)
     
     cm_lite_zip = FILES_DIR / "cm-lite-daemon.zip"
+    cm_lite_dir = FILES_DIR / "cm-lite-daemon"
     pip_packages = FILES_DIR / "pip_packages_dep"
     
     # Default target if caller didn't detect versions.
@@ -1764,6 +2322,42 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
         else:
             print(f"  ✗ cm-lite-daemon.zip not found at {CM_LITE_ZIP_PATH}")
             return False
+
+    # Extract cm-lite-daemon on the BCM headnode so switches do NOT need 'unzip'.
+    # This also makes the transfer check more reliable (directory presence vs unzip success).
+    try:
+        needs_extract = (not cm_lite_dir.exists()) or (not (cm_lite_dir / "requirements.txt").exists())
+        if needs_extract:
+            if cm_lite_dir.exists():
+                shutil.rmtree(cm_lite_dir, ignore_errors=True)
+            print("  Extracting cm-lite-daemon.zip (so switches don't need unzip)...")
+            with zipfile.ZipFile(cm_lite_zip, "r") as zf:
+                zf.extractall(FILES_DIR)
+            if not (cm_lite_dir / "requirements.txt").exists():
+                print("  ✗ Extraction did not produce .files/cm-lite-daemon/requirements.txt")
+                return False
+            # Ensure expected entrypoints are executable. Some zip distributions lose +x bits
+            # depending on how they were created/extracted, which causes systemd ExecStart
+            # to fail with "Permission denied".
+            for rel in [
+                "cm-lite-daemon",
+                "cm-lite-daemon_ctl",
+                "register_node",
+                "unregister_node",
+                "request_certificate",
+                "connection_test",
+                "install-required-pip-packages",
+            ]:
+                p = cm_lite_dir / rel
+                try:
+                    if p.exists():
+                        p.chmod(p.stat().st_mode | 0o111)
+                except Exception:
+                    pass
+            print("  ✓ Extracted cm-lite-daemon/")
+    except Exception as e:
+        print(f"  ✗ Failed to extract cm-lite-daemon.zip: {e}")
+        return False
     
     # Extract requirements and download pip packages if not present OR cache is incomplete.
     if needs_pip_rebuild:
@@ -1936,7 +2530,42 @@ def ensure_local_files(python_versions: Optional[List[str]] = None):
             if temp_req.exists():
                 temp_req.unlink()
     
+    # Check for cached deb packages (prepared by prep-airgapped.py)
+    check_cached_packages()
+    
     return True
+
+
+def check_cached_packages() -> tuple[bool, bool]:
+    """
+    Check if cached packages are available in .files/ directory.
+    
+    These packages should be prepared using scripts/prep-airgapped.py on a
+    Cumulus switch with internet access.
+    
+    Returns:
+        Tuple of (has_pip_packages, has_deb_packages)
+    """
+    pip_packages_dir = FILES_DIR / "pip_packages_dep"
+    deb_packages_dir = DEB_PACKAGES_DIR
+    
+    has_pip = pip_packages_dir.exists() and len(list(pip_packages_dir.glob("*"))) > 0
+    has_deb = deb_packages_dir.exists() and len(list(deb_packages_dir.glob("*.deb"))) >= 5
+    
+    if has_pip:
+        pip_count = len(list(pip_packages_dir.glob("*")))
+        print(f"✓ Found {pip_count} cached pip packages in {pip_packages_dir}")
+    
+    if has_deb:
+        deb_count = len(list(deb_packages_dir.glob("*.deb")))
+        print(f"✓ Found {deb_count} cached deb packages in {deb_packages_dir}")
+    
+    if not has_pip and not has_deb:
+        print(f"ℹ No cached packages found in {FILES_DIR}")
+        print(f"  Switches will download packages from the internet")
+        print(f"  For airgapped deployment, run: python3 scripts/prep-airgapped.py")
+    
+    return has_pip, has_deb
 
 
 def get_bcm_switches() -> List[Dict]:
@@ -1946,7 +2575,7 @@ def get_bcm_switches() -> List[Dict]:
     """
     try:
         result = subprocess.run(
-            ["cmsh", "-c", "device;list -t switch"],
+            [CMSH, "-c", "device;list -t switch"],
             capture_output=True, text=True, check=True
         )
         return parse_bcm_switch_list(result.stdout)
@@ -1954,7 +2583,7 @@ def get_bcm_switches() -> List[Dict]:
         print(f"Error querying BCM switches: {e}")
         return []
     except FileNotFoundError:
-        print("Error: cmsh command not found.")
+        print(f"Error: cmsh command not found at '{CMSH}'.")
         return []
 
 
@@ -2097,12 +2726,19 @@ Notes:
                        help="SSH password for switches (for non-interactive mode)")
     parser.add_argument("--exclude-ips", type=str, default=None,
                        help="IPs to exclude, comma-separated (for --from-bcm)")
+    parser.add_argument("--stage-ztp", action="store_true",
+                       help="After a successful deploy, run scripts/ztp-staging.py to stage ZTP artifacts (non-interactive only; interactive will prompt)")
     
     args = parser.parse_args()
     
     print("=" * 70)
     print("BCM Switch Deployment Tool")
     print("=" * 70)
+
+    # Optional: stage ZTP after a successful deployment.
+    # NOTE: Must be defined for *all* code paths (CSV/from-bcm/resume/etc) since
+    # later finalize logic references it.
+    stage_ztp = False
     
     # Check prerequisites
     check_prerequisites()
@@ -2258,6 +2894,9 @@ Notes:
                 config_password=config.get('password', '') if 'password' in config.config else None,
                 prompt="Enter SSH password: ",
             )
+
+        # Optional: stage ZTP after a successful deployment
+        stage_ztp = prompt_stage_ztp(non_interactive=args.non_interactive, cli_flag=args.stage_ztp)
         
         # Determine VRF
         configured_vrf = config.get('vrf')
@@ -2280,6 +2919,9 @@ Notes:
         config.set('vrf', vrf)
         config.set('switch_ips', [sw['ip'] for sw in bcm_switches])
         config.save()
+
+        # Optional: stage ZTP after a successful deployment
+        stage_ztp = prompt_stage_ztp(non_interactive=args.non_interactive, cli_flag=args.stage_ztp)
         
         # Convert bcm_switches to devices format
         devices = bcm_switches
@@ -2398,7 +3040,15 @@ Notes:
         # (especially in non-interactive mode), but callers (e.g., test-loop) need an
         # accurate success/failure signal.
         if failed_count == 0:
-            maybe_delete_config_file(non_interactive=args.non_interactive)
+            if stage_ztp and not args.dry_run:
+                # Provide a CSV to staging so it reuses the exact switch set.
+                write_ztp_staging_csv(devices, CSV_FILE)
+                rc = run_ztp_staging(csv_path=CSV_FILE, username=username, non_interactive=args.non_interactive)
+                if rc != 0:
+                    print("\nZTP staging failed. Leaving config.json in place for troubleshooting.")
+                    sys.exit(1)
+            else:
+                maybe_delete_config_file(non_interactive=args.non_interactive)
         sys.exit(0 if failed_count == 0 else 1)
 
     # Handle CSV mode
@@ -2483,6 +3133,9 @@ Notes:
                 config_password=config.get('password', '') if 'password' in config.config else None,
                 prompt="Enter SSH password: ",
             )
+
+        # Optional: stage ZTP after a successful deployment
+        stage_ztp = prompt_stage_ztp(non_interactive=args.non_interactive, cli_flag=args.stage_ztp)
         
         # Determine network from CSV or detect
         networks_in_csv = set(d['network'] for d in csv_devices if d.get('network'))
@@ -2582,6 +3235,9 @@ Notes:
                 detected_vrf = detect_switch_vrf(username, password, csv_devices)
             vrf = choose_vrf_interactive(configured_vrf=configured_vrf, detected_vrf=detected_vrf)
         config.set('vrf', vrf)
+        if not args.dry_run:
+            # Persist ZTP-related settings (e.g., VRF) for ztp-staging.py.
+            write_ztp_config(vrf=vrf)
         
         # Set devices directly (skip discovery phase)
         config.progress['devices'] = csv_devices
@@ -2752,7 +3408,13 @@ Notes:
         if config.progress['phase'] == 'complete' and not config.progress['failed_ips']:
             config.clear_progress()
             print("\nDeployment completed successfully!")
-            maybe_delete_config_file(non_interactive=args.non_interactive)
+            if stage_ztp and not args.dry_run:
+                rc = run_ztp_staging(csv_path=args.csv, username=username, non_interactive=args.non_interactive)
+                if rc != 0:
+                    print("\nZTP staging failed. Leaving config.json in place for troubleshooting.")
+                    sys.exit(1)
+            else:
+                maybe_delete_config_file(non_interactive=args.non_interactive)
         
         # Exit non-zero if any devices failed.
         sys.exit(0 if not config.progress.get('failed_ips') else 1)
@@ -2836,6 +3498,9 @@ Notes:
     if config.get('password') != PASSWORD_PLACEHOLDER:
         config.set('password', PASSWORD_PLACEHOLDER)
         config.save()
+
+    # Optional: stage ZTP after a successful deployment
+    stage_ztp = prompt_stage_ztp(non_interactive=args.non_interactive, cli_flag=args.stage_ztp)
     
     if not switch_ips:
         print("Error: No switch IPs configured.")
@@ -2894,6 +3559,7 @@ Notes:
             print(f"VRF configured: {vrf}")
             print("=" * 60)
             print("\nRun without --connectivity-test to proceed with deployment.")
+            write_ztp_config(vrf=vrf)
             sys.exit(0)
     
     # If still not set, prompt in interactive mode; default only in non-interactive mode.
@@ -2907,6 +3573,7 @@ Notes:
         config.save()
     
     print(f"\nUsing VRF: {vrf}")
+    write_ztp_config(vrf=vrf)
     
     # Detect network
     network = config.get('network')
@@ -3254,7 +3921,18 @@ Notes:
     if config.progress['phase'] == 'complete' and not config.progress['failed_ips']:
         config.clear_progress()
         print("\nDeployment completed successfully!")
-        maybe_delete_config_file(non_interactive=args.non_interactive)
+        if stage_ztp and not args.dry_run:
+            # Ensure a staging CSV exists for the exact device set.
+            try:
+                write_ztp_staging_csv(devices, CSV_FILE)
+            except Exception as e:
+                print(f"\nWarning: failed to write staging CSV ({CSV_FILE}): {e}")
+            rc = run_ztp_staging(csv_path=CSV_FILE, username=username, non_interactive=args.non_interactive)
+            if rc != 0:
+                print("\nZTP staging failed. Leaving config.json in place for troubleshooting.")
+                sys.exit(1)
+        else:
+            maybe_delete_config_file(non_interactive=args.non_interactive)
     else:
         print(f"\nProgress saved. Run with --resume to continue.")
 

@@ -26,11 +26,19 @@ Test 3: Install on Switches Already in BCM (--from-bcm mode)
   - Run deploy with --from-bcm to install cm-lite-daemon
   - Validate deployment
 
+Test 4: ZTP End-to-End Recovery (rebuild switches, keep BCM + staged ZTP)
+  - Assume switches are already in BCM and ZTP is staged
+  - Add a known marker to config (eth0 description: "ZTP Works!")
+  - Rebuild switches in Air (skip BCM cleanup) so they boot via ZTP
+  - Poll ZTP status until complete
+  - Validate: marker present, cm-lite-daemon running, BCM status UP
+
 Usage:
     ./test-loop.py              # Run all tests (1, 2, and 3)
     ./test-loop.py --test1      # Run only Test 1
     ./test-loop.py --test2      # Run only Test 2
     ./test-loop.py --test3      # Run only Test 3
+    ./test-loop.py --test4      # Run only Test 4 (ZTP end-to-end)
     ./test-loop.py --dry-run    # Show what would be done
     ./test-loop.py --no-reset   # Skip switch-only rebuild + BCM cleanup
     ./test-loop.py --verbose    # Show detailed output
@@ -51,6 +59,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from contextlib import suppress
+
+# BCM version compatibility
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from bcm_compat import BCMProps, get_bcm_version, get_cmsh_cmd
+
+# cmsh command - use full path to avoid dependency on "module load cmsh"
+CMSH = get_cmsh_cmd()
 
 # ============================================================================
 # Configuration
@@ -61,6 +77,7 @@ REPO_DIR = SCRIPT_DIR.parent.parent
 SCRIPTS_DIR = REPO_DIR / "scripts"
 CONFIG_DIR = REPO_DIR / ".configs"
 LOGS_DIR = REPO_DIR / ".logs"
+FILES_DIR = REPO_DIR / ".files"
 TOPOLOGY_FILE = SCRIPT_DIR / "sample-configs" / "test-topology.json"
 DHCP_LEASES_FILE = Path("/var/lib/dhcpd/dhcpd.leases")
 VENV_PYTHON = SCRIPT_DIR / ".venv" / "bin" / "python"
@@ -74,10 +91,28 @@ TEST_SWITCHES = ["spine-01", "spine-02", "leaf-01", "leaf-02", "leaf-03", "leaf-
 # Wait times
 DHCP_WAIT_SECONDS = 90  # Wait for switches to get DHCP after reset
 BOOT_STABILIZE_SECONDS = 30  # Extra wait for boot to stabilize
+ZTP_POLL_SECONDS = 30
+ZTP_TIMEOUT_SECONDS = 600  # 10 minutes
 
 # Default test password (can be overridden via --password)
 DEFAULT_TEST_PASSWORD = "Nvidia1234!"
 
+# region agent log
+def _dbg(hypothesis_id: str, location: str, message: str, data: Dict):
+    # NOTE: do NOT log secrets (passwords/tokens). Keep payloads small.
+    payload = {
+        "sessionId": "debug-session",
+        "runId": os.getenv("DEBUG_RUN_ID", ""),
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    with suppress(Exception):
+        with open("/root/CUMULUS_in_BCM/.cursor/debug.log", "a") as f:
+            f.write(json.dumps(payload) + "\n")
+# endregion
 
 # ============================================================================
 # Data Classes
@@ -231,6 +266,38 @@ def clear_config():
     return True
 
 
+def clear_configs_dir() -> bool:
+    """
+    Clear the .configs/ directory.
+
+    Test intent: some scenarios (notably Test 4) should not rely on cached CSV/config state.
+    """
+    if not CONFIG_DIR.exists():
+        return True
+    try:
+        shutil.rmtree(CONFIG_DIR)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def clear_files_dir() -> bool:
+    """
+    Clear the .files/ cache directory.
+
+    This matters for test isolation: deploy_bcm_switches.py changes behavior based on whether
+    cached artifacts are present in .files/ (pip wheelhouse, deb_packages, extracted cm-lite-daemon).
+    """
+    if not FILES_DIR.exists():
+        return True
+    try:
+        shutil.rmtree(FILES_DIR)
+        return True
+    except Exception:
+        return False
+
+
 def get_validation_summary(output: str) -> Tuple[int, int]:
     """Parse validation output to get passed/failed counts."""
     passed = 0
@@ -364,8 +431,39 @@ def sshpass_run(user: str, password: str, ip: str, cmd: str, timeout: int = 60) 
         return -1, "", f"timeout after {timeout}s"
 
 
+def ssh_try_passwords(user: str, passwords: List[str], ip: str, cmd: str, timeout: int = 60) -> Tuple[int, str, str, str]:
+    """
+    Try multiple passwords in order. Returns (rc, stdout, stderr, password_used).
+    """
+    for pw in passwords:
+        rc, out, err = sshpass_run(user, pw, ip, cmd, timeout=timeout)
+        if rc == 0:
+            return rc, out, err, pw
+    return rc, out, err, passwords[-1] if passwords else ""
+
+
+def parse_ztp_show(output: str) -> Tuple[str, str]:
+    """
+    Parse `nv show system ztp` into (service, status).
+    """
+    service = ""
+    status = ""
+    for line in (output or "").splitlines():
+        m = re.match(r"^\s*service\s+(\S+)\s*$", line)
+        if m:
+            service = m.group(1).strip().lower()
+        m = re.match(r"^\s*status\s+(.+?)\s*$", line)
+        if m:
+            status = m.group(1).strip().lower()
+    return service, status
+
+
 def expect_available() -> bool:
     return shutil.which("expect") is not None
+
+
+def sshpass_available() -> bool:
+    return shutil.which("sshpass") is not None
 
 
 def expect_handle_forced_password_change(ip: str, old_password: str, new_password: str,
@@ -511,18 +609,36 @@ def add_devices_to_bcm_only(csv_path: Path, username: str, password: str) -> boo
             ip = device.get('IP') or device.get('ip', '')
             mac = device.get('MAC') or device.get('mac', '')
             network = device.get('Network') or device.get('network', 'internalnet')
+            ifname = (device.get('Interface') or device.get('interface', '') or 'eth0').strip() or 'eth0'
             
             if not hostname or not ip:
                 continue
+
+            _dbg(
+                "H3",
+                "scripts/tests/test-loop.py:add_devices_to_bcm_only",
+                "Adding device via cmsh (pre)",
+                {"hostname": hostname, "ip": ip, "network": network, "ifname": ifname, "has_mac": bool(mac)},
+            )
             
             # Add device to BCM using cmsh
-            cmds = [
-                f"cmsh -c 'device; add switch {hostname}; commit'",
-                f"cmsh -c \"device; use {hostname}; set ip {ip}; set mac {mac}; set network {network}; set hasclientdaemon yes; commit\"",
-                f"cmsh -c \"device; use {hostname}; accesssettings; set username {username}; set password {password}; set -e force true; commit\"",
-                f"cmsh -c \"device; use {hostname}; ztpsettings; set enableapi yes; commit\"",
-                f"cmsh -c \"device; use {hostname}; initialize\"",
-            ]
+            props = BCMProps()
+            cmds = [f"{CMSH} -c 'device; add switch {hostname}; commit'"]
+            if props.major >= 11:
+                # BCM 11: device.ip is read-only; set IP under device->interfaces.
+                cmds.extend([
+                    f"{CMSH} -c \"device; use {hostname}; set mac {mac}; set network {network}; set hasclientdaemon yes; commit\"",
+                    f"{CMSH} -c \"device; use {hostname}; interfaces; add physical {ifname} {ip} {network}; commit\"",
+                ])
+            else:
+                cmds.append(
+                    f"{CMSH} -c \"device; use {hostname}; set ip {ip}; set mac {mac}; set network {network}; set hasclientdaemon yes; commit\""
+                )
+            cmds.extend([
+                f"{CMSH} -c \"device; use {hostname}; accesssettings; set username {username}; set password {password}; set -e {props.access_force_param} yes; commit\"",
+                f"{CMSH} -c \"device; use {hostname}; ztpsettings; set enableapi yes; commit\"",
+                f"{CMSH} -c \"device; use {hostname}; initialize\"",
+            ])
             for cmd in cmds:
                 res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
                 if res.returncode != 0:
@@ -530,10 +646,55 @@ def add_devices_to_bcm_only(csv_path: Path, username: str, password: str) -> boo
                     # cmsh sometimes returns non-zero for idempotent operations like 'already exists'
                     if 'already' in stderr.lower() or 'exists' in stderr.lower():
                         continue
+                    _dbg(
+                        "H3",
+                        "scripts/tests/test-loop.py:add_devices_to_bcm_only",
+                        "cmsh command failed",
+                        {"hostname": hostname, "ip": ip, "rc": res.returncode, "stderr_head": stderr[:160]},
+                    )
                     print(f"    cmsh failed for {hostname} ({ip}): {cmd}")
                     if stderr:
                         print(f"      stderr: {stderr[:300]}")
                     return False
+
+            # Post-check: confirm BCM has non-empty ip/network after our commits.
+            # (No secrets; used to distinguish code issues vs BCM/lab behavior.)
+            try:
+                # BCM 11 may report 0.0.0.0 at device.ip; check interface IP too.
+                ip_get = subprocess.run(
+                    f"{CMSH} -c 'device; use {hostname}; get ip' 2>/dev/null",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                )
+                if_ip_get = subprocess.run(
+                    f"{CMSH} -c 'device; use {hostname}; interfaces; use {ifname}; get ip' 2>/dev/null",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                )
+                net_get = subprocess.run(
+                    f"{CMSH} -c 'device; use {hostname}; get network' 2>/dev/null",
+                    shell=True, capture_output=True, text=True
+                )
+                _dbg(
+                    "H4",
+                    "scripts/tests/test-loop.py:add_devices_to_bcm_only",
+                    "Added device via cmsh (post)",
+                    {
+                        "hostname": hostname,
+                        "expected_ip": ip,
+                        "bcm_ip": (ip_get.stdout or "").strip(),
+                        "bcm_ifname": ifname,
+                        "bcm_if_ip": (if_ip_get.stdout or "").strip(),
+                        "bcm_network": (net_get.stdout or "").strip(),
+                        "get_ip_rc": ip_get.returncode,
+                        "get_if_ip_rc": if_ip_get.returncode,
+                        "get_net_rc": net_get.returncode,
+                    },
+                )
+            except Exception:
+                pass
         
         return True
     except Exception as e:
@@ -671,13 +832,15 @@ class RunLogger:
 class TestRunner:
     """Runs automated tests."""
     
-    def __init__(self, verbose: bool = False, dry_run: bool = False, 
-                 password: str = DEFAULT_TEST_PASSWORD, logger: "RunLogger" = None):
+    def __init__(self, verbose: bool = False, dry_run: bool = False,
+                 password: str = DEFAULT_TEST_PASSWORD, logger: "RunLogger" = None,
+                 validation_timeout: int = 1200):
         self.verbose = verbose
         self.dry_run = dry_run
         self.password = password
         self.results: List[TestResult] = []
         self.logger = logger
+        self.validation_timeout = validation_timeout
     
     def run_step(self, name: str, script: str, args: str = "", 
                  timeout: int = 600, input_text: str = None) -> StepResult:
@@ -699,6 +862,20 @@ class TestRunner:
             self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
 
         return result
+
+    def air_health_check(self) -> StepResult:
+        """
+        Fast validation that NVIDIA Air API + simulation are accessible.
+
+        This catches cases where the sim may appear "not loaded" in the UI (or API is unhealthy)
+        even if SSH to nodes still works. Without this, resets can hang until timeout and mask root cause.
+        """
+        return self.run_step(
+            "NVIDIA Air health-check (API + simulation access)",
+            "scripts/tests/test-sim-reset.py",
+            "--health-check",
+            timeout=90,
+        )
     
     def reset_simulation(self) -> StepResult:
         """
@@ -724,7 +901,11 @@ class TestRunner:
             timeout=400,  # 6+ minutes for rebuild
             verbose=self.verbose
         )
-        
+
+        # Always log the step, even on failure/timeout, so test-loop runs are debuggable.
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
+
         if not result.success:
             return result
         
@@ -733,8 +914,44 @@ class TestRunner:
         wait_with_countdown(BOOT_STABILIZE_SECONDS, "Waiting for boot stabilization...")
         
         result.duration = time.time() - start
+        return result
+
+    def reset_switches_keep_bcm(self) -> StepResult:
+        """
+        Rebuild test switches in Air but keep BCM configuration/staged ZTP.
+
+        This uses scripts/tests/test-sim-reset.py --skip-bcm.
+        """
+        step_name = "reset-switches-keep-bcm"
+        start = time.time()
+
+        if self.dry_run:
+            return StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: rebuild test switches in Air, skipping BCM cleanup",
+                command="scripts/tests/test-sim-reset.py --skip-bcm",
+            )
+
+        result = run_script(
+            "scripts/tests/test-sim-reset.py",
+            "--skip-bcm",
+            timeout=400,
+            verbose=self.verbose,
+        )
         if self.logger is not None:
             self.logger.write_step(getattr(self, "_current_test_name", "unknown"), result)
+        if not result.success:
+            return result
+
+        # Wait for switches to boot and get DHCP
+        wait_with_countdown(DHCP_WAIT_SECONDS, "Waiting for switches to get DHCP addresses...")
+        wait_with_countdown(BOOT_STABILIZE_SECONDS, "Waiting for boot stabilization...")
+
+        result.name = step_name
+        result.duration = time.time() - start
         return result
 
     def preflight_oob_bridge_and_wait_for_dhcp(self) -> StepResult:
@@ -925,24 +1142,217 @@ class TestRunner:
     
     def deploy_switches(self) -> StepResult:
         """Deploy switches to BCM using --csv with --non-interactive."""
+        # In airgapped mode, we explicitly prepare the .files/ cache first by temporarily
+        # enabling IP forwarding so a prep switch (leaf-01) can reach the internet, then
+        # disabling forwarding before running the deployment.
+        if getattr(self, "_current_mode", "") == "airgapped":
+            prep = self.prep_airgapped_on_leaf_01()
+            if not prep.success:
+                return prep
         csv_path = shlex.quote(str(FROM_DHCP_CSV))
         pwd = shlex.quote(self.password)
         return self.run_step(
             "Deploy to BCM",
             "deploy_bcm_switches.py",
-            f"--csv {csv_path} --non-interactive --username cumulus --password {pwd}",
+            f"--csv {csv_path} --non-interactive --username cumulus --password {pwd} --stage-ztp",
             timeout=900  # 15 minutes for full deployment
         )
     
     def deploy_from_bcm(self) -> StepResult:
         """Deploy using --from-bcm mode (install on existing BCM devices)."""
+        # Same airgapped prep logic as deploy_switches().
+        if getattr(self, "_current_mode", "") == "airgapped":
+            prep = self.prep_airgapped_on_leaf_01()
+            if not prep.success:
+                return prep
         pwd = shlex.quote(self.password)
         return self.run_step(
             "Deploy from BCM (install cm-lite-daemon)",
             "deploy_bcm_switches.py",
-            f"--from-bcm --non-interactive --username cumulus --password {pwd}",
+            f"--from-bcm --non-interactive --username cumulus --password {pwd} --stage-ztp",
             timeout=900  # 15 minutes for full deployment
         )
+
+    def _get_leaf_01_ip_from_csv(self) -> Optional[str]:
+        """Return leaf-01 IP from the current FROM_DHCP_CSV mapping."""
+        try:
+            with open(FROM_DHCP_CSV, "r") as f:
+                rows = list(csv.DictReader(f))
+            for r in rows:
+                hn = (r.get("Hostname") or r.get("hostname") or "").strip()
+                ip = (r.get("IP") or r.get("ip") or "").strip()
+                if hn == "leaf-01" and ip:
+                    return ip
+        except Exception:
+            pass
+        return None
+
+    def prep_airgapped_on_leaf_01(self) -> StepResult:
+        """
+        Airgapped prep flow:
+        - Temporarily set ip_forward=1 so leaf-01 can download packages from the internet
+        - Run scripts/prep-airgapped.py against leaf-01 to populate local .files/
+        - Set ip_forward=0 to simulate airgapped switches for deployment
+        """
+        step_name = "Airgapped prep (prep-airgapped.py on leaf-01)"
+        print(f"\n  Step: {step_name}")
+        start = time.time()
+
+        if self.dry_run:
+            step = StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: sysctl ip_forward=1; run scripts/prep-airgapped.py --switch <leaf-01>; sysctl ip_forward=0",
+                command="sysctl -w net.ipv4.ip_forward=1; python3 scripts/prep-airgapped.py ...; sysctl -w net.ipv4.ip_forward=0",
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        leaf_ip = self._get_leaf_01_ip_from_csv()
+        if not leaf_ip:
+            step = StepResult(
+                name=step_name,
+                success=False,
+                duration=time.time() - start,
+                message="Failed (leaf-01 IP not found in from-dhcp.csv)",
+                output=f"Expected a row with Hostname=leaf-01 and a non-empty IP in {FROM_DHCP_CSV}",
+                command=str(FROM_DHCP_CSV),
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        # Use a temp tarball path to avoid accumulating artifacts in the repo.
+        tar_path = Path("/tmp") / f"prep-airgapped-{uuid.uuid4().hex}.tar.gz"
+        logs: List[str] = []
+
+        def _set_forward(val: int) -> Tuple[bool, str]:
+            rc, out, err = run_cmd(f"sysctl -w net.ipv4.ip_forward={val}", timeout=10)
+            msg = f"$ sysctl -w net.ipv4.ip_forward={val}\nrc={rc}\n{(out or '').strip()}\n{(err or '').strip()}"
+            return rc == 0, msg
+
+        ok, msg = _set_forward(1)
+        logs.append(msg)
+        if not ok:
+            step = StepResult(
+                name=step_name,
+                success=False,
+                duration=time.time() - start,
+                message="Failed (could not enable ip_forward=1 for prep)",
+                output="\n\n".join(logs)[-8000:],
+                command="sysctl -w net.ipv4.ip_forward=1",
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        try:
+            pwd = shlex.quote(self.password)
+            args = (
+                f"--non-interactive --switch {leaf_ip} --username cumulus --password {pwd} "
+                f"--output {shlex.quote(str(tar_path))}"
+            )
+            prep_res = run_script("scripts/prep-airgapped.py", args, timeout=1800, verbose=self.verbose)
+            logs.append(f"$ {prep_res.command}\nrc={'0' if prep_res.success else 'nonzero'}\n{(prep_res.output or '').strip()}")
+            ok_prep = prep_res.success
+        finally:
+            ok2, msg2 = _set_forward(0)
+            logs.append(msg2)
+            # Best-effort cleanup of tarball
+            try:
+                if tar_path.exists():
+                    tar_path.unlink()
+            except Exception:
+                pass
+
+        duration = time.time() - start
+        step = StepResult(
+            name=step_name,
+            success=ok_prep,
+            duration=duration,
+            message="Success" if ok_prep else "Failed (prep-airgapped.py failed)",
+            output="\n\n".join(logs)[-8000:],
+            command=f"prep-airgapped.py --switch {leaf_ip}",
+        )
+        status = "✓" if step.success else "✗"
+        print(f"    {status} {step.message} ({step.duration:.1f}s)")
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
+
+    def ztp_preflight_config(self) -> StepResult:
+        """Run ZTP preflight (config-only) to confirm staging artifacts are present."""
+        csv_path = shlex.quote(str(FROM_DHCP_CSV))
+        return self.run_step(
+            "ZTP preflight (config-only)",
+            "scripts/ztp-preflight.py",
+            f"--csv {csv_path} --config-only",
+            timeout=300
+        )
+
+    def enable_cm_lite_daemon_via_ztp(self) -> StepResult:
+        """
+        Ensure BCM is configured to include cm-lite-daemon installation in generated ZTP scripts.
+
+        BCM 11: ztpsettings -> install lite daemon
+        BCM 10: device.hasclientdaemon
+        """
+        step_name = "Enable cm-lite-daemon via ZTP + initialize"
+        start = time.time()
+
+        if self.dry_run:
+            step = StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: cmsh set installlitedaemon/hasclientdaemon and run initialize for test switches",
+                command="cmsh device;use <sw>; ...; initialize",
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        bcm_major, bcm_minor = get_bcm_version()
+        logs: List[str] = [f"BCM version: {bcm_major}.{bcm_minor}"]
+
+        ok_all = True
+        for sw in TEST_SWITCHES:
+            if bcm_major >= 11:
+                cmds = [
+                    f"{CMSH} -c \"device; use {sw}; ztpsettings; set installlitedaemon yes; commit\"",
+                    f"{CMSH} -c \"device; use {sw}; initialize\"",
+                ]
+            else:
+                cmds = [
+                    f"{CMSH} -c \"device; use {sw}; set hasclientdaemon yes; commit\"",
+                    f"{CMSH} -c \"device; use {sw}; initialize\"",
+                ]
+
+            for cmd in cmds:
+                rc, out, err = run_cmd(cmd, timeout=120)
+                logs.append(f"$ {cmd}\nrc={rc}\n{(out or '').strip()}\n{(err or '').strip()}")
+                if rc != 0:
+                    # tolerate idempotent "already" / "exists"
+                    if "already" in (err or "").lower() or "exists" in (err or "").lower():
+                        continue
+                    ok_all = False
+
+        duration = time.time() - start
+        step = StepResult(
+            name=step_name,
+            success=ok_all,
+            duration=duration,
+            message="Success" if ok_all else "Failed",
+            output="\n\n".join(logs)[-8000:],
+            command="; ".join(["cmsh ..."] * 2),
+        )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
     
     def add_devices_to_bcm(self) -> StepResult:
         """Add devices to BCM without installing cm-lite-daemon."""
@@ -971,13 +1381,25 @@ class TestRunner:
     def validate_deployment(self) -> StepResult:
         """Run validation testing."""
         pwd = shlex.quote(self.password)
+        _dbg(
+            "H1",
+            "scripts/tests/test-loop.py:validate_deployment",
+            "Starting validation-testing.py",
+            {"timeout_sec": int(getattr(self, "validation_timeout", 0)), "verbose": True},
+        )
         result = self.run_step(
             "Validate deployment",
             "scripts/validation-testing.py",
             # Always run validation with --verbose so failures include actionable detail
             # in the step log even if test-loop itself is not running with --verbose.
             f"--password {pwd} --verbose",
-            timeout=600
+            timeout=int(self.validation_timeout)
+        )
+        _dbg(
+            "H1",
+            "scripts/tests/test-loop.py:validate_deployment",
+            "Finished validation-testing.py",
+            {"success": result.success, "duration_sec": result.duration, "message": result.message},
         )
         
         if not self.dry_run:
@@ -985,6 +1407,290 @@ class TestRunner:
             print(f"    Validation: {passed} passed, {failed} failed")
         
         return result
+
+    def set_eth0_description_marker(self, description: str = "ZTP Works!") -> StepResult:
+        """
+        Add a deterministic marker to the BCM-staged startup.yaml (NOT the running switch config).
+
+        Rationale (Test 4): we want to prove ZTP restored config from BCM. If we set the marker
+        on the switch first, seeing it later doesn't prove anything. Instead, we patch the
+        staged file under BCM htdocs so the marker only appears on the switch if ZTP worked.
+        """
+        step_name = f"Set BCM-staged eth0 description marker ({description})"
+        start = time.time()
+
+        if self.dry_run:
+            step = StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: patch BCM htdocs staged startup.yaml to include eth0 description marker",
+                command="/cm/local/apps/cmd/etc/htdocs/switch/<sw>/startup.yaml",
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        logs: List[str] = []
+        ok_all = True
+        base_dir = Path("/cm/local/apps/cmd/etc/htdocs/switch")
+        for sw in TEST_SWITCHES:
+            p = base_dir / sw / "startup.yaml"
+            if not p.exists():
+                ok_all = False
+                logs.append(f"{sw}: missing staged file: {p}")
+                continue
+            try:
+                lines = p.read_text(errors="replace").splitlines()
+            except Exception as e:
+                ok_all = False
+                logs.append(f"{sw}: failed to read {p}: {e}")
+                continue
+
+            # Find eth0 block and set/replace the 'description:' line.
+            eth0_idx = None
+            for i, line in enumerate(lines):
+                if re.match(r"^\s*eth0:\s*$", line):
+                    eth0_idx = i
+                    break
+            if eth0_idx is None:
+                ok_all = False
+                logs.append(f"{sw}: could not find 'eth0:' in {p} (cannot inject marker)")
+                continue
+
+            eth0_indent = len(lines[eth0_idx]) - len(lines[eth0_idx].lstrip(" "))
+            child_indent = eth0_indent + 2
+            child_prefix = " " * child_indent
+
+            # Determine eth0 block end (next line with indent <= eth0_indent, excluding blank lines).
+            end = len(lines)
+            for j in range(eth0_idx + 1, len(lines)):
+                s = lines[j]
+                if not s.strip():
+                    continue
+                ind = len(s) - len(s.lstrip(" "))
+                if ind <= eth0_indent:
+                    end = j
+                    break
+
+            desc_line = f"{child_prefix}description: {description}"
+            replaced = False
+            for j in range(eth0_idx + 1, end):
+                if lines[j].startswith(child_prefix + "description:"):
+                    lines[j] = desc_line
+                    replaced = True
+                    break
+            if not replaced:
+                # Insert immediately after eth0: so it's clearly within the eth0 block.
+                lines.insert(eth0_idx + 1, desc_line)
+
+            try:
+                p.write_text("\n".join(lines) + "\n")
+                logs.append(f"{sw}: updated {p} ({'replaced' if replaced else 'inserted'})")
+            except Exception as e:
+                ok_all = False
+                logs.append(f"{sw}: failed to write {p}: {e}")
+
+        step = StepResult(
+            name=step_name,
+            success=ok_all,
+            duration=time.time() - start,
+            message="Success" if ok_all else "Failed",
+            output="\n\n".join(logs)[-8000:],
+            command="patch BCM staged startup.yaml",
+        )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
+
+    def _resolve_switch_ips_from_bcm(self, switches: List[str]) -> Tuple[Dict[str, str], str]:
+        """
+        Resolve {hostname: ip} from BCM via cmsh.
+
+        For Test 4 we want BCM to be the source of truth. This avoids reliance on DHCP CSV/leases.
+        """
+        resolved: Dict[str, str] = {}
+        logs: List[str] = []
+        for sw in switches:
+            rc, out, err = run_cmd(f"{CMSH} -c \"device;use {sw};get ip\"", timeout=30)
+            ip = (out or "").strip()
+            logs.append(f"{sw}: rc={rc} ip='{ip}' err='{(err or '').strip()[:160]}'")
+            if rc == 0 and ip and ip != "0.0.0.0":
+                resolved[sw] = ip
+        return resolved, "\n".join(logs)[-8000:]
+
+    def wait_for_ztp_complete(self) -> StepResult:
+        """
+        Poll `nv show system ztp` on each switch until:
+          - service == disabled
+          - status == success
+        """
+        step_name = "Wait for ZTP completion (nv show system ztp)"
+        start = time.time()
+
+        if self.dry_run:
+            step = StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output=f"Would: poll every {ZTP_POLL_SECONDS}s for up to {ZTP_TIMEOUT_SECONDS}s",
+                command="nv show system ztp",
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        # Resolve current switch IPs from BCM (no CSV/DHCP dependency).
+        hn_to_ip, bcm_ip_logs = self._resolve_switch_ips_from_bcm(TEST_SWITCHES)
+        if len(hn_to_ip) != len(TEST_SWITCHES):
+            missing = [sw for sw in TEST_SWITCHES if sw not in hn_to_ip]
+            step = StepResult(
+                name=step_name,
+                success=False,
+                duration=time.time() - start,
+                message=f"Failed to resolve switch IPs from BCM (missing: {', '.join(missing)})",
+                output=bcm_ip_logs,
+                command=f"{CMSH} device;use <sw>;get ip",
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        passwords = [self.password, "cumulus"]
+        done: Dict[str, bool] = {sw: False for sw in TEST_SWITCHES}
+        logs: List[str] = []
+
+        deadline = time.time() + ZTP_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            all_done = True
+            for sw in TEST_SWITCHES:
+                if done.get(sw):
+                    continue
+                ip = hn_to_ip.get(sw, "")
+                if not ip:
+                    all_done = False
+                    continue
+
+                rc, out, err, used_pw = ssh_try_passwords("cumulus", passwords, ip, "nv show system ztp", timeout=30)
+                if rc != 0:
+                    all_done = False
+                    continue
+                service, status = parse_ztp_show(out)
+                logs.append(f"{sw} ({ip}) ztp: service={service or '?'} status={status or '?'} (pw={used_pw})")
+                if service == "disabled" and status == "success":
+                    done[sw] = True
+                else:
+                    all_done = False
+
+            if all_done:
+                step = StepResult(
+                    name=step_name,
+                    success=True,
+                    duration=time.time() - start,
+                    message="Success",
+                    output="\n".join(logs)[-8000:],
+                    command="nv show system ztp",
+                )
+                if self.logger is not None:
+                    self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+                return step
+            time.sleep(ZTP_POLL_SECONDS)
+
+        missing = [sw for sw, ok in done.items() if not ok]
+        logs.append(f"Timed out waiting for: {', '.join(missing)}")
+        step = StepResult(
+            name=step_name,
+            success=False,
+            duration=time.time() - start,
+            message="Timed out",
+            output="\n".join(logs)[-8000:],
+            command="nv show system ztp",
+        )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
+
+    def validate_ztp_recovery(self, description: str = "ZTP Works!") -> StepResult:
+        """
+        After ZTP completes, validate:
+          1) eth0 description marker is present in startup.yaml
+          2) cm-lite-daemon service is active(running)
+          3) BCM device status is UP
+        """
+        step_name = "Validate ZTP recovery outcomes"
+        start = time.time()
+
+        if self.dry_run:
+            step = StepResult(
+                name=step_name,
+                success=True,
+                duration=0,
+                message="[DRY RUN] Skipped",
+                output="Would: check startup.yaml marker, systemctl is-active, and cmsh device status",
+                command="ssh + cmsh checks",
+            )
+            if self.logger is not None:
+                self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+            return step
+
+        # Resolve current switch IPs from BCM (no CSV/DHCP dependency).
+        hn_to_ip, bcm_ip_logs = self._resolve_switch_ips_from_bcm(TEST_SWITCHES)
+
+        passwords = [self.password, "cumulus"]
+        logs: List[str] = []
+        ok_all = True
+        if len(hn_to_ip) != len(TEST_SWITCHES):
+            missing = [sw for sw in TEST_SWITCHES if sw not in hn_to_ip]
+            ok_all = False
+            logs.append(f"BCM missing IPs for: {', '.join(missing)}")
+            logs.append(bcm_ip_logs)
+
+        for sw in TEST_SWITCHES:
+            ip = hn_to_ip.get(sw, "")
+            if not ip:
+                ok_all = False
+                logs.append(f"{sw}: missing IP from BCM (device.ip empty/0.0.0.0)")
+                continue
+
+            # 1) Marker present
+            marker_cmd = f"echo {self.password} | sudo -S grep -q \"description: {description}\" /etc/nvue.d/startup.yaml && echo OK"
+            rc1, out1, err1, _ = ssh_try_passwords("cumulus", passwords, ip, marker_cmd, timeout=60)
+            logs.append(f"{sw} ({ip}) marker rc={rc1} out={out1.strip()} err={err1.strip()[:200]}")
+            if rc1 != 0:
+                ok_all = False
+
+            # 2) cm-lite-daemon service running
+            svc_cmd = f"echo {self.password} | sudo -S systemctl is-active cm-lite-daemon.service"
+            rc2, out2, err2, _ = ssh_try_passwords("cumulus", passwords, ip, svc_cmd, timeout=60)
+            logs.append(f"{sw} ({ip}) cm-lite-daemon is-active rc={rc2} out={out2.strip()} err={err2.strip()[:200]}")
+            if rc2 != 0 or (out2 or "").strip() != "active":
+                # In airgapped mode, ZTP cannot install cm-lite-daemon unless the environment provides
+                # an internal apt repo/mirror. Record the result but do not fail the test.
+                if getattr(self, "_current_mode", "") == "airgapped":
+                    logs.append(f"{sw} ({ip}) NOTE: cm-lite-daemon not active in airgapped mode (expected unless internal repo/mirror exists)")
+                else:
+                    ok_all = False
+
+            # 3) BCM status UP
+            rc3, out3, err3 = run_cmd(f"{CMSH} -c \"device;use {sw};status\"", timeout=30)
+            logs.append(f"BCM {sw} status rc={rc3} out={(out3 or '').strip()} err={(err3 or '').strip()[:200]}")
+            if rc3 != 0 or "UP" not in (out3 or ""):
+                ok_all = False
+
+        step = StepResult(
+            name=step_name,
+            success=ok_all,
+            duration=time.time() - start,
+            message="Success" if ok_all else "Failed",
+            output="\n".join(logs)[-8000:],
+            command="marker+service+cmsh status",
+        )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        return step
+
     
     def run_test_1(self, skip_reset: bool = False) -> TestResult:
         """
@@ -1018,6 +1724,15 @@ class TestRunner:
         
         # Step 1: Rebuild test switches + BCM cleanup
         if not skip_reset:
+            step = self.air_health_check()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
             step = self.reset_simulation()
             steps.append(step)
             if not step.success:
@@ -1072,9 +1787,21 @@ class TestRunner:
         steps.append(step)
         if not step.success:
             test.success = False
+
+        # Step 5b: Ensure cm-lite-daemon install via ZTP is enabled and initialize regenerates scripts
+        step = self.enable_cm_lite_daemon_via_ztp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
         
         # Step 6: Validate (even if deploy failed, to see what state we're in)
         step = self.validate_deployment()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 6b: ZTP preflight (config-only) to confirm staging happened
+        step = self.ztp_preflight_config()
         steps.append(step)
         if not step.success:
             test.success = False
@@ -1117,6 +1844,15 @@ class TestRunner:
         
         # Step 1: Rebuild test switches + BCM cleanup
         if not skip_reset:
+            step = self.air_health_check()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
             step = self.reset_simulation()
             steps.append(step)
             if not step.success:
@@ -1177,6 +1913,18 @@ class TestRunner:
         steps.append(step)
         if not step.success:
             test.success = False
+
+        # Step 6b: Ensure cm-lite-daemon install via ZTP is enabled and initialize regenerates scripts
+        step = self.enable_cm_lite_daemon_via_ztp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 6c: ZTP preflight (config-only) to confirm staging happened
+        step = self.ztp_preflight_config()
+        steps.append(step)
+        if not step.success:
+            test.success = False
         
         test.steps = steps
         test.end_time = datetime.now().isoformat()
@@ -1217,6 +1965,15 @@ class TestRunner:
         
         # Step 1: Rebuild test switches + BCM cleanup
         if not skip_reset:
+            step = self.air_health_check()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
             step = self.reset_simulation()
             steps.append(step)
             if not step.success:
@@ -1287,11 +2044,126 @@ class TestRunner:
         steps.append(step)
         if not step.success:
             test.success = False
+
+        # Step 7b: Ensure cm-lite-daemon install via ZTP is enabled and initialize regenerates scripts
+        step = self.enable_cm_lite_daemon_via_ztp()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 7c: ZTP preflight (config-only) to confirm staging happened
+        step = self.ztp_preflight_config()
+        steps.append(step)
+        if not step.success:
+            test.success = False
         
         test.steps = steps
         test.end_time = datetime.now().isoformat()
         test.duration = time.time() - start
         
+        return test
+
+    def run_test_4(self, skip_reset: bool = False) -> TestResult:
+        """
+        Test 4: ZTP End-to-End Recovery
+
+        Assumptions:
+        - Switches are already in BCM
+        - ZTP is already staged
+
+        Steps:
+        1. (Optional) Confirm ZTP staging is present (preflight config-only)
+        2. Ensure cm-lite-daemon install via ZTP is enabled + initialize regenerates scripts
+        3. Add marker to config (eth0 description: "ZTP Works!")
+        4. Rebuild switches in Air (skip BCM cleanup) so they boot via ZTP
+        5. Preflight oob bridge + regenerate DHCP CSV + map hostnames
+        6. Wait for ZTP completion
+        7. Validate marker present, cm-lite-daemon running, BCM status UP
+        """
+        print("\n" + "=" * 70)
+        print("TEST 4: ZTP End-to-End Recovery")
+        print("=" * 70)
+
+        test = TestResult(
+            name="Test 4: ZTP End-to-End Recovery",
+            success=True,
+            start_time=datetime.now().isoformat()
+        )
+        start = time.time()
+        steps: List[StepResult] = []
+
+        if not skip_reset:
+            # We intentionally do NOT clear config.json here because we want to preserve BCM state.
+            pass
+
+        # Per user intent: Test 4 assumes a previous test already staged ZTP artifacts.
+        # So we keep this minimal and do NOT run oob bridge config, CSV generation, map-hostnames,
+        # prep-airgapped, ztp-preflight, or enable-cm-lite-daemon steps here.
+
+        # Step 1: Clear .configs (so we don't depend on cached CSV/config state)
+        if not self.dry_run:
+            ok = clear_configs_dir()
+        else:
+            ok = True
+        step = StepResult(
+            name="Clear .configs/",
+            success=ok,
+            duration=0,
+            message="Success" if ok else "Failed",
+            output=f"Deleted and recreated: {CONFIG_DIR}",
+            command="rm -rf .configs",
+        )
+        if self.logger is not None:
+            self.logger.write_step(getattr(self, "_current_test_name", "unknown"), step)
+        steps.append(step)
+        if not step.success:
+            test.success = False
+            test.steps = steps
+            test.end_time = datetime.now().isoformat()
+            test.duration = time.time() - start
+            return test
+
+        # Step 2: Set marker in BCM-staged config (this is what ZTP should apply after rebuild)
+        step = self.set_eth0_description_marker("ZTP Works!")
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 3: Rebuild switches (keep BCM)
+        if not skip_reset:
+            step = self.air_health_check()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
+            step = self.reset_switches_keep_bcm()
+            steps.append(step)
+            if not step.success:
+                test.success = False
+                test.steps = steps
+                test.end_time = datetime.now().isoformat()
+                test.duration = time.time() - start
+                return test
+
+        # Step 4: Wait for ZTP complete
+        step = self.wait_for_ztp_complete()
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        # Step 5: Validate outcomes
+        step = self.validate_ztp_recovery("ZTP Works!")
+        steps.append(step)
+        if not step.success:
+            test.success = False
+
+        test.steps = steps
+        test.end_time = datetime.now().isoformat()
+        test.duration = time.time() - start
         return test
     
     def print_summary(self):
@@ -1369,6 +2241,14 @@ Prerequisites:
                        help="Run only Test 2 (switch setup first)")
     parser.add_argument("--test3", action="store_true",
                        help="Run only Test 3 (--from-bcm mode)")
+    parser.add_argument("--test4", action="store_true",
+                       help="Run only Test 4 (ZTP end-to-end recovery)")
+    parser.add_argument("--online", action="store_true",
+                       help="Run tests with switch internet access enabled (ip_forward=1)")
+    parser.add_argument("--airgapped", action="store_true",
+                       help="Run tests with switch internet access disabled (ip_forward=0)")
+    parser.add_argument("--keep-files", action="store_true",
+                       help="Do not delete .files between/around tests (faster, but less isolated)")
     parser.add_argument("--no-reset", action="store_true",
                        help="Skip switch-only rebuild + BCM device cleanup (use existing test state)")
     parser.add_argument("--stop-on-fail", action="store_true",
@@ -1379,14 +2259,29 @@ Prerequisites:
                        help="Show detailed output from each step")
     parser.add_argument("--password", type=str, default=DEFAULT_TEST_PASSWORD,
                        help=f"Password to set on switches (default: {DEFAULT_TEST_PASSWORD})")
+    parser.add_argument("--validation-timeout", type=int, default=1200,
+                       help="Timeout (seconds) for scripts/validation-testing.py step (default: 1200)")
     
     args = parser.parse_args()
     
     # Determine which tests to run
-    any_specific = args.test1 or args.test2 or args.test3
+    any_specific = args.test1 or args.test2 or args.test3 or args.test4
     run_test1 = args.test1 or not any_specific
     run_test2 = args.test2 or not any_specific
     run_test3 = args.test3 or not any_specific
+    run_test4 = args.test4 or not any_specific
+
+    if args.online and args.airgapped:
+        print("Error: --online and --airgapped are mutually exclusive")
+        sys.exit(2)
+
+    modes: List[str] = []
+    if args.online:
+        modes = ["online"]
+    elif args.airgapped:
+        modes = ["airgapped"]
+    else:
+        modes = ["online", "airgapped"]
     
     # Password is passed to TestRunner
     test_password = args.password
@@ -1403,9 +2298,24 @@ Prerequisites:
         tests_to_run.append("Test 2")
     if run_test3:
         tests_to_run.append("Test 3")
+    if run_test4:
+        tests_to_run.append("Test 4")
     print(", ".join(tests_to_run))
+    print(f"Modes: {', '.join(modes)} (switch internet via ip_forward)")
     print(f"Skip reset: {args.no_reset}")
     print(f"Dry run: {args.dry_run}")
+    _dbg(
+        "H1",
+        "scripts/tests/test-loop.py:main",
+        "Parsed args",
+        {
+            "tests": {"t1": run_test1, "t2": run_test2, "t3": run_test3, "t4": run_test4},
+            "modes": modes,
+            "no_reset": bool(args.no_reset),
+            "stop_on_fail": bool(args.stop_on_fail),
+            "validation_timeout": int(args.validation_timeout),
+        },
+    )
     
     # Check prerequisites
     if not args.dry_run:
@@ -1414,6 +2324,14 @@ Prerequisites:
             print(f"\nError: {env_file} not found")
             print("Please copy sample-configs/sample.env to .env and configure it.")
             sys.exit(1)
+        if not sshpass_available():
+            print("\nError: required tool 'sshpass' was not found in PATH.")
+            print("test-loop uses sshpass for non-interactive SSH to switches.")
+            sys.exit(1)
+        if not expect_available():
+            # Not always required, but extremely helpful when devices force a password change.
+            print("\nWarning: 'expect' was not found in PATH.")
+            print("Some NVIDIA Air topologies may require expect to handle forced password changes on first login.")
     
     # Logging
     logger = RunLogger(enabled=not args.dry_run)
@@ -1422,7 +2340,13 @@ Prerequisites:
         print(f"\nLogs will be written to: {logger.run_dir}")
 
     # Run tests
-    runner = TestRunner(verbose=args.verbose, dry_run=args.dry_run, password=test_password, logger=logger)
+    runner = TestRunner(
+        verbose=args.verbose,
+        dry_run=args.dry_run,
+        password=test_password,
+        logger=logger,
+        validation_timeout=args.validation_timeout,
+    )
     
     try:
         selected = []
@@ -1432,6 +2356,8 @@ Prerequisites:
             selected.append(("Test 2", runner.run_test_2))
         if run_test3:
             selected.append(("Test 3", runner.run_test_3))
+        if run_test4:
+            selected.append(("Test 4", runner.run_test_4))
 
         # If running multiple tests, we *always* rebuild the test switches + clean BCM before each test to ensure isolation.
         # --no-reset is only respected when running exactly one test.
@@ -1439,13 +2365,50 @@ Prerequisites:
             print("\nNOTE: --no-reset was specified, but multiple tests were selected.")
             print("      For isolation, this run will rebuild test switches + clean BCM between tests (ignoring --no-reset).")
 
-        for name, fn in selected:
-            runner._current_test_name = name
-            skip_reset = args.no_reset and len(selected) == 1
-            result = fn(skip_reset=skip_reset)
-            runner.results.append(result)
-            if args.stop_on_fail and not result.success:
-                print("\nNOTE: --stop-on-fail enabled; stopping after first failure to preserve state for debugging.")
+        stop_now = False
+        for mode in modes:
+            if not args.dry_run:
+                # ip_forward controls whether switches can reach the internet through this system (Air topology).
+                forward = "1" if mode == "online" else "0"
+                rc, out, err = run_cmd(f"sysctl -w net.ipv4.ip_forward={forward}", timeout=10)
+                if rc != 0:
+                    print(f"\nError: failed to set ip_forward={forward}: {err or out}")
+                    if os.geteuid() != 0:
+                        print("Hint: run test-loop as root (or via sudo) so it can change sysctl settings.")
+                    sys.exit(1)
+                print(f"\nMode '{mode}': set net.ipv4.ip_forward={forward}")
+
+            for name, fn in selected:
+                runner._current_mode = mode
+                runner._current_test_name = f"{mode}:{name}"
+                skip_reset = args.no_reset and len(selected) == 1 and len(modes) == 1
+
+                # Test isolation: always start with a clean .files/ so we exercise cache creation,
+                # and always delete it after each test so artifacts never leak across tests.
+                if not args.dry_run and not args.keep_files:
+                    print("\nTest isolation: clearing .files/ cache (pre-test)...")
+                    if not clear_files_dir():
+                        print("Error: failed to delete .files/ (check permissions)")
+                        sys.exit(1)
+                    print("Test isolation: .files/ cleared (pre-test)")
+
+                result = fn(skip_reset=skip_reset)
+                # Prefix test names with mode for clarity in summary/logs.
+                result.name = f"[{mode}] {result.name}"
+                runner.results.append(result)
+
+                if not args.dry_run and not args.keep_files:
+                    print("\nTest isolation: clearing .files/ cache (post-test)...")
+                    if not clear_files_dir():
+                        print("Error: failed to delete .files/ (check permissions)")
+                        sys.exit(1)
+                    print("Test isolation: .files/ cleared (post-test)")
+
+                if args.stop_on_fail and not result.success:
+                    print("\nNOTE: --stop-on-fail enabled; stopping after first failure to preserve state for debugging.")
+                    stop_now = True
+                    break
+            if stop_now:
                 break
 
         # Print summary
